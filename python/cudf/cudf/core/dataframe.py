@@ -446,6 +446,33 @@ class DataFrame(object):
     def empty(self):
         return not len(self)
 
+    @property
+    def values(self):
+        if not utils._have_cupy:
+            raise ModuleNotFoundError("cuPY was not found.")
+        import cupy
+
+        return cupy.asarray(self.as_gpu_matrix())
+
+    @property
+    def values_host(self):
+        if self.isnull().all().all():
+            return np.empty(self.shape, dtype=np.object)
+        cols = [
+            c
+            if not is_categorical_dtype(c)
+            else c.as_string_column(dtype=np.object)
+            for c in self._columns
+        ]
+        mat_dtype = np.find_common_type(cols, [])
+        mat = np.zeros(self.shape, dtype=mat_dtype)
+        for i, col in enumerate(cols):
+            if np.issubdtype(col.dtype, np.dtype("object")):
+                mat[:, i] = col.data.to_host()
+            else:
+                mat[:, i] = col.data.mem.copy_to_host()
+        return mat
+
     def _get_numeric_data(self):
         """ Return a dataframe with only numeric data types """
         columns = [
@@ -1394,7 +1421,7 @@ class DataFrame(object):
             data, forceindex=forceindex, name=name
         )
 
-    def drop(self, labels, axis=None, errors="raise"):
+    def drop(self, labels, axis=None, columns=None, errors="raise"):
         """Drop column(s)
 
         Parameters
@@ -1403,6 +1430,7 @@ class DataFrame(object):
             Name of column(s) to be dropped.
         axis : {0 or 'index', 1 or 'columns'}, default 0
             Only axis=1 is currently supported.
+        columns: Ignored.
         errors : {'ignore', 'raise'}, default 'raise'
             This parameter is currently ignored.
 
@@ -1735,9 +1763,12 @@ class DataFrame(object):
             raise ValueError("require at least 1 column")
         if nrow < 1:
             raise ValueError("require at least 1 row")
-        dtype = cols[0].dtype
-        if any(dtype != c.dtype for c in cols):
-            raise ValueError("all columns must have the same dtype")
+        if any(
+            (np.issubdtype(c, np.dtype("object")) or is_categorical_dtype(c))
+            for c in cols
+        ):
+            raise TypeError("Data must be homogenous numeric")
+        dtype = np.find_common_type(cols, [])
         for k, c in self._cols.items():
             if c.null_count > 0:
                 errmsg = (
@@ -1751,7 +1782,10 @@ class DataFrame(object):
                 shape=(nrow, ncol), dtype=dtype, order=order
             )
             for colidx, inpcol in enumerate(cols):
-                dense = inpcol.to_gpu_array(fillna="pandas")
+                if inpcol.dtype == dtype:
+                    dense = inpcol.to_gpu_array(fillna="pandas")
+                else:
+                    dense = inpcol.astype(dtype).to_gpu_array(fillna="pandas")
                 matrix[:, colidx].copy_to_device(dense)
         elif order == "C":
             matrix = cudautils.row_matrix(cols, nrow, ncol, dtype)
