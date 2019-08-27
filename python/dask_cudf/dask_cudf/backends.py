@@ -1,5 +1,12 @@
+import cupy
+from pandas._libs.algos import groupsort_indexer
+
 from dask.dataframe.core import get_parallel_type, make_meta, meta_nonempty
-from dask.dataframe.methods import concat_dispatch
+from dask.dataframe.methods import (
+    concat_dispatch,
+    df_index_split_dispatch,
+    hash_df_dispatch,
+)
 
 import cudf
 
@@ -33,3 +40,19 @@ def concat_cudf(
     assert axis == 0
     assert join == "outer"
     return cudf.concat(dfs)
+
+
+@hash_df_dispatch.register((cudf.DataFrame, cudf.Series, cudf.Index))
+def hash_df_cudf(dfs):
+    return dfs.hash_columns()
+
+
+@df_index_split_dispatch.register((cudf.DataFrame, cudf.Series, cudf.Index))
+def df_index_split_cudf(df, c, k):
+    if type(k) == cupy.core.core.ndarray:
+        k = k.get().tolist()
+    indexer, locations = groupsort_indexer(c.get(), k)
+    df2 = df.take(indexer)
+    locations = locations.cumsum()
+    parts = [df2.iloc[a:b] for a, b in zip(locations[:-1], locations[1:])]
+    return dict(zip(range(k), parts))
