@@ -23,7 +23,7 @@ from dask.utils import M, OperatorMethodMixin, derived_from, funcname
 import cudf
 import cudf._lib as libcudf
 
-from dask_cudf import batcher_sortnet
+from dask_cudf import batcher_sortnet, join_impl
 from dask_cudf.accessor import (
     CachedAccessor,
     CategoricalAccessor,
@@ -137,16 +137,59 @@ class DataFrame(_Frame, dd.core.DataFrame):
             do_apply_rows, func, incols, outcols, kwargs, meta=meta
         )
 
-    def merge(self, other, **kwargs):
-        if kwargs.pop("shuffle", "tasks") != "tasks":
-            raise ValueError(
-                "Dask-cudf only supports task based shuffling, got %s"
-                % kwargs["shuffle"]
+    # def merge(self, other, **kwargs):
+    #     if kwargs.pop("shuffle", "tasks") != "tasks":
+    #         raise ValueError(
+    #             "Dask-cudf only supports task based shuffling, got %s"
+    #             % kwargs["shuffle"]
+    #         )
+    #     on = kwargs.pop("on", None)
+    #     if isinstance(on, tuple):
+    #         on = list(on)
+    #     return super().merge(other, on=on, shuffle="tasks", **kwargs)
+
+    def merge(
+        self,
+        other,
+        on=None,
+        how="left",
+        left_index=False,
+        right_index=False,
+        suffixes=("_x", "_y"),
+    ):
+        """Merging two dataframes on the column(s) indicated in *on*.
+        """
+        if (
+            left_index
+            or right_index
+            or not dask.is_dask_collection(other)
+            or self.npartitions == 1
+            and how in ("inner", "right")
+            or other.npartitions == 1
+            and how in ("inner", "left")
+        ):
+            return dd.merge(
+                self,
+                other,
+                how=how,
+                suffixes=suffixes,
+                left_index=left_index,
+                right_index=right_index,
             )
-        on = kwargs.pop("on", None)
-        if isinstance(on, tuple):
-            on = list(on)
-        return super().merge(other, on=on, shuffle="tasks", **kwargs)
+
+        if not on and not left_index and not right_index:
+            on = [c for c in self.columns if c in other.columns]
+            if not on:
+                left_index = right_index = True
+
+        return join_impl.join_frames(
+            left=self,
+            right=other,
+            on=on,
+            how=how,
+            lsuffix=suffixes[0],
+            rsuffix=suffixes[1],
+        )
 
     def join(self, other, how="left", lsuffix="", rsuffix=""):
         """Join two datatframes
@@ -342,13 +385,69 @@ class DataFrame(_Frame, dd.core.DataFrame):
         divisions = compute(*divs)
         return type(self)(self.dask, self._name, self._meta, divisions)
 
-    def set_index(self, other, **kwargs):
-        if kwargs.pop("shuffle", "tasks") != "tasks":
-            raise ValueError(
-                "Dask-cudf only supports task based shuffling, got %s"
-                % kwargs["shuffle"]
-            )
-        return super().set_index(other, shuffle="tasks", **kwargs)
+    # def set_index(self, other, **kwargs):
+    #     if kwargs.pop("shuffle", "tasks") != "tasks":
+    #         raise ValueError(
+    #             "Dask-cudf only supports task based shuffling, got %s"
+    #             % kwargs["shuffle"]
+    #         )
+    #     return super().set_index(other, shuffle="tasks", **kwargs)
+
+    def set_index(self, index, drop=True, sorted=False):
+        """Set new index.
+        Parameters
+        ----------
+        index : str or Series
+            If a ``str`` is provided, it is used as the name of the
+            column to be made into the index.
+            If a ``Series`` is provided, it is used as the new index
+        drop : bool
+            Whether the first original index column is dropped.
+        sorted : bool
+            Whether the new index column is already sorted.
+        """
+        if not drop:
+            raise NotImplementedError("drop=False not supported yet")
+
+        if isinstance(index, str):
+            tmpdf = self.sort_values(index)
+            return tmpdf._set_column_as_sorted_index(index, drop=drop)
+        elif isinstance(index, Series):
+            indexname = "__dask_cudf.index"
+            df = self.assign(**{indexname: index})
+            return df.set_index(indexname, drop=drop, sorted=sorted)
+        else:
+            raise TypeError("cannot set_index from {}".format(type(index)))
+
+    def _set_column_as_sorted_index(self, colname, drop):
+        def select_index(df, col):
+            return df.set_index(col)
+
+        return self.map_partitions(
+            select_index, col=colname, meta=self._meta.set_index(colname)
+        )
+
+    def _argsort(self, col, sorted=False):
+        """
+        Returns
+        -------
+        shufidx : Series
+            Positional indices to be used with .take() to
+            put the dataframe in order w.r.t ``col``.
+        """
+        # Get subset with just the index and positional value
+        subset = self[col].to_dask_dataframe()
+        subset = subset.reset_index(drop=False)
+        ordered = subset.set_index(0, sorted=sorted)
+        shufidx = from_dask_dataframe(ordered)["index"]
+        return shufidx
+
+    def _set_index_raw(self, indexname, drop, sorted):
+        shufidx = self._argsort(indexname, sorted=sorted)
+        # Shuffle the GPU data
+        shuffled = self.take(shufidx, npartitions=self.npartitions)
+        out = shuffled.map_partitions(lambda df: df.set_index(indexname))
+        return out
 
     def reset_index(self, force=False, drop=False):
         """Reset index to range based

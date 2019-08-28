@@ -33,3 +33,14 @@ from cudf.io import (
 
 __version__ = get_versions()["version"]
 del get_versions
+
+
+# Import dask_cudf dispatch functions
+try:
+    from dask_cudf.backends import (
+        hash_df_cudf,
+        group_split_cudf,
+        group_split_2_cudf,
+    )
+except ImportError:
+    pass

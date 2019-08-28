@@ -1,13 +1,12 @@
-import cupy
 import numpy as np
 from pandas._libs.algos import groupsort_indexer
 
 from dask.dataframe.core import get_parallel_type, make_meta, meta_nonempty
 from dask.dataframe.methods import (
     concat_dispatch,
-    group_scatter_2_dispatch,
-    group_scatter_dispatch,
-    hash_df_dispatch,
+    group_split,
+    group_split_2,
+    hash_df,
 )
 
 import cudf
@@ -44,30 +43,22 @@ def concat_cudf(
     return cudf.concat(dfs)
 
 
-@hash_df_dispatch.register((cudf.DataFrame, cudf.Series, cudf.Index))
+@hash_df.register((cudf.DataFrame, cudf.Series, cudf.Index))
 def hash_df_cudf(dfs):
     return dfs.hash_columns()
 
 
-@group_scatter_dispatch.register((cudf.DataFrame, cudf.Series, cudf.Index))
-def group_scatter_cudf(df, ind, stage, k, npartitions):
-    c = ind.values
-    typ = cupy.min_scalar_type(npartitions * 2)
-
-    c = cupy.mod(c, npartitions).astype(typ, copy=False)
-    cupy.floor_divide(c, k ** stage, out=c)
-    cupy.mod(c, k, out=c)
-
+@group_split.register((cudf.DataFrame, cudf.Series, cudf.Index))
+def group_split_cudf(df, c, k):
     indexer, locations = groupsort_indexer(c.get().astype(np.int64), k)
     df2 = df.take(indexer)
     locations = locations.cumsum()
     parts = [df2.iloc[a:b] for a, b in zip(locations[:-1], locations[1:])]
-
     return dict(zip(range(k), parts))
 
 
-@group_scatter_2_dispatch.register((cudf.DataFrame, cudf.Series, cudf.Index))
-def group_scatter_2_cudf(df, col):
+@group_split_2.register((cudf.DataFrame, cudf.Series, cudf.Index))
+def group_split_2_cudf(df, col):
     if not len(df):
         return {}, df
     ind = df[col].values_host.astype(np.int64)
