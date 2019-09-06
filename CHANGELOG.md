@@ -11,6 +11,7 @@
 - PR #2674 Add __contains__ for Index/Series/Column
 - PR #2722 Add Java bindings for NVTX ranges
 - PR #2724 Add libcudf support for __contains__
+- PR #2685 Add cudf::scatter_to_tables and cython binding
 
 ## Improvements
 
