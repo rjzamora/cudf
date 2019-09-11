@@ -171,7 +171,7 @@ TYPED_TEST(ScatterToTablesTest, SizeMismatchTest) {
 * o/p = number of output tables
 *
 * c r sm  RESULT
-* 0 * *   seg fault
+* 0 * *   seg fault (zero columns is not allowed)
 * 1 0 0   pass  (o/p=0)
 * 1 0 1   throw (r!=sm)
 * 1 1 0   throw (r!=sm)
@@ -179,36 +179,37 @@ TYPED_TEST(ScatterToTablesTest, SizeMismatchTest) {
 *
 */
 TYPED_TEST(ScatterToTablesTest, ZeroSizeTest) {
-  for(gdf_size_type table_n_cols : {1}) //0 seg fault
-    for(gdf_size_type table_n_rows : {0, 1})
-      for(gdf_size_type scatter_size : {0, 1}) {
-        //std::cout << table_n_cols << table_n_rows << scatter_size << std::endl;
+  gdf_size_type table_n_cols=1;
+  for(gdf_size_type table_n_rows : {0, 1}) {
+    for(gdf_size_type scatter_size : {0, 1}) {
+      //std::cout << table_n_cols << table_n_rows << scatter_size << std::endl;
 
-        //data
-        std::vector<cudf::test::column_wrapper<TypeParam>> v_colwrap(
-            table_n_cols, {table_n_rows,
-              [](gdf_index_type row) { return static_cast<TypeParam>(row); },
-              [](gdf_index_type row) { return false; }});
-        std::vector<gdf_column *> v_cols(table_n_cols);
-        for (size_t i = 0; i < v_colwrap.size(); i++)
-          v_cols[i] = v_colwrap[i].get();
+      //data
+      std::vector<cudf::test::column_wrapper<TypeParam>> v_colwrap(
+          table_n_cols, {table_n_rows,
+          [](gdf_index_type row) { return static_cast<TypeParam>(row); },
+          [](gdf_index_type row) { return false; }});
+      std::vector<gdf_column *> v_cols(table_n_cols);
+      for (size_t i = 0; i < v_colwrap.size(); i++)
+        v_cols[i] = v_colwrap[i].get();
 
-        //input datatypes
-        cudf::table input_table{v_cols};
-        cudf::test::column_wrapper<gdf_index_type> scatter_map(scatter_size,
+      //input datatypes
+      cudf::table input_table{v_cols};
+      cudf::test::column_wrapper<gdf_index_type> scatter_map(scatter_size,
           [](gdf_index_type row) { return row; }, false);
-        std::vector<cudf::table> output_tables;
-        if (table_n_cols == 0) table_n_rows=0;
-        if(scatter_size != table_n_rows) {
-          CUDF_EXPECT_THROW_MESSAGE(
+      std::vector<cudf::table> output_tables;
+      if (table_n_cols == 0) table_n_rows=0;
+      if(scatter_size != table_n_rows) {
+        CUDF_EXPECT_THROW_MESSAGE(
             output_tables = cudf::scatter_to_tables(input_table, scatter_map),
             "scatter_map length is not equal to number of rows in input table.");
-        } else {
-          EXPECT_NO_THROW(
+      } else {
+        EXPECT_NO_THROW(
             output_tables = cudf::scatter_to_tables(input_table, scatter_map));
-            EXPECT_EQ(size_t(scatter_size), output_tables.size());
-        }
+        EXPECT_EQ(size_t(scatter_size), output_tables.size());
       }
+    }
+  }
 }
 
 template <typename T>
@@ -247,15 +248,15 @@ auto scatter_columns(
       output_cols_data[g].push_back(output_col_data);
       output_cols_bitmask[g].push_back(output_col_bitmask);
       output_cols_null_count[g].push_back(nullc);
-      assert(n_output == j);
+      EXPECT_EQ(n_output, j) << "Reference solution calculation failure\n";
     }
-    assert(num_cols == output_cols_data[g].size());
-    assert(num_cols == output_cols_bitmask[g].size());
-    assert(num_cols == output_cols_null_count[g].size());
+    EXPECT_EQ(num_cols, output_cols_data[g].size()) << "Reference solution calculation failure\n";
+    EXPECT_EQ(num_cols, output_cols_bitmask[g].size()) << "Reference solution calculation failure\n";
+    EXPECT_EQ(num_cols, output_cols_null_count[g].size()) << "Reference solution calculation failure\n";
   }
-  assert(max+1 == output_cols_data.size());
-  assert(max+1 == output_cols_bitmask.size());
-  assert(max+1 == output_cols_null_count.size());
+  EXPECT_EQ(size_t(max+1), output_cols_data.size()) << "Reference solution calculation failure\n";
+  EXPECT_EQ(size_t(max+1), output_cols_bitmask.size()) << "Reference solution calculation failure\n";
+  EXPECT_EQ(size_t(max+1), output_cols_null_count.size()) << "Reference solution calculation failure\n";
   return std::make_tuple(output_cols_data,
                          output_cols_bitmask,
                          output_cols_null_count);
