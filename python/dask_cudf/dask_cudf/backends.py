@@ -56,23 +56,28 @@ def hash_df_cudf(dfs):
 
 @group_split.register((cudf.DataFrame, cudf.Series, cudf.Index))
 def group_split_cudf(df, c, k):
-    indexer, locations = groupsort_indexer(c.get().astype(np.int64), k)
-    df2 = df.take(indexer)
-    locations = locations.cumsum()
-    parts = [df2.iloc[a:b] for a, b in zip(locations[:-1], locations[1:])]
-    return dict(zip(range(k), parts))
+
+    import cudf._lib.copying as copying
+    source = [df[col] for col in df.columns]
+    ind_map = cudf.Series(c.astype(np.int64))
+    tables = copying.scatter_to_frames(source, ind_map)
+    for i in range(k - len(tables)):
+        tables.append(tables[0].iloc[[]])
+    return dict(zip(range(k), tables))
 
 
 @group_split_2.register((cudf.DataFrame, cudf.Series, cudf.Index))
 def group_split_2_cudf(df, col):
+
     if not len(df):
         return {}, df
-    ind = df[col].values_host.astype(np.int64)
-    n = ind.max() + 1
-    indexer, locations = groupsort_indexer(ind.view(np.int64), n)
-    df2 = df.take(indexer)
-    locations = locations.cumsum()
-    parts = [df2.iloc[a:b] for a, b in zip(locations[:-1], locations[1:])]
+    import cudf._lib.copying as copying
+    source = [df[c] for c in df.columns]
+    ind_map = df[col]
+    n = ind_map.max() + 1
+    parts = copying.scatter_to_frames(source, ind_map)
+    for i in range(n - len(parts)):
+        parts.append(parts[0].iloc[[]])
     result2 = dict(zip(range(n), parts))
     return result2, df.iloc[:0]
 
@@ -95,9 +100,8 @@ def percentiles_summary_cudf(df, num_old, num_new, upsample, state):
     if is_categorical_dtype(data):
         data = data.codes
         interpolation = "nearest"
-    vals, _ = _percentile(data.get(), qs, interpolation=interpolation)
+    vals, _ = _percentile(data, qs, interpolation=interpolation)
     if interpolation == "linear" and np.issubdtype(data.dtype, np.integer):
         vals = np.around(vals).astype(data.dtype)
     vals_and_weights = percentiles_to_weights(qs, vals, length)
-    print(vals_and_weights)
     return vals_and_weights
