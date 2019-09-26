@@ -169,11 +169,21 @@ def test_roundtrip_from_dask_partitioned(tmpdir, parts):
     ddf2 = dd.from_pandas(df, npartitions=2)
 
     ddf2.to_parquet(tmpdir, engine="pyarrow", partition_on=parts)
-    df_read = dd.read_parquet(tmpdir).compute()
-    gdf_read = dask_cudf.read_parquet(tmpdir).compute()
-    # dask_cudf converts categoricals to original data type,
-    # dask.dataframe does not. Convert types before check...
-    for part in parts:
-        cat_type = df_read[part].dtype._categories.dtype
-        df_read[part] = df_read[part].astype(cat_type)
-    assert_eq(df_read, gdf_read)
+
+    df_read = dd.read_parquet(tmpdir).set_index("index")
+    gdf_read = dask_cudf.read_parquet(tmpdir).set_index("index")
+
+    # import pdb; pdb.set_trace()
+    assert_eq(
+        df_read.compute(scheduler=dask.get),
+        gdf_read.compute(scheduler=dask.get),
+    )
+
+    # df_read = dd.read_parquet(tmpdir).set_index("index").compute()
+    # gdf_read = dask_cudf.read_parquet(tmpdir).set_index("index").compute()
+    # # dask_cudf converts categoricals to original data type,
+    # # dask.dataframe does not. Convert types before check...
+    # for part in parts:
+    #     cat_type = df_read[part].dtype._categories.dtype
+    #     df_read[part] = df_read[part].astype(cat_type)
+    # assert_eq(df_read, gdf_read)
