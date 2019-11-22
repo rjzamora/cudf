@@ -233,3 +233,13 @@ def test_serialize_all_null_string():
 
     recreated = cudf.Series.deserialize(*gd_series.serialize())
     assert_eq(recreated, pd_series)
+
+
+def test_serialize_empty_index():
+
+    gdf = cudf.DataFrame({"a": ["s1", "s2"], "b": [0, 1]})
+    gdf = gdf.set_index("a").iloc[:0]
+
+    typ = type(gdf)
+    res = typ.deserialize(*gdf.serialize())
+    assert_eq(res, gdf)

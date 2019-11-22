@@ -270,10 +270,22 @@ class DataFrame(object):
         # Reconstruct the columns
         column_frames = frames[header["index_frame_count"] :]
 
-        column_names = pickle.loads(header["column_names"])
+        column_names = list(pickle.loads(header["column_names"]))
         columns = column.deserialize_columns(header["columns"], column_frames)
 
-        return cls(dict(zip(column_names, columns)), index=index)
+        # Make sure zero-length indices are preserved
+        if len(index) < 1:
+            index_name = index.name or str(uuid.uuid4())
+            column_names = list(column_names)
+            column_names.append(index_name)
+            columns.append(column.as_column(index))
+            result = cls(dict(zip(column_names, columns))).set_index(
+                index_name
+            )
+            result.index.name = index.name
+            return result
+        else:
+            return cls(dict(zip(column_names, columns)), index=index)
 
     @property
     def dtypes(self):
