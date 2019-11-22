@@ -270,11 +270,13 @@ class DataFrame(object):
         # Reconstruct the columns
         column_frames = frames[header["index_frame_count"] :]
 
-        column_names = list(pickle.loads(header["column_names"]))
+        column_names = pickle.loads(header["column_names"])
         columns = column.deserialize_columns(header["columns"], column_frames)
 
         # Make sure zero-length indices are preserved
         if len(index) < 1:
+            # TODO: This block can be deleted after zero-length indice
+            #       creation is fixed in cudf.DataFrame (GH Issue #3420)
             index_name = index.name or str(uuid.uuid4())
             column_names = list(column_names)
             column_names.append(index_name)
