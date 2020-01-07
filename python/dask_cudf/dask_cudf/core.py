@@ -144,7 +144,8 @@ class DataFrame(_Frame, dd.core.DataFrame):
         )
 
     def merge(self, other, **kwargs):
-        if kwargs.pop("shuffle", "tasks") != "tasks":
+        shuffle = kwargs.pop("shuffle", "tasks")
+        if shuffle not in ["tasks", "tasks-hash"]:
             raise ValueError(
                 "Dask-cudf only supports task based shuffling, got %s"
                 % kwargs["shuffle"]
@@ -152,10 +153,11 @@ class DataFrame(_Frame, dd.core.DataFrame):
         on = kwargs.pop("on", None)
         if isinstance(on, tuple):
             on = list(on)
-        return super().merge(other, on=on, shuffle="tasks", **kwargs)
+        return super().merge(other, on=on, shuffle=shuffle, **kwargs)
 
     def join(self, other, **kwargs):
-        if kwargs.pop("shuffle", "tasks") != "tasks":
+        shuffle = kwargs.pop("shuffle", "tasks")
+        if shuffle not in ["tasks", "tasks-hash"]:
             raise ValueError(
                 "Dask-cudf only supports task based shuffling, got %s"
                 % kwargs["shuffle"]
@@ -164,12 +166,14 @@ class DataFrame(_Frame, dd.core.DataFrame):
         # CuDF doesn't support "right" join yet
         how = kwargs.pop("how", "left")
         if how == "right":
-            return other.join(other=self, how="left", **kwargs)
+            return other.join(
+                other=self, how="left", shuffle=shuffle, **kwargs
+            )
 
         on = kwargs.pop("on", None)
         if isinstance(on, tuple):
             on = list(on)
-        return super().join(other, how=how, on=on, shuffle="tasks", **kwargs)
+        return super().join(other, how=how, on=on, shuffle=shuffle, **kwargs)
 
     def set_index(self, other, **kwargs):
         if kwargs.pop("shuffle", "tasks") != "tasks":
