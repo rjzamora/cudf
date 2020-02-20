@@ -29,6 +29,7 @@
 
 #include <cudf/detail/merge.cuh>
 #include <cudf/strings/detail/merge.cuh>
+#include <cudf/utilities/nvtx_utils.hpp>
 
 namespace { // anonym.
 
@@ -367,21 +368,25 @@ table_ptr_type merge(cudf::table_view const& left_table,
                      cudaStream_t stream = 0) {
     //collect index columns for lhs, rhs, resp.
     //
+    nvtx::range_push("MERGE_PHASE_A", nvtx::color::GREEN);
     cudf::table_view index_left_view{left_table.select(key_cols)};
     cudf::table_view index_right_view{right_table.select(key_cols)};
     bool const nullable = cudf::has_nulls(index_left_view) || cudf::has_nulls(index_right_view);
-
+    nvtx::range_pop();
+    nvtx::range_push("MERGE_PHASE_B", nvtx::color::GREEN);
     //extract merged row order according to indices:
     //
     rmm::device_vector<index_type>
       merged_indices = generate_merged_indices(index_left_view, index_right_view, column_order, null_precedence, nullable);
-
+    nvtx::range_pop();
+    nvtx::range_push("MERGE_PHASE_C", nvtx::color::GREEN);
     //create merged table:
     //    
     auto const n_cols = left_table.num_columns();
     std::vector<std::unique_ptr<column>> merged_cols;
     merged_cols.reserve(n_cols);
-
+    nvtx::range_pop();
+    nvtx::range_push("MERGE_PHASE_D", nvtx::color::GREEN);
     column_merger merger{merged_indices, mr, stream};
     transform(left_table.begin(), left_table.end(), 
               right_table.begin(), 
@@ -392,7 +397,7 @@ table_ptr_type merge(cudf::table_view const& left_table,
                                                            left_col,
                                                            right_col);
               });
-
+    nvtx::range_pop();
     return std::make_unique<cudf::experimental::table>(std::move(merged_cols));
 }
 
@@ -448,7 +453,7 @@ table_ptr_type merge(std::vector<table_view> const& tables_to_merge,
  
     CUDF_EXPECTS(key_cols.size() == column_order.size(),
                  "Mismatched size between key_cols and column_order");
- 
+
     // A queue of (table view, table) pairs
     std::priority_queue<merge_queue_item> merge_queue;
     // The table pointer is null if we do not own the table (input tables)
@@ -467,7 +472,8 @@ table_ptr_type merge(std::vector<table_view> const& tables_to_merge,
     if (merge_queue.empty()) {
       return empty_like(first_table);
     }
-    
+
+    nvtx::range_push("SORTED_MERGE_LOOP", nvtx::color::GREEN);
     // Pick the two smallest tables and merge them
     // Until there is only one table left in the queue
     while (merge_queue.size() > 1) {
@@ -475,6 +481,7 @@ table_ptr_type merge(std::vector<table_view> const& tables_to_merge,
       auto const left_table = top_and_pop(merge_queue);
       // Deallocated at the end of the block
       auto const right_table = top_and_pop(merge_queue);
+      nvtx::range_push("LOOP_MERGE_TABLES", nvtx::color::GREEN);
       auto merged_table = merge(left_table.view, 
                                 right_table.view, 
                                 key_cols, 
@@ -482,10 +489,11 @@ table_ptr_type merge(std::vector<table_view> const& tables_to_merge,
                                 null_precedence, 
                                 mr, 
                                 stream);
+      nvtx::range_pop();
       auto const merged_table_view = merged_table->view();
       merge_queue.emplace(merged_table_view, std::move(merged_table));
     }
-
+    nvtx::range_pop();
     return std::move(top_and_pop(merge_queue).table);
 }
  
@@ -496,7 +504,11 @@ std::unique_ptr<cudf::experimental::table> merge(std::vector<table_view> const& 
                                                  std::vector<cudf::order> const& column_order,
                                                  std::vector<cudf::null_order> const& null_precedence,
                                                  rmm::mr::device_memory_resource* mr){
-  return detail::merge(tables_to_merge, key_cols, column_order, null_precedence, mr);
+  std::unique_ptr<cudf::experimental::table> output_table;
+  nvtx::range_push("CUDF_SORTED_MERGE", nvtx::color::GREEN);
+  output_table = detail::merge(tables_to_merge, key_cols, column_order, null_precedence, mr);
+  nvtx::range_pop();
+  return output_table;
 }
  
 }  // namespace experimental
