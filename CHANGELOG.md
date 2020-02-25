@@ -14,9 +14,11 @@
 - PR #4088 Added asString() on ColumnVector in Java that takes a format string
 - PR #4040 Add support for n-way merge of sorted tables
 - PR #4053 Multi-column quantiles.
+- PR #4100 Add set_keys function for dictionary columns
+- PR #3894 Add remove_keys functions for dictionary columns
 - PR #4107 Add groupby nunique aggregation
-- PR #4127 Add python API for n-way sorted merge (merge_sorted)
 - PR #4153 Support Dask serialization protocol on cuDF objects
+- PR #4127 Add python API for n-way sorted merge (merge_sorted)
 - PR #4164 Add Buffer "constructor-kwargs" header
 - PR #4159 Add COUNT aggregation that includes null values
 - PR #4190 Add libcudf++ transpose Cython implementation
@@ -61,8 +63,10 @@
 - PR #3786 Adding string support to rolling_windows
 - PR #4067 Removed unused `CATEGORY` type ID.
 - PR #3891 Port NVStrings (r)split_record to contiguous_(r)split_record
+- PR #4070 Port NVText normalize_spaces to use libcudf strings column
 - PR #4072 Allow round_robin_partition to single partition
 - PR #4064 Add cudaGetDeviceCount to JNI layer
+- PR #4075 Port nvtext ngrams-tokenize to libcudf++
 - PR #4087 Add support for writing large Parquet files in a chunked manner.
 - PR #3716 Update cudf.to_parquet to use new GPU accelerated Parquet writer
 - PR #4083 Use two partitions in test_groupby_multiindex_reset_index
@@ -95,7 +99,10 @@
 - PR #4191 Porting sort.pyx to use new libcudf APIs
 - PR #4196 reduce CHANGELOG.md merge conflicts
 - PR #4197 Added notebook testing to gpuCI gpu build
+- PR #4219 Port dlpack.pyx to use new libcudf APIs
 - PR #4225 Remove stale notebooks
+- PR #4223 Fix a few of the Cython warnings
+- PR #4234 Add BUILD_LEGACY_TESTS cmake option
 
 ## Bug Fixes
 
@@ -142,12 +149,18 @@
 - PR #4162 Properly handle no index metadata generation for to_parquet
 - PR #4175 Fix `__sizeof__` calculation in `StringColumn`
 - PR #4155 Update groupby group_offsets size and fix unnecessary device dispatch.
+- PR #4186 Fix from_timestamps 12-hour specifiers support
 - PR #4198 Fix constructing `RangeIndex` from `range`
 - PR #4192 Parquet writer: fix OOB read when computing string hash
 - PR #4201 Fix java window tests
 - PR #4199 Fix potential race condition in memcpy_block
+- PR #4221 Fix series dict alignment to not drop index name
+- PR #4218 Fix `get_aggregation` definition with `except *`
 - PR #4215 Fix performance regression in strings::detail::concatenate
 - PR #4214 Alter ValueError exception for GPU accelerated Parquet writer to properly report `categorical` columns are not supported.
+- PR #4232 Fix handling empty tuples of children in string columns
+- PR #4222 Fix no-return compile error in binop-null-test
+- PR #4245 Fix race condition in parquet reader
 
 
 # cuDF 0.12.0 (04 Feb 2020)
