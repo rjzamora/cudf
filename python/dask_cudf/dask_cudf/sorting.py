@@ -454,8 +454,9 @@ def sort_values_experimental(
         (index2,) = dask.base.optimize(index2)
 
         doubledivs = (
-            partition_quantiles(index2, npartitions * 2, upsample=upsample)
-            .compute()
+            # partition_quantiles(index2, npartitions * 2, upsample=upsample)
+            partition_quantiles(df2[by], npartitions * 2, upsample=upsample)
+            .compute(scheduler="single-threaded")
             .to_list()
         )
         # Heuristic: Start with 2x divisions and coarsening

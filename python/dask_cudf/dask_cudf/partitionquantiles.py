@@ -8,12 +8,45 @@ from functools import wraps
 import numpy as np
 import pandas as pd
 from pandas.api.types import is_datetime64tz_dtype
-from toolz import merge, merge_sorted, take
+from toolz import merge, take
 
 from dask.base import tokenize
-from dask.dataframe.core import Series
+from dask.dataframe.core import DataFrame, Series
 from dask.dataframe.utils import is_categorical_dtype
 from dask.utils import random_state_data
+
+import cudf
+from cudf._libxx.quantiles import quantiles
+
+# from toolz import merge, merge_sorted, take
+
+
+interp_dict = {
+    "LINEAR": 0,
+    "LOWER": 1,
+    "HIGHER": 2,
+    "MIDPOINT": 3,
+    "NEAREST": 4,
+}
+sorted_dict = {"YES": 0, "NO": 1}
+order_dict = {"ASCENDING": 0, "DESCENDING": 1}
+null_order_dict = {"BEFORE": 0, "AFTER": 1}
+
+
+def _quantile(a, q, interpolation="LINEAR"):
+    if not len(a):
+        return None
+    if isinstance(q, Iterator):
+        q = list(q)
+    if isinstance(a, cudf.DataFrame):
+        interpolation = "NEAREST"
+    elif isinstance(a._column, cudf.column.StringColumn):
+        interpolation = "NEAREST"
+
+    is_input_sorted = sorted_dict["NO"]
+    return a.__class__._from_table(
+        quantiles(a, q, interp_dict[interpolation], is_input_sorted, [], [])
+    )
 
 
 @wraps(np.percentile)
@@ -218,7 +251,8 @@ def percentiles_to_weights(qs, vals, length):
         return ()
     diff = np.ediff1d(qs, 0.0, 0.0)
     weights = 0.5 * length * (diff[1:] + diff[:-1])
-    return vals.tolist(), weights.tolist()
+    vals["_weights"] = weights
+    return vals
 
 
 def merge_and_compress_summaries(vals_and_weights):
@@ -232,23 +266,71 @@ def merge_and_compress_summaries(vals_and_weights):
     vals_and_weights = [x for x in vals_and_weights if x]
     if not vals_and_weights:
         return ()
-    it = merge_sorted(*[zip(x, y) for x, y in vals_and_weights])
-    vals = []
+    it = cudf.merge_sorted(vals_and_weights)
+    vals = {}
+    val = {}
+    prev_val = {}
     weights = []
-    vals_append = vals.append
-    weights_append = weights.append
-    val, weight = prev_val, prev_weight = next(it)
-    for val, weight in it:
+
+    def vals_append(vals, new_val):
+        for name in vals:
+            vals[name].append(new_val[name])
+        return
+
+    import pdb
+
+    pdb.set_trace()
+
+    for name in it.columns:
+        item = it[name].iloc[0]
+        if name == "_weights":
+            weight = prev_weight = item
+        else:
+            vals[name] = []
+            val[name] = item
+            prev_val[name] = item
+
+    import pdb
+
+    pdb.set_trace()
+
+    for ind in range(1, len(it)):
+        val = {
+            name: it[name].iloc[ind]
+            for name in it.columns
+            if name != "_weights"
+        }
+        weight = it["_weights"].iloc[ind]
         if val == prev_val:
             prev_weight += weight
         else:
-            vals_append(prev_val)
-            weights_append(prev_weight)
+            vals_append(vals, prev_val)
+            weights.append(prev_weight)
             prev_val, prev_weight = val, weight
     if val == prev_val:
-        vals_append(prev_val)
-        weights_append(prev_weight)
-    return vals, weights
+        vals_append(vals, prev_val)
+        weights.append(prev_weight)
+    ret_vals = cudf.DataFrame(vals)
+    ret_vals["_weights"] = weights
+    return ret_vals
+
+    # it = merge_sorted(*[zip(x, y) for x, y in vals_and_weights])
+    # vals = []
+    # weights = []
+    # vals_append = vals.append
+    # weights_append = weights.append
+    # val, weight = prev_val, prev_weight = next(it)
+    # for val, weight in it:
+    #     if val == prev_val:
+    #         prev_weight += weight
+    #     else:
+    #         vals_append(prev_val)
+    #         weights_append(prev_weight)
+    #         prev_val, prev_weight = val, weight
+    # if val == prev_val:
+    #     vals_append(prev_val)
+    #     weights_append(prev_weight)
+    # return vals, weights
 
 
 def process_val_weights(vals_and_weights, npartitions, dtype_info):
@@ -265,84 +347,107 @@ def process_val_weights(vals_and_weights, npartitions, dtype_info):
     aren't enough unique values in the column.  Increasing ``upsample``
     keyword argument in ``df.set_index`` may help.
     """
-    dtype, info = dtype_info
-
-    if not vals_and_weights:
-        try:
-            return np.array(None, dtype=dtype)
-        except Exception:
-            # dtype does not support None value so allow it to change
-            return np.array(None, dtype=np.float_)
-
-    vals, weights = vals_and_weights
-    vals = np.array(vals)
-    weights = np.array(weights)
-
-    # We want to create exactly `npartition` number of groups of `vals` that
-    # are approximately the same weight and non-empty if possible.  We use a
-    # simple approach (more accurate algorithms exist):
-    # 1. Remove all the values with weights larger than the relative
-    #    percentile width from consideration (these are `jumbo`s)
-    # 2. Calculate percentiles with "interpolation=left" of percentile-like
-    #    weights of the remaining values.  These are guaranteed to be unique.
-    # 3. Concatenate the values from (1) and (2), sort, and return.
-    #
-    # We assume that all values are unique, which happens in the previous
-    # step `merge_and_compress_summaries`.
-
-    if len(vals) == npartitions + 1:
-        rv = vals
-    elif len(vals) < npartitions + 1:
-        # The data is under-sampled
-        if np.issubdtype(vals.dtype, np.number) and not is_categorical_dtype(
-            dtype
-        ):
-            # Interpolate extra divisions
-            q_weights = np.cumsum(weights)
-            q_target = np.linspace(
-                q_weights[0], q_weights[-1], npartitions + 1
+    if isinstance(vals_and_weights, (cudf.Series, cudf.DataFrame)):
+        weights = vals_and_weights["_weights"].tolist()
+        vals = vals_and_weights.drop(columns=["_weights"])
+        # vals, weights = vals_and_weights
+        if len(vals) == npartitions + 1:
+            rv = vals
+        elif len(vals) < npartitions + 1:
+            raise ValueError(
+                "Data is under-sampled!" " Try increasing upsample argument."
             )
-            rv = np.interp(q_target, q_weights, vals)
         else:
-            # Distribute the empty partitions
-            duplicated_index = np.linspace(
-                0, len(vals) - 1, npartitions - len(vals) + 1, dtype=int
-            )
-            duplicated_vals = vals[duplicated_index]
-            rv = np.concatenate([vals, duplicated_vals])
-            rv.sort()
+            target_weight = weights.sum() / npartitions
+            jumbo_mask = weights >= target_weight
+            jumbo_vals = vals[jumbo_mask]
+
+            trimmed_vals = vals[~jumbo_mask]
+            trimmed_weights = weights[~jumbo_mask]
+            trimmed_npartitions = npartitions - len(jumbo_vals)
+
+            # percentile-like, but scaled by weights
+            q_weights = np.cumsum(trimmed_weights)
+            q_target = np.linspace(0, q_weights[-1], trimmed_npartitions + 1)
+
+            left = np.searchsorted(q_weights, q_target, side="left")
+            right = np.searchsorted(q_weights, q_target, side="right") - 1
+            # stay inbounds
+            np.maximum(right, 0, right)
+            lower = np.minimum(left, right)
+            trimmed = trimmed_vals[lower]
+
+            # rv = np.concatenate([trimmed, jumbo_vals])
+            rv = cudf.concat([trimmed, jumbo_vals])
+            rv.sort_values(rv.columns)
+        return rv
     else:
-        target_weight = weights.sum() / npartitions
-        jumbo_mask = weights >= target_weight
-        jumbo_vals = vals[jumbo_mask]
+        dtype, info = dtype_info
 
-        trimmed_vals = vals[~jumbo_mask]
-        trimmed_weights = weights[~jumbo_mask]
-        trimmed_npartitions = npartitions - len(jumbo_vals)
+        if not vals_and_weights:
+            try:
+                return np.array(None, dtype=dtype)
+            except Exception:
+                # dtype does not support None value so allow it to change
+                return np.array(None, dtype=np.float_)
 
-        # percentile-like, but scaled by weights
-        q_weights = np.cumsum(trimmed_weights)
-        q_target = np.linspace(0, q_weights[-1], trimmed_npartitions + 1)
+        vals, weights = vals_and_weights
+        vals = np.array(vals)
+        weights = np.array(weights)
 
-        left = np.searchsorted(q_weights, q_target, side="left")
-        right = np.searchsorted(q_weights, q_target, side="right") - 1
-        # stay inbounds
-        np.maximum(right, 0, right)
-        lower = np.minimum(left, right)
-        trimmed = trimmed_vals[lower]
+        if len(vals) == npartitions + 1:
+            rv = vals
+        elif len(vals) < npartitions + 1:
+            # The data is under-sampled
+            if np.issubdtype(
+                vals.dtype, np.number
+            ) and not is_categorical_dtype(dtype):
+                # Interpolate extra divisions
+                q_weights = np.cumsum(weights)
+                q_target = np.linspace(
+                    q_weights[0], q_weights[-1], npartitions + 1
+                )
+                rv = np.interp(q_target, q_weights, vals)
+            else:
+                # Distribute the empty partitions
+                duplicated_index = np.linspace(
+                    0, len(vals) - 1, npartitions - len(vals) + 1, dtype=int
+                )
+                duplicated_vals = vals[duplicated_index]
+                rv = np.concatenate([vals, duplicated_vals])
+                rv.sort()
+        else:
+            target_weight = weights.sum() / npartitions
+            jumbo_mask = weights >= target_weight
+            jumbo_vals = vals[jumbo_mask]
 
-        rv = np.concatenate([trimmed, jumbo_vals])
-        rv.sort()
+            trimmed_vals = vals[~jumbo_mask]
+            trimmed_weights = weights[~jumbo_mask]
+            trimmed_npartitions = npartitions - len(jumbo_vals)
 
-    if is_categorical_dtype(dtype):
-        rv = pd.Categorical.from_codes(rv, info[0], info[1])
-    elif is_datetime64tz_dtype(dtype):
-        rv = pd.DatetimeIndex(rv).tz_localize(dtype.tz)
-    elif "datetime64" in str(dtype):
-        rv = pd.DatetimeIndex(rv, dtype=dtype)
-    elif rv.dtype != dtype:
-        rv = rv.astype(dtype)
-    return rv
+            # percentile-like, but scaled by weights
+            q_weights = np.cumsum(trimmed_weights)
+            q_target = np.linspace(0, q_weights[-1], trimmed_npartitions + 1)
+
+            left = np.searchsorted(q_weights, q_target, side="left")
+            right = np.searchsorted(q_weights, q_target, side="right") - 1
+            # stay inbounds
+            np.maximum(right, 0, right)
+            lower = np.minimum(left, right)
+            trimmed = trimmed_vals[lower]
+
+            rv = np.concatenate([trimmed, jumbo_vals])
+            rv.sort()
+
+        if is_categorical_dtype(dtype):
+            rv = pd.Categorical.from_codes(rv, info[0], info[1])
+        elif is_datetime64tz_dtype(dtype):
+            rv = pd.DatetimeIndex(rv).tz_localize(dtype.tz)
+        elif "datetime64" in str(dtype):
+            rv = pd.DatetimeIndex(rv, dtype=dtype)
+        elif rv.dtype != dtype:
+            rv = rv.astype(dtype)
+        return rv
 
 
 def percentiles_summary(df, num_old, num_new, upsample, state):
@@ -353,7 +458,7 @@ def percentiles_summary(df, num_old, num_new, upsample, state):
 
     Parameters
     ----------
-    df: pandas.Series
+    df: cudf.Series or cudf.DatFrame
         Data to summarize
     num_old: int
         Number of partitions of the current object
@@ -368,33 +473,25 @@ def percentiles_summary(df, num_old, num_new, upsample, state):
         return ()
     random_state = np.random.RandomState(state)
     qs = sample_percentiles(num_old, num_new, length, upsample, random_state)
-    data = df.values
-    interpolation = "linear"
-    if is_categorical_dtype(data):
-        data = data.codes
-        interpolation = "nearest"
-    vals, n = _percentile(data, qs, interpolation=interpolation)
-    if interpolation == "linear" and np.issubdtype(data.dtype, np.integer):
-        vals = np.round(vals).astype(data.dtype)
-    vals_and_weights = percentiles_to_weights(qs, vals, length)
-    return vals_and_weights
+    vals = _quantile(df, qs)
+    return percentiles_to_weights(qs, vals, length)
 
 
 def dtype_info(df):
-    info = None
-    if is_categorical_dtype(df):
-        data = df.values
-        info = (data.categories, data.ordered)
-    return df.dtype, info
+    if isinstance(df, Series):
+        return df.to_frame().dtypes
+    return df.dtypes
 
 
 def partition_quantiles(df, npartitions, upsample=1.0, random_state=None):
-    """ Approximate quantiles of Series used for repartitioning
+    """ Approximate quantiles of Series.DataFrame used for repartitioning
     """
-    assert isinstance(df, Series)
-    # currently, only Series has quantile method
+    assert isinstance(df, (Series, DataFrame))
+    # currently, only Series has quantile method in pandas
     # Index.quantile(list-like) must be pd.Series, not pd.Index
-    return_type = Series
+    #
+    # cudf supports Series and DataFrame
+    return_type = df.__class__
 
     qs = np.linspace(0, 1, npartitions + 1)
     token = tokenize(df, qs, upsample)
@@ -435,13 +532,19 @@ def partition_quantiles(df, npartitions, upsample=1.0, random_state=None):
     name3 = "re-quantiles-3-" + token
     last_dsk = {
         (name3, 0): (
-            pd.Series,  # TODO: Use `type(df._meta)` when cudf adds `tolist()`
+            cudf.DataFrame,  # TODO: Use `type(df._meta)` when cudf..
             (process_val_weights, merged_key, npartitions, (name0, 0)),
-            qs,
-            None,
-            df.name,
         )
     }
+    # last_dsk = {
+    #     (name3, 0): (
+    #         pd.Series,  # TODO: Use `type(df._meta)` when cudf adds..
+    #         (process_val_weights, merged_key, npartitions, (name0, 0)),
+    #         qs,
+    #         None,
+    #         df.name,
+    #     )
+    # }
 
     dsk = merge(df.dask, dtype_dsk, val_dsk, merge_dsk, last_dsk)
     new_divisions = [0.0, 1.0]
