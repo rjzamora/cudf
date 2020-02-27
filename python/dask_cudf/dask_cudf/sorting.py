@@ -1,15 +1,17 @@
 # Copyright (c) 2020, NVIDIA CORPORATION.
 import math
 import warnings
+from collections.abc import Iterator
 from operator import getitem
 
 import numpy as np
+import cupy
 import toolz
 
 import dask
 from dask import compute, delayed
 from dask.base import tokenize
-from dask.dataframe.core import DataFrame, _concat
+from dask.dataframe.core import Series, Index, DataFrame, Scalar, _concat, quantile
 from dask.dataframe.shuffle import rearrange_by_column, shuffle_group_get
 from dask.dataframe.utils import group_split_dispatch
 from dask.highlevelgraph import HighLevelGraph
@@ -388,6 +390,94 @@ def rearrange_by_division_list(
     return df3
 
 
+def _percentile(a, q, interpolation="linear"):
+    n = len(a)
+    if not len(a):
+        return None, n
+    if isinstance(q, Iterator):
+        q = list(q)
+    if a.dtype.name == "category":
+        result = np.percentile(a.codes, q, interpolation=interpolation)
+        import pandas as pd
+
+        return pd.Categorical.from_codes(result, a.categories, a.ordered), n
+    if np.issubdtype(a.dtype, np.datetime64):
+        a2 = a.astype("i8")
+        result = np.percentile(a2, q, interpolation=interpolation)
+        return result.astype(a.dtype), n
+    if not np.issubdtype(a.dtype, np.number):
+        interpolation = "nearest"
+    quant = np.percentile(a, q, interpolation=interpolation)
+    return cupy.asnumpy(quant), n
+
+
+def quantile(df, q):
+    """Approximate quantiles of Series.
+
+    Parameters
+    ----------
+    q : list/array of floats
+        Iterable of numbers ranging from 0 to 100 for the desired quantiles
+    """
+    # current implementation needs q to be sorted so
+    # sort if array-like, otherwise leave it alone
+    q_ndarray = np.array(q)
+    if q_ndarray.ndim > 0:
+        q_ndarray.sort(kind="mergesort")
+        q = q_ndarray
+
+    assert isinstance(df, Series)
+
+    # currently, only Series has quantile method
+    if isinstance(df, Index):
+        meta = gd.Series(df._meta_nonempty).quantile(q=q)
+    else:
+        meta = df._meta_nonempty.quantile(q=q)
+
+    # Index.quantile(list-like) must be pd.Series, not pd.Index
+    df_name = df.name
+    finalize_tsk = lambda tsk: (gd.Series, tsk, q, None, df_name)
+    return_type = Series
+
+    # pandas uses quantile in [0, 1]
+    # numpy / everyone else uses [0, 100]
+    qs = np.asarray(q) * 100
+    token = tokenize(df, qs)
+
+    if len(qs) == 0:
+        name = "quantiles-" + token
+        empty_index = gd.Index([], dtype=float)
+        return Series(
+            {(name, 0): gd.Series([], name=df.name, index=empty_index, dtype="float")},
+            name,
+            df._meta,
+            [None, None],
+        )
+    else:
+        new_divisions = [np.min(q), np.max(q)]
+
+    df = df.dropna()
+
+    # from dask.array.percentile import _percentile, merge_percentiles
+    from dask.array.percentile import merge_percentiles
+
+    name = "quantiles-1-" + token
+    val_dsk = {
+        (name, i): (_percentile, (getattr, key, "values"), qs)
+        for i, key in enumerate(df.__dask_keys__())
+    }
+
+    name2 = "quantiles-2-" + token
+    merge_dsk = {
+        (name2, 0): finalize_tsk(
+            (merge_percentiles, qs, [qs] * df.npartitions, sorted(val_dsk))
+        )
+    }
+    dsk = toolz.merge(val_dsk, merge_dsk)
+    graph = HighLevelGraph.from_collections(name2, dsk, dependencies=[df])
+    return return_type(graph, name2, meta, new_divisions)
+
+
 def sort_values_experimental(
     df,
     by,
@@ -450,18 +540,23 @@ def sort_values_experimental(
     ):
         # TODO: Use input divisions for use_explicit==True
 
-        index2 = df2[index]
-        (index2,) = dask.base.optimize(index2)
+        # index2 = df2[index]
+        # (index2,) = dask.base.optimize(index2)
 
-        doubledivs = (
-            # partition_quantiles(index2, npartitions * 2, upsample=upsample)
-            partition_quantiles(df2[by], npartitions * 2, upsample=upsample)
-            .compute(scheduler="single-threaded")
-            .to_list()
-        )
-        # Heuristic: Start with 2x divisions and coarsening
-        divisions = [doubledivs[i] for i in range(0, len(doubledivs), 2)]
-        divisions[-1] += 1  # Make sure the last division is large enough
+        qn = np.linspace(0.0, 1.0, npartitions + 1).tolist()
+        divisions = quantile(df2[index], qn).astype("int").compute().values.tolist()
+        max_val = df2[index].max().compute()
+
+        # doubledivs = (
+        #     # partition_quantiles(index2, npartitions * 2, upsample=upsample)
+        #     partition_quantiles(df2[by], npartitions * 2, upsample=upsample)
+        #     .compute(scheduler="single-threaded")
+        #     .to_list()
+        # )
+        # # Heuristic: Start with 2x divisions and coarsening
+        # divisions = [doubledivs[i] for i in range(0, len(doubledivs), 2)]
+        divisions[0] = 0
+        divisions[-1] = max_val + 1  # Make sure the last division is large enough
     else:
         # For now we can accept multi-column divisions as a dataframe
         if isinstance(divisions, gd.DataFrame):
