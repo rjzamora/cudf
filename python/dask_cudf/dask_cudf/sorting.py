@@ -394,21 +394,7 @@ def _percentile(a, q, interpolation="linear"):
     n = len(a)
     if not len(a):
         return None, n
-    if isinstance(q, Iterator):
-        q = list(q)
-    if a.dtype.name == "category":
-        result = np.percentile(a.codes, q, interpolation=interpolation)
-        import pandas as pd
-
-        return pd.Categorical.from_codes(result, a.categories, a.ordered), n
-    if np.issubdtype(a.dtype, np.datetime64):
-        a2 = a.astype("i8")
-        result = np.percentile(a2, q, interpolation=interpolation)
-        return result.astype(a.dtype), n
-    if not np.issubdtype(a.dtype, np.number):
-        interpolation = "nearest"
-    quant = np.percentile(a, q, interpolation=interpolation)
-    return cupy.asnumpy(quant), n
+    return cupy.asnumpy(gd.Series(a).quantile(q).values), n
 
 
 def quantile(df, q):
@@ -441,7 +427,7 @@ def quantile(df, q):
 
     # pandas uses quantile in [0, 1]
     # numpy / everyone else uses [0, 100]
-    qs = np.asarray(q) * 100
+    qs = np.asarray(q) #* 100
     token = tokenize(df, qs)
 
     if len(qs) == 0:
@@ -543,9 +529,10 @@ def sort_values_experimental(
         # index2 = df2[index]
         # (index2,) = dask.base.optimize(index2)
 
-        qn = np.linspace(0.0, 1.0, npartitions + 1).tolist()
-        divisions = quantile(df2[index], qn).astype("int").compute().values.tolist()
-        max_val = df2[index].max().compute()
+        #import pdb; pdb.set_trace()
+        qn = np.linspace(0.0, 1.0, (npartitions * 1) + 1).tolist()
+        divisions = (quantile(df2[index], qn).astype("int").compute().values + 1).tolist()
+        #max_val = df2[index].max().compute()
 
         # doubledivs = (
         #     # partition_quantiles(index2, npartitions * 2, upsample=upsample)
@@ -556,7 +543,7 @@ def sort_values_experimental(
         # # Heuristic: Start with 2x divisions and coarsening
         # divisions = [doubledivs[i] for i in range(0, len(doubledivs), 2)]
         divisions[0] = 0
-        divisions[-1] = max_val + 1  # Make sure the last division is large enough
+        #divisions[-1] = max_val + 1  # Make sure the last division is large enough
     else:
         # For now we can accept multi-column divisions as a dataframe
         if isinstance(divisions, gd.DataFrame):
