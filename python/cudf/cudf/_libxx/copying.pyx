@@ -279,6 +279,39 @@ def scatter_to_tables(Table source_table, Column partition_map,
     return result
 
 
+def partition(Table source_table, Column partition_map, int num_partitions,
+              bool keep_index=True):
+    cdef int c_num_partitions = num_partitions
+    cdef table_view c_source_view
+    if keep_index is True:
+        c_source_view = source_table.view()
+    else:
+        c_source_view = source_table.data_view()
+    cdef column_view c_partition_map_view = partition_map.view()
+
+    cdef pair[unique_ptr[table], vector[libcudf_types.size_type]] c_result
+    with nogil:
+        c_result = move(
+            cpp_partition(
+                c_source_view,
+                c_partition_map_view,
+                c_num_partitions
+            )
+        )
+
+    return (
+        Table.from_unique_ptr(
+            move(c_result.first),
+            column_names=source_table._column_names,
+            index_names=source_table._index_names if(
+                keep_index is True)
+            else None
+
+        ),
+        list(c_result.second)
+    )
+
+
 def column_empty_like(Column input_column):
 
     cdef column_view input_column_view = input_column.view()
