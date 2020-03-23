@@ -20,6 +20,7 @@ from cudf._libxx.cpp.column.column_view cimport (
     mutable_column_view
 )
 from cudf._libxx.cpp.libcpp.functional cimport reference_wrapper
+from cudf._libxx.cpp.partitioning cimport partition as cpp_partition
 from cudf._libxx.cpp.scalar.scalar cimport scalar
 from cudf._libxx.cpp.table.table cimport table
 from cudf._libxx.cpp.table.table_view cimport table_view
