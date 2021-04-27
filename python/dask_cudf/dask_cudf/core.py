@@ -375,6 +375,10 @@ class Series(_Frame, dd.core.Series):
             meta="i8",
         )
 
+    @property
+    def list(self):
+        return CudfListMethods(self)
+
     def mean(self, split_every=False):
         sum = self.sum(split_every=split_every)
         n = self.count(split_every=split_every)
@@ -731,3 +735,33 @@ for name in ["lt", "gt", "le", "ge", "ne", "eq"]:
     meth = getattr(cudf.Series, name)
     kwargs = {"original": cudf.Series} if DASK_VERSION >= "2.11.1" else {}
     Series._bind_comparison_method(name, meth, **kwargs)
+
+
+class CudfListMethods:
+    def __init__(self, ddf):
+        self.ddf = ddf
+
+    @property
+    def leaves(self):
+        return map_partitions(
+            lambda x: x.list.leaves, self.ddf, meta=self.ddf._meta.list.leaves,
+        )
+
+    @classmethod
+    def _bind_list_method(
+        cls, name, op, original=cudf.core.column.lists.ListMethods
+    ):
+        """ bind list method to this class """
+
+        def meth(self):
+            return map_partitions(
+                lambda x: op(x.list), self.ddf, meta=op(self.ddf._meta.list),
+            )
+
+        meth.__name__ = name
+        setattr(cls, name, derived_from(original)(meth))
+
+
+for name in ["len", "unique"]:
+    meth = getattr(cudf.core.column.lists.ListMethods, name)
+    CudfListMethods._bind_list_method(name, meth)
