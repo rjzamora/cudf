@@ -34,6 +34,7 @@ from cudf._lib.cpp.io.types cimport (
 )
 from cudf._lib.cpp.table.table_view cimport table_view
 from cudf._lib.cpp.types cimport data_type, size_type, type_id
+from cudf._lib.io.datasource cimport NativeFileDatasource
 from cudf._lib.io.utils cimport (
     make_sink_info,
     make_source_info,
@@ -49,6 +50,8 @@ from cudf._lib.types cimport underlying_type_t_type_id
 import numpy as np
 
 from cudf._lib.utils cimport data_from_unique_ptr, get_column_names
+
+from pyarrow.lib import NativeFile
 
 from cudf._lib.utils import _index_level_name, generate_pandas_metadata
 from cudf.api.types import is_list_dtype, is_struct_dtype
@@ -206,6 +209,9 @@ cdef orc_reader_options make_orc_reader_options(
     object decimal_cols_as_float
 ) except*:
 
+    for i, datasource in enumerate(filepaths_or_buffers):
+        if isinstance(datasource, NativeFile):
+            filepaths_or_buffers[i] = NativeFileDatasource(datasource)
     cdef vector[string] c_column_names
     cdef vector[vector[size_type]] strps = stripes
     c_column_names.reserve(len(column_names))
