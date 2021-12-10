@@ -2,7 +2,6 @@
 
 import warnings
 from collections import defaultdict
-from functools import partial
 from uuid import uuid4
 
 import fsspec
@@ -306,66 +305,66 @@ def _process_dataset(
     )
 
 
-def _get_remote_open_func(
-    use_fsspec_parquet=True,
-    fs=None,
-    columns=None,
-    row_groups=None,
-    mode="rb",
-    open_cb=None,
-    engine="pyarrow",
-    **kwargs,
-):
+# def _get_remote_open_func(
+#     use_fsspec_parquet=True,
+#     fs=None,
+#     columns=None,
+#     row_groups=None,
+#     mode="rb",
+#     open_cb=None,
+#     engine="pyarrow",
+#     **kwargs,
+# ):
 
-    # Return None if this is not a remote fs
-    if fs is None or ioutils._is_local_filesystem(fs):
-        return None
+#     # Return None if this is not a remote fs
+#     if fs is None or ioutils._is_local_filesystem(fs):
+#         return None
 
-    # Use call-back function if one was specified
-    if open_cb is not None:
-        return open_cb
+#     # Use call-back function if one was specified
+#     if open_cb is not None:
+#         return open_cb
 
-    # Check if fsspec.parquet is available
-    use_fsspec_parquet = bool(use_fsspec_parquet)
-    if use_fsspec_parquet and not bool(fsspec_parquet):
-        use_kwargs = {}  # Clear kwargs
-        use_fsspec_parquet = False
+#     # Check if fsspec.parquet is available
+#     use_fsspec_parquet = bool(use_fsspec_parquet)
+#     if use_fsspec_parquet and not bool(fsspec_parquet):
+#         use_kwargs = {}  # Clear kwargs
+#         use_fsspec_parquet = False
 
-    # Older versions of s3fs may not work properly with
-    # `fsspec.parquet.open_parquet_file`. To be safe,
-    # we should check if fs is based on s3fs, and
-    # set `use_fsspec_parquet=False` if the version is
-    # too old
-    use_kwargs = kwargs.copy()
-    if use_fsspec_parquet and "s3" in fs.protocol:
-        try:
-            import s3fs
+#     # Older versions of s3fs may not work properly with
+#     # `fsspec.parquet.open_parquet_file`. To be safe,
+#     # we should check if fs is based on s3fs, and
+#     # set `use_fsspec_parquet=False` if the version is
+#     # too old
+#     use_kwargs = kwargs.copy()
+#     if use_fsspec_parquet and "s3" in fs.protocol:
+#         try:
+#             import s3fs
 
-            use_fsspec_parquet = parse_version(
-                s3fs.__version__
-            ) > parse_version("2021.11.0")
-        except ImportError:
-            pass
-        if not use_fsspec_parquet:
-            use_kwargs = {}  # Clear kwargs
-            warnings.warn(
-                f"This version of s3fs ({s3fs.__version__}) does not "
-                f"support optimized parquet-file opening. Please update "
-                f"to the latest s3fs version for better performance."
-            )
+#             use_fsspec_parquet = parse_version(
+#                 s3fs.__version__
+#             ) > parse_version("2021.11.0")
+#         except ImportError:
+#             pass
+#         if not use_fsspec_parquet:
+#             use_kwargs = {}  # Clear kwargs
+#             warnings.warn(
+#                 f"This version of s3fs ({s3fs.__version__}) does not "
+#                 f"support optimized parquet-file opening. Please update "
+#                 f"to the latest s3fs version for better performance."
+#             )
 
-    # Return the appropriate open function
-    if use_fsspec_parquet:
-        return partial(
-            fsspec_parquet.open_parquet_file,
-            mode=mode,
-            fs=fs,
-            columns=columns,
-            row_groups=row_groups,
-            engine=engine,
-            **use_kwargs,
-        )
-    return partial(fs.open, mode=mode, **use_kwargs)
+#     # Return the appropriate open function
+#     if use_fsspec_parquet:
+#         return partial(
+#             fsspec_parquet.open_parquet_file,
+#             mode=mode,
+#             fs=fs,
+#             columns=columns,
+#             row_groups=row_groups,
+#             engine=engine,
+#             **use_kwargs,
+#         )
+#     return partial(fs.open, mode=mode, **use_kwargs)
 
 
 @ioutils.doc_read_parquet()
@@ -433,10 +432,11 @@ def read_parquet(
 
     # Check for a remote-open function
     remote_open = (
-        _get_remote_open_func(
+        ioutils._get_remote_open_func(
             fs=fs,
             columns=columns,
             row_groups=row_groups,
+            file_format="parquet",
             **(open_options or {}),
         )
         if paths

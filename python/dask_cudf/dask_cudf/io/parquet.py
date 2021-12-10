@@ -20,8 +20,8 @@ except ImportError:
 import cudf
 from cudf.core.column import as_column, build_categorical_column
 from cudf.io import write_to_dataset
-from cudf.io.parquet import _get_remote_open_func
 from cudf.utils.dtypes import cudf_dtype_from_pa_type
+from cudf.utils.ioutils import _get_remote_open_func
 
 
 class CudfEngine(ArrowDatasetEngine):
@@ -78,6 +78,7 @@ class CudfEngine(ArrowDatasetEngine):
             fs=fs,
             columns=columns,
             row_groups=row_groups,
+            file_format="parquet",
             **(open_options or {}),
         )
 

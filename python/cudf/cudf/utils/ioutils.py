@@ -3,6 +3,8 @@
 import datetime
 import os
 import urllib
+import warnings
+from functools import partial
 from io import BufferedWriter, BytesIO, IOBase, TextIOWrapper
 from threading import Thread
 
@@ -11,6 +13,7 @@ import fsspec.implementations.local
 import numpy as np
 import pandas as pd
 from fsspec.core import get_fs_token_paths
+from packaging.version import parse as parse_version
 from pyarrow import PythonFile as ArrowPythonFile
 from pyarrow.fs import FSSpecHandler, PyFileSystem
 from pyarrow.lib import NativeFile
@@ -1197,6 +1200,127 @@ def _get_filesystem_and_paths(path_or_data, **kwargs):
                 raise e
 
     return fs, return_paths
+
+
+def _known_parts_open(
+    path,
+    fs=None,
+    mode="rb",
+    known_starts=None,
+    known_ends=None,
+    max_block=256_000_000,
+    **kwargs,
+):
+    # Check inputs
+    known_starts = known_starts or []
+    known_ends = known_ends or []
+    if len(known_starts) != len(known_ends):
+        raise ValueError(
+            f"known_starts and known_ends must be the same "
+            f"length. Got {len(known_starts)} and "
+            f"{len(known_ends)}."
+        )
+
+    # Collect the file in groups of `max_block` bytes
+    if not known_starts:
+        file_size = fs.size(path)
+        for b in range(0, file_size, max_block):
+            known_starts.append(b)
+            known_ends.append(min(b + max_block, file_size))
+
+    # Use cat_ranges to gather the data byte_ranges
+    known_parts = {}
+    ranges = ([path] * len(known_starts), known_starts, known_ends)
+    for start, end, data in zip(*ranges[:2], fs.cat_ranges(*ranges)):
+        known_parts[(start, end)] = data
+
+    # Return open file
+    options = kwargs.pop("cache_options", {}).copy()
+    return fs.open(
+        path,
+        mode=mode,
+        cache_type="parts",
+        cache_options={**options, **{"data": known_parts, "strict": False}},
+        **kwargs,
+    )
+
+
+def _get_remote_open_func(
+    fs=None,
+    open_cb=None,
+    mode="rb",
+    engine="pyarrow",
+    file_format=None,
+    known_starts=None,
+    known_ends=None,
+    **kwargs,
+):
+
+    # Return None if this is not a remote fs
+    if fs is None or _is_local_filesystem(fs):
+        return None
+
+    # Use call-back function if one was specified
+    if open_cb is not None:
+        return open_cb
+
+    # If "parts" is not specified as the cache_type,
+    # just return the `fs.open` function
+    if kwargs.get("cache_type", None) != "parts":
+        return partial(fs.open, mode=mode, **kwargs)
+
+    # Check for "parts" support
+    supported = parse_version(fsspec.__version__) > parse_version("2021.11.0")
+
+    # Check that the current s3fs version supports
+    # the "parts" caching strategy
+    if supported and "s3" in fs.protocol:
+        try:
+            import s3fs
+
+            supported = parse_version(s3fs.__version__) > parse_version(
+                "2021.11.0"
+            )
+        except ImportError:
+            pass
+        if not supported:
+            warnings.warn(
+                f"This version of s3fs ({s3fs.__version__}) does not "
+                f"support the 'parts' cache in fsspec. Please update "
+                f"to the latest s3fs version for better performance."
+            )
+
+    # We are using fs.open due to a lack of support
+    # in fsspec and/or s3fs. Drop kwargs
+    if not supported:
+        return partial(fs.open, mode=mode)
+
+    # Now we are ready for format-specific parts caching
+    if file_format == "parquet":
+        # Parquet already has a dedicated function in fsspec
+        return partial(
+            fsspec.parquet.open_parquet_file,
+            mode=mode,
+            fs=fs,
+            engine=engine,
+            **kwargs,
+        )
+    elif file_format is not None:
+        # Only "parquet" or None are supported for now
+        raise ValueError(
+            f"{file_format} not a supported `file_format` option."
+        )
+    else:
+        # For other formats, we will cache the entire file,
+        # or transfer data from known offsets (starts and ends)
+        return partial(
+            _known_parts_open,
+            mode=mode,
+            fs=fs,
+            known_starts=known_starts,
+            known_ends=known_ends,
+            **kwargs,
+        )
 
 
 def get_filepath_or_buffer(
