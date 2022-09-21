@@ -5,6 +5,7 @@ from typing import Set
 import numpy as np
 import pandas as pd
 
+from dask import config
 from dask.dataframe.core import (
     DataFrame as DaskDataFrame,
     aca,
@@ -515,7 +516,10 @@ def _shuffle_aggregate(
         chunk,
         *args,
         meta=chunk(
-            *[arg._meta if isinstance(arg, _Frame) else arg for arg in args],
+            *[
+                arg._meta_nonempty if isinstance(arg, _Frame) else arg
+                for arg in args
+            ],
             **chunk_kwargs,
         ),
         enforce_metadata=False,
@@ -539,7 +543,7 @@ def _shuffle_aggregate(
             )
             .map_partitions(
                 aggregate,
-                meta=aggregate(chunked._meta, **aggregate_kwargs),
+                meta=aggregate(chunked._meta_nonempty, **aggregate_kwargs),
                 enforce_metadata=False,
                 **aggregate_kwargs,
             )
@@ -552,7 +556,7 @@ def _shuffle_aggregate(
             shuffle=shuffle,
         ).map_partitions(
             aggregate,
-            meta=aggregate(chunked._meta, **aggregate_kwargs),
+            meta=aggregate(chunked._meta_nonempty, **aggregate_kwargs),
             enforce_metadata=False,
             **aggregate_kwargs,
         )
@@ -690,6 +694,17 @@ def groupby_agg(
     if sort and split_out > 1 and shuffle is None:
         shuffle = "tasks"
 
+    # Try reducing ddf down to a single partition per worker
+    ddf, chunk, chunk_kwargs = _worker_reduce(
+        ddf,
+        chunk,
+        chunk_kwargs,
+        combine,
+        combine_kwargs,
+        split_out,
+        split_every,
+    )
+
     # Check if we are using the shuffle-based algorithm
     if shuffle:
         try:
@@ -762,6 +777,128 @@ def _redirect_aggs(arg):
     if isinstance(arg, list):
         return [redirects.get(agg, agg) for agg in arg]
     return redirects.get(arg, arg)
+
+
+@_dask_cudf_nvtx_annotate
+def _worker_reduce(
+    ddf,
+    chunk,
+    chunk_kwargs,
+    combine,
+    combine_kwargs,
+    split_out,
+    split_every,
+):
+    """Perform local ACA aggregation on the worker-local partitions"""
+
+    worker_reduce = config.get("worker-reduce", False)
+    if not worker_reduce:
+        return ddf, chunk, chunk_kwargs
+
+    try:
+        from collections import defaultdict
+
+        from toolz import first
+
+        from dask.base import compute_as_if_collection, tokenize
+        from dask.dataframe.core import new_dd_object
+        from dask.dataframe.utils import make_meta
+        from dask.delayed import delayed
+        from dask.distributed import get_client, wait
+
+        client = get_client()
+        worker_addresses = list(client.run(lambda: 42).keys())
+    except (ImportError, ValueError):
+        client = None
+        worker_addresses = []
+
+    if len(worker_addresses) < split_out:
+        return ddf, chunk, chunk_kwargs
+
+    # Step 1 - Persist ddf and figure out which partitions are on
+    # each worker
+    ddf = ddf.persist()
+    ddf_futures = compute_as_if_collection(
+        type(ddf),
+        ddf.dask,
+        ddf.__dask_keys__(),
+        sync=False,
+    )
+    wait(ddf_futures)
+    for f in ddf_futures:  # Check for errors
+        if f.status == "error":
+            f.result()  # raise exception
+
+    key_to_part = {str(part.key): part for part in ddf_futures}
+    in_parts = defaultdict(list)  # Map worker -> [list of futures]
+    for key, workers in client.who_has(ddf_futures).items():
+        # Note, if multiple workers have the part, we pick the first worker
+        in_parts[first(workers)].append(key_to_part[key])
+
+    in_nparts = {}
+    workers = set()  # All ranks that have a partition of `df`
+    for rank, worker in enumerate(worker_addresses):
+        nparts = len(in_parts.get(worker, ()))
+        if nparts > 0:
+            in_nparts[rank] = nparts
+            workers.add(rank)
+
+    _aca_kwargs = dict(
+        chunk=chunk,
+        chunk_kwargs=chunk_kwargs,
+        combine=combine,
+        combine_kwargs=combine_kwargs,
+        aggregate=combine,
+        aggregate_kwargs=combine_kwargs,
+        token="cudf-aggregate",
+        split_every=split_every,
+        sort=False,
+        ignore_index=True,
+    )
+
+    def _local_aca(
+        in_parts,
+        meta,
+        *args,
+        **kwargs,
+    ):
+        name = f"local-aca-{tokenize(in_parts, *args, **kwargs)}"
+        dsk = {(name, i): part for i, part in enumerate(in_parts)}
+        divs = [None] * (len(dsk) + 1)
+        ddf_local = new_dd_object(dsk, name, meta, divs)
+        return aca(
+            [ddf_local],
+            *args,
+            split_out=1,
+            **kwargs,
+        ).compute(scheduler="synchronous")
+
+    # Run `_local_aca()` on each worker
+    result_futures = {}
+    for rank, worker in enumerate(worker_addresses):
+        if rank in workers:
+            result_futures[rank] = client.submit(
+                _local_aca,
+                in_parts[worker],
+                meta=ddf._meta,
+                workers=[worker],
+                **_aca_kwargs,
+            )
+    wait(list(result_futures.values()))
+
+    dsk = {}
+    meta = None
+    name = f"reduced-{ddf._name}"
+    for i, part_future in result_futures.items():
+        dsk[(name, i)] = part_future
+        if meta is None:
+            # Get the meta from the first output partition
+            meta = delayed(make_meta)(part_future).compute()
+    assert meta is not None
+
+    divs = [None] * (len(dsk) + 1)
+    ddf = new_dd_object(dsk, name, meta, divs).persist()
+    return ddf, lambda x, *args, **kwargs: x, {}
 
 
 @_dask_cudf_nvtx_annotate
