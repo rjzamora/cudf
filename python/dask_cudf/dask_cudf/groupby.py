@@ -535,7 +535,7 @@ def _shuffle_aggregate(
             .sort_values(
                 gb_cols,
                 ignore_index=True,
-                # TODO: pass `shuffle=shuffle` after #11576
+                shuffle=shuffle,
             )
             .map_partitions(
                 aggregate,
