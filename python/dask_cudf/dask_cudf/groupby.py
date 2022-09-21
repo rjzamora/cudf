@@ -843,6 +843,7 @@ def _worker_reduce(
             in_nparts[rank] = nparts
             workers.add(rank)
 
+    # Step 2 - Run a local ACA aggregation on each worker
     _aca_kwargs = dict(
         chunk=chunk,
         chunk_kwargs=chunk_kwargs,
@@ -886,6 +887,7 @@ def _worker_reduce(
             )
     wait(list(result_futures.values()))
 
+    # Step 3 - Return a new "reduced" DataFrame
     dsk = {}
     meta = None
     name = f"reduced-{ddf._name}"
