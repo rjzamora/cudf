@@ -794,8 +794,7 @@ def _worker_aca(
 ):
     """Perform local ACA aggregation on each worker"""
 
-    worker_reduce = config.get("worker-aca", True)
-    if not worker_reduce:
+    if not config.get("worker-aca", True):
         return ddf, chunk, chunk_kwargs
 
     try:
