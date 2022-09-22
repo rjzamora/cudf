@@ -805,7 +805,7 @@ def _worker_aca(ddf, **aca_kwargs):
     because this local-worker ACA should always be
     followed up by a global ACA operation.
     """
-    if not config.get("worker-aca", True):
+    if not config.get("worker-aca", False):
         # Worker ACA is disabled
         return ddf, aca_kwargs
 
