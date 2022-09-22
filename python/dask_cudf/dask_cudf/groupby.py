@@ -695,7 +695,7 @@ def groupby_agg(
         shuffle = "tasks"
 
     # Try reducing ddf down to a single partition per worker
-    ddf, chunk, chunk_kwargs = _worker_reduce(
+    ddf, chunk, chunk_kwargs = _worker_aca(
         ddf,
         chunk,
         chunk_kwargs,
@@ -703,6 +703,8 @@ def groupby_agg(
         combine_kwargs,
         split_out,
         split_every,
+        ignore_index=True,
+        sort=False,
     )
 
     # Check if we are using the shuffle-based algorithm
@@ -780,7 +782,7 @@ def _redirect_aggs(arg):
 
 
 @_dask_cudf_nvtx_annotate
-def _worker_reduce(
+def _worker_aca(
     ddf,
     chunk,
     chunk_kwargs,
@@ -788,10 +790,11 @@ def _worker_reduce(
     combine_kwargs,
     split_out,
     split_every,
+    **kwargs,
 ):
-    """Perform local ACA aggregation on the worker-local partitions"""
+    """Perform local ACA aggregation on each worker"""
 
-    worker_reduce = config.get("worker-reduce", False)
+    worker_reduce = config.get("worker-aca", True)
     if not worker_reduce:
         return ddf, chunk, chunk_kwargs
 
@@ -800,11 +803,11 @@ def _worker_reduce(
 
         from toolz import first
 
-        from dask.base import compute_as_if_collection, tokenize
+        from dask.base import tokenize
         from dask.dataframe.core import new_dd_object
         from dask.dataframe.utils import make_meta
         from dask.delayed import delayed
-        from dask.distributed import get_client, wait
+        from dask.distributed import get_client, get_worker, wait
 
         client = get_client()
         worker_addresses = list(client.run(lambda: 42).keys())
@@ -818,30 +821,17 @@ def _worker_reduce(
     # Step 1 - Persist ddf and figure out which partitions are on
     # each worker
     ddf = ddf.persist()
-    ddf_futures = compute_as_if_collection(
-        type(ddf),
-        ddf.dask,
-        ddf.__dask_keys__(),
-        sync=False,
-    )
-    wait(ddf_futures)
-    for f in ddf_futures:  # Check for errors
-        if f.status == "error":
-            f.result()  # raise exception
-
-    key_to_part = {str(part.key): part for part in ddf_futures}
-    in_parts = defaultdict(list)  # Map worker -> [list of futures]
-    for key, workers in client.who_has(ddf_futures).items():
+    wait(ddf)
+    in_keys = defaultdict(list)  # Map worker -> [list of keys]
+    for key, workers in client.who_has(ddf).items():
         # Note, if multiple workers have the part, we pick the first worker
-        in_parts[first(workers)].append(key_to_part[key])
+        in_keys[first(workers)].append(key)
 
-    in_nparts = {}
-    workers = set()  # All ranks that have a partition of `df`
+    active_workers = set()  # All ranks that have a partition of `df`
     for rank, worker in enumerate(worker_addresses):
-        nparts = len(in_parts.get(worker, ()))
+        nparts = len(in_keys.get(worker, ()))
         if nparts > 0:
-            in_nparts[rank] = nparts
-            workers.add(rank)
+            active_workers.add(rank)
 
     # Step 2 - Run a local ACA aggregation on each worker
     _aca_kwargs = dict(
@@ -853,34 +843,39 @@ def _worker_reduce(
         aggregate_kwargs=combine_kwargs,
         token="cudf-aggregate",
         split_every=split_every,
-        sort=False,
-        ignore_index=True,
+        **kwargs,
     )
 
     def _local_aca(
-        in_parts,
+        in_keys,
         meta,
         *args,
         **kwargs,
     ):
-        name = f"local-aca-{tokenize(in_parts, *args, **kwargs)}"
-        dsk = {(name, i): part for i, part in enumerate(in_parts)}
+        # Build graph to perform a local ACA aggregation
+        # on the current worker
+        name = f"local-aca-{tokenize(in_keys, *args, **kwargs)}"
+        w = get_worker()
+        dsk = {
+            (name, i): w.data.get(part, meta) for i, part in enumerate(in_keys)
+        }
+
         divs = [None] * (len(dsk) + 1)
         ddf_local = new_dd_object(dsk, name, meta, divs)
         return aca(
             [ddf_local],
             *args,
-            split_out=1,
+            split_out=1,  # Result must fit in single partition
             **kwargs,
         ).compute(scheduler="synchronous")
 
-    # Run `_local_aca()` on each worker
+    # Run `_local_aca` on each worker
     result_futures = {}
     for rank, worker in enumerate(worker_addresses):
-        if rank in workers:
+        if rank in active_workers:
             result_futures[rank] = client.submit(
                 _local_aca,
-                in_parts[worker],
+                in_keys[worker],
                 meta=ddf._meta,
                 workers=[worker],
                 **_aca_kwargs,
