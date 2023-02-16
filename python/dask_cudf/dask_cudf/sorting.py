@@ -205,23 +205,43 @@ def quantile_divisions(df, by, npartitions):
     ):
         dtype = df[columns[0]].dtype
         divisions = divisions[columns[0]].astype("int64")
-        divisions.iloc[-1] += 1
-        divisions = sorted(
+        unique_divisions = sorted(
             divisions.drop_duplicates().astype(dtype).to_arrow().tolist(),
             key=lambda x: (x is None, x),
         )
+        if len(unique_divisions) < len(divisions):
+            unique_divisions += [unique_divisions.iloc[-1] + 1]
+        divisions = unique_divisions
     else:
+        above = {}
         for col in columns:
             dtype = df[col].dtype
             if dtype != "object":
                 divisions[col] = divisions[col].astype("int64")
-                divisions[col].iloc[-1] += 1
                 divisions[col] = divisions[col].astype(dtype)
+                above[col] = divisions.iloc[-1] + 1
             else:
-                divisions[col].iloc[-1] = chr(
-                    ord(divisions[col].iloc[-1][0]) + 1
+                above[col] = chr(ord(divisions[col].iloc[-1][0]) + 1)
+
+        # Extend divisions if we had any duplicates
+        unique_divisions = divisions.drop_duplicates().sort_index()
+        if len(divisions) == len(unique_divisions):
+            divisions = unique_divisions
+        else:
+            end = unique_divisions.iloc[-1:].copy()[[]]
+            for col in columns:
+                end[col] = gd.Series(
+                    [above[col]],
+                    dtype=unique_divisions[col].dtype,
+                    index=end.index,
                 )
-        divisions = divisions.drop_duplicates().sort_index()
+            divisions = gd.concat([unique_divisions, end])
+
+    if isinstance(divisions, gd.DataFrame) and len(columns) == 1:
+        # Convert divisions to `Series if we are only ordering
+        # by one column (this will indicate to the `sort_values`
+        # logic that we can satisfy `set_divisions=True`)
+        return divisions[columns[0]]
     return divisions
 
 

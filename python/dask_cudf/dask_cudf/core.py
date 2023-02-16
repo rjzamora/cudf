@@ -227,7 +227,7 @@ class DataFrame(_Frame, dd.core.DataFrame):
             sort_function_kwargs=sort_function_kwargs,
         )
 
-        if ignore_index:
+        if ignore_index and not set_divisions:
             return df.reset_index(drop=True)
         return df
 
