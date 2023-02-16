@@ -209,8 +209,11 @@ def quantile_divisions(df, by, npartitions):
             divisions.drop_duplicates().astype(dtype).to_arrow().tolist(),
             key=lambda x: (x is None, x),
         )
-        if len(unique_divisions) < len(divisions):
-            unique_divisions += [unique_divisions.iloc[-1] + 1]
+        if unique_divisions[-1] is None:
+            if unique_divisions[-2] is not None:
+                unique_divisions[-1] = unique_divisions[-2] + 1
+        elif len(unique_divisions) < len(divisions):
+            unique_divisions += [unique_divisions[-1] + 1]
         divisions = unique_divisions
     else:
         above = {}
@@ -219,7 +222,7 @@ def quantile_divisions(df, by, npartitions):
             if dtype != "object":
                 divisions[col] = divisions[col].astype("int64")
                 divisions[col] = divisions[col].astype(dtype)
-                above[col] = divisions.iloc[-1] + 1
+                above[col] = divisions[col].iloc[-1] + 1
             else:
                 above[col] = chr(ord(divisions[col].iloc[-1][0]) + 1)
 
