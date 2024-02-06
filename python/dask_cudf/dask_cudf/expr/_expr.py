@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.
 
 import numpy as np
-
 from dask_expr._cumulative import CumulativeBlockwise, TakeLast
 from dask_expr._groupby import NUnique
 from dask_expr._shuffle import DiskShuffle
@@ -60,7 +59,6 @@ def _shuffle_group(df, col, _filter, p):
 DiskShuffle._shuffle_group = staticmethod(_shuffle_group)
 
 
-
 from dask.dataframe.dispatch import concat
 from dask.dataframe.groupby import _determine_levels, _groupby_raise_unaligned
 
@@ -82,7 +80,9 @@ def _nunique_df_chunk(df, *by, **kwargs):
     g = _groupby_raise_unaligned(df, by=by, **group_keys)
     if len(df) > 0:
         grouped = (
-            g[[name]].apply(_drop_duplicates_reindex).reset_index(level=-1, drop=True)
+            g[[name]]
+            .apply(_drop_duplicates_reindex)
+            .reset_index(level=-1, drop=True)
         )
     else:
         # Manually create empty version, since groupby-apply for empty frame
