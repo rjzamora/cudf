@@ -1,6 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.
 
+import numpy as np
+
 from dask_expr._cumulative import CumulativeBlockwise, TakeLast
+from dask_expr._groupby import NUnique
 from dask_expr._shuffle import DiskShuffle
 
 ##
@@ -55,3 +58,60 @@ def _shuffle_group(df, col, _filter, p):
 
 
 DiskShuffle._shuffle_group = staticmethod(_shuffle_group)
+
+
+
+from dask.dataframe.dispatch import concat
+from dask.dataframe.groupby import _determine_levels, _groupby_raise_unaligned
+
+
+def _drop_duplicates_reindex(df):
+    if hasattr(df, "to_pandas"):
+        # Don't reindex for cudf
+        return df.drop_duplicates()
+    result = df.drop_duplicates()
+    result.index = np.zeros(len(result), dtype=int)
+    return result
+
+
+def _nunique_df_chunk(df, *by, **kwargs):
+    name = kwargs.pop("name")
+    group_keys = {}
+    group_keys["group_keys"] = True
+
+    g = _groupby_raise_unaligned(df, by=by, **group_keys)
+    if len(df) > 0:
+        grouped = (
+            g[[name]].apply(_drop_duplicates_reindex).reset_index(level=-1, drop=True)
+        )
+    else:
+        # Manually create empty version, since groupby-apply for empty frame
+        # results in df with no columns
+        grouped = g[[name]].nunique()
+        grouped = grouped.astype(df.dtypes[grouped.columns].to_dict())
+
+    return grouped
+
+
+def _nunique_df_combine(df, levels, sort=False):
+    result = (
+        df.groupby(level=levels, sort=sort, observed=True)
+        .apply(_drop_duplicates_reindex)
+        .reset_index(level=-1, drop=True)
+    )
+    return result
+
+
+def nunique_df_chunk(df, *by, **kwargs):
+    if df.ndim == 1:
+        df = df.to_frame()
+        kwargs = dict(name=df.columns[0], levels=_determine_levels(by))
+    return _nunique_df_chunk(df, *by, **kwargs)
+
+
+def nunique_df_combine(dfs, *args, **kwargs):
+    return _nunique_df_combine(concat(dfs), *args, **kwargs)
+
+
+NUnique.chunk = staticmethod(nunique_df_chunk)
+NUnique.combine = staticmethod(nunique_df_combine)
