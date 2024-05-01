@@ -225,10 +225,11 @@ def test_set_index(nelem):
         ddf = dd.from_pandas(df, npartitions=2)
         ddf2 = ddf.to_backend("cudf")
 
-        expect = ddf.set_index("x")
-        got = ddf2.set_index("x")
+        with dask.config.set({"dataframe.shuffle.method": "tasks"}):
+            expect = ddf.set_index("x")
+            got = ddf2.set_index("x")
 
-        dd.assert_eq(expect, got, check_index=False, check_divisions=False)
+            dd.assert_eq(expect, got, check_index=False, check_divisions=False)
 
 
 @xfail_dask_expr("missing support for divisions='quantile'")

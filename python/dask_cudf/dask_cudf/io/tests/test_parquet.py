@@ -15,7 +15,11 @@ from dask.utils import natural_sort_key
 import cudf
 
 import dask_cudf
-from dask_cudf.tests.utils import skip_dask_expr, xfail_dask_expr
+from dask_cudf.tests.utils import (
+    QUERY_PLANNING_ON,
+    skip_dask_expr,
+    xfail_dask_expr,
+)
 
 # Check if create_metadata_file is supported by
 # the current dask.dataframe version
@@ -356,12 +360,30 @@ def test_roundtrip_from_dask_partitioned(tmpdir, parts, daskcudf, metadata):
                 assert "part" in fn
 
     # Check that we can aggregate files by a partition name
-    df_read = dd.read_parquet(
-        tmpdir, engine="pyarrow", aggregate_files="year", split_row_groups=2
-    )
-    gdf_read = dask_cudf.read_parquet(
-        tmpdir, aggregate_files="year", split_row_groups=2
-    )
+    if QUERY_PLANNING_ON:
+        # Dask-expr doesn't warn (yet)
+        df_read = dd.read_parquet(
+            tmpdir,
+            engine="pyarrow",
+            aggregate_files="year",
+            split_row_groups=2,
+        )
+        gdf_read = dask_cudf.read_parquet(
+            tmpdir, aggregate_files="year", split_row_groups=2
+        )
+    else:
+        with pytest.warns(
+            FutureWarning, match="String support for `aggregate_files`"
+        ):
+            df_read = dd.read_parquet(
+                tmpdir,
+                engine="pyarrow",
+                aggregate_files="year",
+                split_row_groups=2,
+            )
+            gdf_read = dask_cudf.read_parquet(
+                tmpdir, aggregate_files="year", split_row_groups=2
+            )
     dd.assert_eq(df_read, gdf_read)
 
 
