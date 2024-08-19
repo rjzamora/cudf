@@ -1571,6 +1571,162 @@ def _get_filesystem_and_paths(path_or_data, storage_options):
     return fs, return_paths
 
 
+def get_reader_filepaths_or_buffers(
+    sources,
+    compression,
+    mode="rb",
+    fs=None,
+    iotypes=(BytesIO,),
+    allow_raw_text_input=False,
+    storage_options=None,
+    bytes_per_thread=_BYTES_PER_THREAD_DEFAULT,
+    warn_on_raw_text_input=None,
+    warn_meta=None,
+):
+    # Define list of input data sources
+    input_sources = [
+        stringify_pathlike(source)
+        for source in (sources if isinstance(sources, list) else [sources])
+    ]
+    if not input_sources:
+        raise ValueError("Empty input source list: {input_sources}.")
+
+    filepaths_or_buffers = []
+    string_paths = [isinstance(source, str) for source in input_sources]
+    if any(string_paths):
+        # Sources are all strings (typically file paths)
+
+        # don't allow a mix of fle paths and open files
+        if not all(string_paths):
+            raise ValueError("Invalid input source list: {input_sources}.")
+
+        # Make sure we have a filesystem defined
+        raw_text_data = False
+        if fs is None:
+            fs, paths = _get_filesystem_and_paths(
+                input_sources, storage_options
+            )
+            if fs is None:
+                raw_text_data = True
+                if warn_on_raw_text_input:
+                    # Do not remove until pandas 3.0 support is added.
+                    assert (
+                        PANDAS_LT_300
+                    ), "Need to drop after pandas-3.0 support is added."
+                    warnings.warn(
+                        f"Passing literal {warn_meta[0]} to {warn_meta[1]} is "
+                        "deprecated and will be removed in a future version. "
+                        "To read from a literal string, wrap it in a "
+                        "'StringIO' object.",
+                        FutureWarning,
+                    )
+        else:
+            paths = input_sources
+
+        # Return open paths
+        if raw_text_data:
+            return input_sources, compression
+
+        if _is_local_filesystem(fs):
+            # Doing this as `read_json` accepts a json string
+            # path_or_data need not be a filepath like string
+
+            # helper for checking if raw text looks like a json filename
+            compression_extensions = [
+                ".tar",
+                ".tar.gz",
+                ".tar.bz2",
+                ".tar.xz",
+                ".gz",
+                ".bz2",
+                ".zip",
+                ".xz",
+                ".zst",
+                "",
+            ]
+
+            if len(paths):
+                if fs.exists(paths[0]):
+                    filepaths_or_buffers = (
+                        paths if len(paths) > 1 else paths[0]
+                    )
+
+                # raise FileNotFound if path looks like json
+                # following pandas
+                # see
+                # https://github.com/pandas-dev/pandas/pull/46718/files#diff-472ce5fe087e67387942e1e1c409a5bc58dde9eb8a2db6877f1a45ae4974f694R724-R729
+                elif not allow_raw_text_input or paths[0].lower().endswith(
+                    tuple(f".json{c}" for c in compression_extensions)
+                ):
+                    raise FileNotFoundError(
+                        f"{input_sources} could not be resolved to any files"
+                    )
+                elif warn_on_raw_text_input:
+                    # Do not remove until pandas 3.0 support is added.
+                    assert (
+                        PANDAS_LT_300
+                    ), "Need to drop after pandas-3.0 support is added."
+                    warnings.warn(
+                        f"Passing literal {warn_meta[0]} to {warn_meta[1]} is "
+                        "deprecated and will be removed in a future version. "
+                        "To read from a literal string, wrap it in a "
+                        "'StringIO' object.",
+                        FutureWarning,
+                    )
+            elif warn_on_raw_text_input:
+                # Do not remove until pandas 3.0 support is added.
+                assert (
+                    PANDAS_LT_300
+                ), "Need to drop after pandas-3.0 support is added."
+                warnings.warn(
+                    f"Passing literal {warn_meta[0]} to {warn_meta[1]} is "
+                    "deprecated and will be removed in a future version. "
+                    "To read from a literal string, wrap it in a "
+                    "'StringIO' object.",
+                    FutureWarning,
+                )
+
+        else:
+            if len(paths) == 0:
+                raise FileNotFoundError(
+                    f"{input_sources} could not be resolved to any files"
+                )
+            filepaths_or_buffers = [
+                BytesIO(
+                    _fsspec_data_transfer(
+                        fpath,
+                        fs=fs,
+                        mode=mode,
+                        bytes_per_thread=bytes_per_thread,
+                    )
+                )
+                for fpath in paths
+            ]
+            if len(filepaths_or_buffers) == 1:
+                filepaths_or_buffers = filepaths_or_buffers[0]
+    else:
+        # Sources are file-like objects
+        for path_or_data in input_sources:
+            if not isinstance(path_or_data, iotypes) and is_file_like(
+                path_or_data
+            ):
+                if isinstance(path_or_data, TextIOWrapper):
+                    path_or_data = path_or_data.buffer
+                filepaths_or_buffers.append(
+                    BytesIO(
+                        _fsspec_data_transfer(
+                            path_or_data,
+                            mode=mode,
+                            bytes_per_thread=bytes_per_thread,
+                        )
+                    )
+                )
+            else:
+                filepaths_or_buffers.append(path_or_data)
+
+    return filepaths_or_buffers, compression
+
+
 @doc_get_reader_filepath_or_buffer()
 def get_reader_filepath_or_buffer(
     path_or_data,
