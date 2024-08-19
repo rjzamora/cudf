@@ -1647,9 +1647,7 @@ def get_reader_filepaths_or_buffers(
 
             if len(paths):
                 if fs.exists(paths[0]):
-                    filepaths_or_buffers = (
-                        paths if len(paths) > 1 else paths[0]
-                    )
+                    filepaths_or_buffers = paths
 
                 # raise FileNotFound if path looks like json
                 # following pandas
@@ -1702,8 +1700,6 @@ def get_reader_filepaths_or_buffers(
                 )
                 for fpath in paths
             ]
-            if len(filepaths_or_buffers) == 1:
-                filepaths_or_buffers = filepaths_or_buffers[0]
     else:
         # Sources are file-like objects
         for path_or_data in input_sources:
