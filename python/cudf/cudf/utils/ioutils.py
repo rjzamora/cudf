@@ -2097,32 +2097,34 @@ def _read_byte_ranges(
 def _get_remote_bytes_all(
     remote_paths, fs, *, blocksize=_BYTES_PER_THREAD_DEFAULT
 ):
-    # TODO: Avoid calling fs.sizes on many files
-    # (Might as well just parallelize over files)
-    sizes = fs.sizes(remote_paths)
-    remote_starts = [0] * len(remote_paths)
-    remote_ends = sizes
+    if (
+        blocksize is None
+        or len(remote_paths) >= 8  # Heuristic to avoid fs.sizes
+        or max(sizes := fs.sizes(remote_paths)) <= blocksize
+    ):
+        # Don't bother braking up individual files
+        return fs.cat_ranges(remote_paths, None, None)
+    else:
+        # Construct list of paths, starts, and ends
+        paths, starts, ends = [], [], []
+        for i, remote_path in enumerate(remote_paths):
+            for j in range(0, sizes[i], blocksize):
+                paths.append(remote_path)
+                starts.append(j)
+                ends.append(min(j + blocksize, sizes[i]))
 
-    # Construct list of paths, starts, and stops
-    paths, starts, ends = [], [], []
-    for i, remote_path in enumerate(remote_paths):
-        for j in range(remote_starts[i], remote_ends[i], blocksize):
-            paths.append(remote_path)
-            starts.append(j)
-            ends.append(min(j + blocksize, remote_ends[i]))
+        # Collect the byte ranges
+        chunks = fs.cat_ranges(paths, starts, ends)
 
-    # Collect the byte ranges
-    chunks = fs.cat_ranges(paths, starts, ends)
-
-    # Construct local byte buffers
-    buffers = []
-    path_counts = np.unique(paths, return_counts=True)[1]
-    for i, remote_path in enumerate(remote_paths):
-        bytes_arr = bytearray()
-        for j in range(path_counts[i]):
-            bytes_arr.extend(chunks.pop(0))
-        buffers.append(bytes(bytes_arr))
-    return buffers
+        # Construct local byte buffers
+        buffers = []
+        path_counts = np.unique(paths, return_counts=True)[1]
+        for i, remote_path in enumerate(remote_paths):
+            bytes_arr = bytearray()
+            for j in range(path_counts[i]):
+                bytes_arr.extend(chunks.pop(0))
+            buffers.append(bytes(bytes_arr))
+        return buffers
 
 
 def _get_remote_bytes_parquet(
