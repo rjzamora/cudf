@@ -2098,8 +2098,7 @@ def _get_remote_bytes_all(
     remote_paths, fs, *, blocksize=_BYTES_PER_THREAD_DEFAULT
 ):
     if (
-        blocksize is None
-        or len(remote_paths) >= 8  # Heuristic to avoid fs.sizes
+        len(remote_paths) >= 8  # Heuristic to avoid fs.sizes
         or max(sizes := fs.sizes(remote_paths)) <= blocksize
     ):
         # Don't bother braking up individual files
