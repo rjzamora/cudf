@@ -2078,3 +2078,78 @@ def _read_byte_ranges(
 
     for worker in workers:
         worker.join()
+
+
+def _from_pyarrow_dataset(
+    filepath_or_buffer,
+    columns=None,
+    storage_options=None,
+    filters=None,
+    row_groups=None,
+    use_pandas_metadata=True,
+    categorical_partitions=True,
+    bytes_per_thread=None,
+    dataset_kwargs=None,
+    nrows=None,
+    skip_rows=None,
+    *args,
+    **kwargs,
+):
+    import os
+
+    import pyarrow as pa
+    from fsspec.implementations.arrow import ArrowFSWrapper
+    from pyarrow import dataset as ds, fs as pa_fs
+
+    from cudf import DataFrame
+
+    # Convert to consistent input
+    if not isinstance(filepath_or_buffer, list):
+        filepath_or_buffer = [filepath_or_buffer]
+
+    # Get filesystem and paths
+    dataset_kwargs = dataset_kwargs or {}
+    if storage_options:
+        assert dataset_kwargs.get("filesystem") is None
+        (
+            dataset_kwargs["filesystem"],
+            paths,
+        ) = _get_filesystem_and_paths(
+            path_or_data=filepath_or_buffer,
+            storage_options=storage_options,
+        )
+    else:
+        if dataset_kwargs.get("filesystem") is None:
+            dataset_kwargs["filesystem"] = pa_fs.FileSystem.from_uri(
+                filepath_or_buffer[0]
+            )[0]
+        # TODO: Check if input filesystem is fsspec already
+        fsspec_fs = ArrowFSWrapper(dataset_kwargs["filesystem"])
+        paths = expand_paths_if_needed(
+            filepath_or_buffer, "rb", 1, fsspec_fs, None
+        )
+        paths = [fsspec_fs._strip_protocol(u) for u in paths]
+
+    scan_options = ds.ParquetFragmentScanOptions(
+        pre_buffer=True,
+        cache_options=pa.CacheOptions(
+            hole_size_limit=4_194_304,  # 4 MiB
+            range_size_limit=33_554_432,  # 32.00 MiB
+        ),
+    )
+    pa.set_cpu_count(os.cpu_count())  # TODO: Memoize
+
+    dataset = ds.dataset(paths, **dataset_kwargs)
+
+    if filters is not None:
+        from pyarrow.parquet import filters_to_expression
+
+        dataset = dataset.filter(filters_to_expression(filters))
+
+    table = dataset.to_table(
+        columns=columns,
+        batch_size=10_000_000,
+        fragment_scan_options=scan_options,
+        use_threads=True,
+    )
+    return DataFrame.from_arrow(table)

@@ -544,6 +544,30 @@ def read_parquet(
         raise ValueError(
             f"Only supported engines are {{'cudf', 'pyarrow'}}, got {engine=}"
         )
+
+    if engine == "pyarrow":
+        dataset_kwargs = dataset_kwargs or {}
+        return ioutils._from_pyarrow_dataset(
+            filepath_or_buffer,
+            columns=columns,
+            storage_options=storage_options,
+            filters=filters,
+            row_groups=row_groups,
+            use_pandas_metadata=use_pandas_metadata,
+            categorical_partitions=categorical_partitions,
+            bytes_per_thread=bytes_per_thread,
+            dataset_kwargs=dataset_kwargs.update(
+                {
+                    "filesystem": dataset_kwargs.get("filesystem", filesystem),
+                    "format": dataset_kwargs.get("format", "parquet"),
+                }
+            ),
+            nrows=nrows,
+            skip_rows=skip_rows,
+            *args,
+            **kwargs,
+        )
+
     if bytes_per_thread is None:
         bytes_per_thread = ioutils._BYTES_PER_THREAD_DEFAULT
 
