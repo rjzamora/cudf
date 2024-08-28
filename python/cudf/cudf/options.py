@@ -357,6 +357,7 @@ _register_option(
     textwrap.dedent(
         """
         Whether to use libcudf's native S3 backend or not.
+        \tWARN: this is experimental and only works for parquet_read().
         \tValid values are True or False. Default is False.
     """
     ),

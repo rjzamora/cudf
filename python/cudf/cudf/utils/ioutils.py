@@ -14,7 +14,6 @@ import numpy as np
 import pandas as pd
 from fsspec.core import expand_paths_if_needed, get_fs_token_paths
 
-import cudf
 from cudf.api.types import is_list_like
 from cudf.core._compat import PANDAS_LT_300
 from cudf.utils.docutils import docfmt_partial
@@ -1437,6 +1436,9 @@ expand_dir_pattern : str, default None
     Glob pattern to use when expanding directories into file paths
     (e.g. "*.json"). If this parameter is not specified, directories
     will not be expanded.
+libcudf_s3_io : bool, default False
+    Use libcudf's native S3 backend, if applicable, by preserving S3 file
+    paths such as "s3://my-bucket/my-object".
 
 Returns
 -------
@@ -1618,6 +1620,7 @@ def get_reader_filepath_or_buffer(
     warn_on_raw_text_input=None,
     warn_meta=None,
     expand_dir_pattern=None,
+    libcudf_s3_io=False,
 ):
     """{docstring}"""
 
@@ -1694,9 +1697,7 @@ def get_reader_filepath_or_buffer(
                 )
             from s3fs.core import S3FileSystem
 
-            if cudf.get_option("libcudf_s3_io") and isinstance(
-                fs, S3FileSystem
-            ):
+            if libcudf_s3_io and isinstance(fs, S3FileSystem):
                 filepaths_or_buffers = [f"s3://{fpath}" for fpath in paths]
             else:
                 # TODO: We can use cat_ranges and/or parquet-aware logic

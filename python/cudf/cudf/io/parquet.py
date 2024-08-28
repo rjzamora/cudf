@@ -576,6 +576,7 @@ def read_parquet(
         fs=fs,
         storage_options=storage_options,
         bytes_per_thread=bytes_per_thread,
+        libcudf_s3_io=cudf.get_option("libcudf_s3_io"),
     )
 
     # Warn user if they are not using cudf for IO
