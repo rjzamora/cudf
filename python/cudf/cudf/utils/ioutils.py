@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 from fsspec.core import expand_paths_if_needed, get_fs_token_paths
 
+import cudf
 from cudf.api.types import is_list_like
 from cudf.core._compat import PANDAS_LT_300
 from cudf.utils.docutils import docfmt_partial
@@ -1633,12 +1634,12 @@ def get_reader_filepath_or_buffer(
     filepaths_or_buffers = []
     string_paths = [isinstance(source, str) for source in input_sources]
     if any(string_paths):
-        # Sources are all strings. Thes strings are typically
+        # Sources are all strings. The strings are typically
         # file paths, but they may also be raw text strings.
 
         # Don't allow a mix of source types
         if not all(string_paths):
-            raise ValueError("Invalid input source list: {input_sources}.")
+            raise ValueError(f"Invalid input source list: {input_sources}.")
 
         # Make sure we define a filesystem (if possible)
         paths = input_sources
@@ -1687,26 +1688,33 @@ def get_reader_filepath_or_buffer(
                 raw_text_input = True
 
         elif fs is not None:
-            # TODO: We can use cat_ranges and/or parquet-aware logic
-            # to copy all remote data into host memory at once here.
-            # The current solution iterates over files, and copies
-            # ALL data from each file (even when we are performing
-            # partial IO, and don't need the entire file)
             if len(paths) == 0:
                 raise FileNotFoundError(
                     f"{input_sources} could not be resolved to any files"
                 )
-            filepaths_or_buffers = [
-                BytesIO(
-                    _fsspec_data_transfer(
-                        fpath,
-                        fs=fs,
-                        mode=mode,
-                        bytes_per_thread=bytes_per_thread,
+            from s3fs.core import S3FileSystem
+
+            if cudf.get_option("libcudf_s3_io") and isinstance(
+                fs, S3FileSystem
+            ):
+                filepaths_or_buffers = [f"s3://{fpath}" for fpath in paths]
+            else:
+                # TODO: We can use cat_ranges and/or parquet-aware logic
+                # to copy all remote data into host memory at once here.
+                # The current solution iterates over files, and copies
+                # ALL data from each file (even when we are performing
+                # partial IO, and don't need the entire file)
+                filepaths_or_buffers = [
+                    BytesIO(
+                        _fsspec_data_transfer(
+                            fpath,
+                            fs=fs,
+                            mode=mode,
+                            bytes_per_thread=bytes_per_thread,
+                        )
                     )
-                )
-                for fpath in paths
-            ]
+                    for fpath in paths
+                ]
         else:
             raw_text_input = True
 
