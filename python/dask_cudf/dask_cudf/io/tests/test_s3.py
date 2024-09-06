@@ -69,6 +69,7 @@ def s3_base(endpoint_ip, endpoint_port):
         # with an S3 endpoint on localhost
 
         endpoint_uri = f"http://{endpoint_ip}:{endpoint_port}/"
+        os.environ["AWS_ENDPOINT_URL"] = endpoint_uri
 
         server = ThreadedMotoServer(ip_address=endpoint_ip, port=endpoint_port)
         server.start()
