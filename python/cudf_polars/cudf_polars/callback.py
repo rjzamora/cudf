@@ -139,6 +139,15 @@ def _callback(
     assert with_columns is None
     assert pyarrow_predicate is None
     assert n_rows is None
+
+    USE_DASK = True
+    if USE_DASK:
+        from dask.threaded import get
+
+        # TODO: extract client and use it for execution
+        dsk = ir._task_graph()
+        return get(dsk, ir._dask_key).to_polars()
+
     with (
         nvtx.annotate(message="ExecuteIR", domain="cudf_polars"),
         # Device must be set before memory resource is obtained.

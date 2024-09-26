@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from functools import cache
+from functools import cache, cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -160,6 +160,53 @@ class IR:
             f"Evaluation of plan {type(self).__name__}"
         )  # pragma: no cover
 
+    @cached_property
+    def _dask_key(self) -> str:
+        from dask.tokenize import tokenize
+
+        name = type(self).__name__.lower()
+        token = tokenize(dataclasses.fields(self), ensure_deterministic=True)
+        return f"{name}-{token}"
+
+    def _task_graph(self) -> dict:
+        import toolz
+
+        stack = [self]
+        seen = set()
+        layers = []
+        while stack:
+            node = stack.pop()
+
+            if node._dask_key in seen:
+                continue
+            seen.add(node._dask_key)
+
+            layers.append(node._tasks())
+            stack.extend(
+                [val for val in dataclasses.fields(node) if isinstance(val, IR)]
+            )
+
+        dsk = toolz.merge(layers)
+
+        # Add task to reduce output partitions
+        key = self._dask_key
+        if self._npartitions > 1:
+            dsk[key] = (
+                DataFrame.concatenate,
+                [(key, i) for i in range(self._npartitions)],
+            )
+        else:
+            dsk[key] = (key, 0)
+
+        return dsk
+
+    @property
+    def _npartitions(self):
+        raise NotImplementedError(f"Partition count for {type(self).__name__}")
+
+    def _tasks(self) -> dict:
+        raise NotImplementedError(f"Generate tasks for {type(self).__name__}")
+
 
 @dataclasses.dataclass
 class PythonScan(IR):
@@ -259,6 +306,53 @@ class Scan(IR):
             raise NotImplementedError(
                 "Reading only parquet metadata to produce row index."
             )
+
+    @property
+    def _npartitions(self):
+        return len(self.paths)
+
+    @staticmethod
+    def read_parquet(path, columns, nrows, skip_rows, predicate, schema):
+        """Read parquet data."""
+        tbl_w_meta = plc.io.parquet.read_parquet(
+            plc.io.SourceInfo([path]),
+            columns=columns,
+            nrows=nrows,
+            skip_rows=skip_rows,
+        )
+        df = DataFrame.from_table(
+            tbl_w_meta.tbl,
+            # TODO: consider nested column names?
+            tbl_w_meta.column_names(include_children=False),
+        )
+        assert all(c.obj.type() == schema[c.name] for c in df.columns)
+        if predicate is None:
+            return df
+        else:
+            (mask,) = broadcast(predicate.evaluate(df), target_length=df.num_rows)
+            return df.filter(mask)
+
+    def _tasks(self) -> dict:
+        if self.typ != "parquet":
+            raise NotImplementedError()
+        key = self._dask_key
+        with_columns = self.with_columns
+        n_rows = self.n_rows
+        skip_rows = self.skip_rows
+        predicate = self.predicate
+        schema = self.schema
+        return {
+            (key, i): (
+                Scan.read_parquet,
+                path,
+                with_columns,
+                n_rows,
+                skip_rows,
+                predicate,
+                schema,
+            )
+            for i, path in enumerate(self.paths)
+        }
 
     def evaluate(self, *, cache: MutableMapping[int, DataFrame]) -> DataFrame:
         """Evaluate and return a dataframe."""
