@@ -168,6 +168,13 @@ class IR:
         token = tokenize(dataclasses.fields(self), ensure_deterministic=True)
         return f"{name}-{token}"
 
+    def _ir_dependencies(self):
+        return [
+            getattr(self, val.name)
+            for val in dataclasses.fields(self)
+            if val.type == "IR"
+        ]
+
     def _task_graph(self) -> dict:
         import toolz
 
@@ -176,16 +183,11 @@ class IR:
         layers = []
         while stack:
             node = stack.pop()
-
             if node._dask_key in seen:
                 continue
             seen.add(node._dask_key)
-
             layers.append(node._tasks())
-            stack.extend(
-                [val for val in dataclasses.fields(node) if isinstance(val, IR)]
-            )
-
+            stack.extend(node._ir_dependencies())
         dsk = toolz.merge(layers)
 
         # Add task to reduce output partitions
@@ -567,6 +569,40 @@ class Select(IR):
         if self.should_broadcast:
             columns = broadcast(*columns)
         return DataFrame(columns)
+
+    @staticmethod
+    def _op(columns, should_broadcast):
+        if should_broadcast:
+            columns = broadcast(*columns)
+        return DataFrame(columns)
+
+    @property
+    def _npartitions(self):
+        # TODO: Convert this logic into a convenience util
+        col_npartitions = [e._get_npartitions(self.df._npartitions) for e in self.expr]
+        npartitions = col_npartitions[0]
+        # TODO: How to deal with mismatched partition counts?
+        assert set(col_npartitions) == {npartitions}, "mismatched partitions"
+        return npartitions
+
+    def _tasks(self):
+        import toolz
+
+        col_keys = [e._get_dask_key(self.df._dask_key) for e in self.expr]
+        col_graphs = [
+            e._get_tasks(self.df._dask_key, self.df._npartitions) for e in self.expr
+        ]
+        key = self._dask_key
+        dsk = {
+            (key, i): (
+                self._op,
+                [(c_key, i) for c_key in col_keys],
+                self.should_broadcast,
+            )
+            for i in range(self._npartitions)
+        }
+
+        return toolz.merge([dsk, *col_graphs])
 
 
 @dataclasses.dataclass

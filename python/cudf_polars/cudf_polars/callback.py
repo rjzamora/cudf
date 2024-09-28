@@ -140,13 +140,18 @@ def _callback(
     assert pyarrow_predicate is None
     assert n_rows is None
 
-    USE_DASK = True
-    if USE_DASK:
-        from dask.threaded import get
+    # TODO: By default, we can attempt to build
+    # the task graph, and only fall back to single-GPU execution
+    # if that fails. If the user explicitly opts into dask, then
+    # we would want to raise an error if graph-generation fails.
+    CUDF_POLARS_USE_DASK = os.environ.get("CUDF_POLARS_USE_DASK", "FALSE").upper()
+    if CUDF_POLARS_USE_DASK == "TRUE":
+        from dask import get
 
         # TODO: extract client and use it for execution
         dsk = ir._task_graph()
-        return get(dsk, ir._dask_key).to_polars()
+        result = get(dsk, ir._dask_key)
+        return result.to_polars()
 
     with (
         nvtx.annotate(message="ExecuteIR", domain="cudf_polars"),
