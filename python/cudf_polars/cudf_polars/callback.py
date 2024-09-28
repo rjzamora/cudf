@@ -147,11 +147,23 @@ def _callback(
     CUDF_POLARS_USE_DASK = os.environ.get("CUDF_POLARS_USE_DASK", "FALSE").upper()
     if CUDF_POLARS_USE_DASK == "TRUE":
         from dask import get
+        from distributed import Client, get_client
 
-        # TODO: extract client and use it for execution
-        dsk = ir._task_graph()
-        result = get(dsk, ir._dask_key)
-        return result.to_polars()
+        try:
+            # Check for existing client
+            client = get_client()
+        except ValueError:
+            # Use default LocalCUDACluster
+            # TODO: Integrate device and memory resources?
+            from dask_cuda import LocalCUDACluster
+
+            client = None
+            kwargs: dict = {}
+
+        with client or Client(LocalCUDACluster(**kwargs)) as client:
+            dsk = ir._task_graph()
+            result = get(dsk, ir._dask_key)
+            return result.to_polars()
 
     with (
         nvtx.annotate(message="ExecuteIR", domain="cudf_polars"),
