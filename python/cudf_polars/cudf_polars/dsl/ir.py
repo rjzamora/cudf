@@ -160,54 +160,8 @@ class IR:
             f"Evaluation of plan {type(self).__name__}"
         )  # pragma: no cover
 
-    @cached_property
-    def _dask_key(self) -> str:
-        from dask.tokenize import tokenize
-
-        name = type(self).__name__.lower()
-        token = tokenize(dataclasses.fields(self), ensure_deterministic=True)
-        return f"{name}-{token}"
-
-    def _ir_dependencies(self):
-        return [
-            getattr(self, val.name)
-            for val in dataclasses.fields(self)
-            if val.type == "IR"
-        ]
-
-    def _task_graph(self) -> dict:
-        import toolz
-
-        stack = [self]
-        seen = set()
-        layers = []
-        while stack:
-            node = stack.pop()
-            if node._dask_key in seen:
-                continue
-            seen.add(node._dask_key)
-            layers.append(node._tasks())
-            stack.extend(node._ir_dependencies())
-        dsk = toolz.merge(layers)
-
-        # Add task to reduce output partitions
-        key = self._dask_key
-        if self._npartitions > 1:
-            dsk[key] = (
-                DataFrame.concatenate,
-                [(key, i) for i in range(self._npartitions)],
-            )
-        else:
-            dsk[key] = (key, 0)
-
-        return dsk
-
-    @property
-    def _npartitions(self):
-        raise NotImplementedError(f"Partition count for {type(self).__name__}")
-
-    def _tasks(self) -> dict:
-        raise NotImplementedError(f"Generate tasks for {type(self).__name__}")
+    def _dask_node(self) -> Any:
+        raise NotImplementedError(f"Dask node for {type(self).__name__}")
 
 
 @dataclasses.dataclass
@@ -309,52 +263,12 @@ class Scan(IR):
                 "Reading only parquet metadata to produce row index."
             )
 
-    @property
-    def _npartitions(self):
-        return len(self.paths)
+    def _dask_node(self):
+        if self.typ == "parquet":
+            from cudf_polars.dask.core import ReadParquet
 
-    @staticmethod
-    def read_parquet(path, columns, nrows, skip_rows, predicate, schema):
-        """Read parquet data."""
-        tbl_w_meta = plc.io.parquet.read_parquet(
-            plc.io.SourceInfo([path]),
-            columns=columns,
-            nrows=nrows,
-            skip_rows=skip_rows,
-        )
-        df = DataFrame.from_table(
-            tbl_w_meta.tbl,
-            # TODO: consider nested column names?
-            tbl_w_meta.column_names(include_children=False),
-        )
-        assert all(c.obj.type() == schema[c.name] for c in df.columns)
-        if predicate is None:
-            return df
-        else:
-            (mask,) = broadcast(predicate.evaluate(df), target_length=df.num_rows)
-            return df.filter(mask)
-
-    def _tasks(self) -> dict:
-        if self.typ != "parquet":
-            raise NotImplementedError()
-        key = self._dask_key
-        with_columns = self.with_columns
-        n_rows = self.n_rows
-        skip_rows = self.skip_rows
-        predicate = self.predicate
-        schema = self.schema
-        return {
-            (key, i): (
-                Scan.read_parquet,
-                path,
-                with_columns,
-                n_rows,
-                skip_rows,
-                predicate,
-                schema,
-            )
-            for i, path in enumerate(self.paths)
-        }
+            return ReadParquet(self)
+        raise NotImplementedError()
 
     def evaluate(self, *, cache: MutableMapping[int, DataFrame]) -> DataFrame:
         """Evaluate and return a dataframe."""
@@ -570,39 +484,10 @@ class Select(IR):
             columns = broadcast(*columns)
         return DataFrame(columns)
 
-    @staticmethod
-    def _op(columns, should_broadcast):
-        if should_broadcast:
-            columns = broadcast(*columns)
-        return DataFrame(columns)
+    def _dask_node(self):
+        from cudf_polars.dask.core import Select as _Select
 
-    @property
-    def _npartitions(self):
-        # TODO: Convert this logic into a convenience util
-        col_npartitions = [e._get_npartitions(self.df._npartitions) for e in self.expr]
-        npartitions = col_npartitions[0]
-        # TODO: How to deal with mismatched partition counts?
-        assert set(col_npartitions) == {npartitions}, "mismatched partitions"
-        return npartitions
-
-    def _tasks(self):
-        import toolz
-
-        col_keys = [e._get_dask_key(self.df._dask_key) for e in self.expr]
-        col_graphs = [
-            e._get_tasks(self.df._dask_key, self.df._npartitions) for e in self.expr
-        ]
-        key = self._dask_key
-        dsk = {
-            (key, i): (
-                self._op,
-                [(c_key, i) for c_key in col_keys],
-                self.should_broadcast,
-            )
-            for i in range(self._npartitions)
-        }
-
-        return toolz.merge([dsk, *col_graphs])
+        return _Select(self)
 
 
 @dataclasses.dataclass

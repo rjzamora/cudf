@@ -274,26 +274,8 @@ class Expr:
             f"Collecting aggregation info for {type(self).__name__}"
         )  # pragma: no cover; check_agg trips first
 
-    def _get_npartitions(self, ir_npartitions: int):
-        # Use ir_npartitions by default.
-        # The subclass should override this for reductions
-        return ir_npartitions
-
-    def _get_dask_key(self, ir_key: str) -> str:
-        from dask.tokenize import tokenize
-
-        name = type(self).__name__.lower()
-        token = tokenize(ir_key, self.get_hash(), ensure_deterministic=True)
-        return f"{name}-{token}"
-
-    def _get_tasks(self, ir_key: str, ir_npartitions: int):
-        # Need to pass in ir_key and npartitions so we can
-        # build a task graph without directly referencing
-        # the IR-node dependency we are operating on.
-        # NOTE: `(ir_key, 0)` corresponds to the dask key
-        # corresponding to the 0th partition of the dataframe
-        # that we refer to as `df` in the `evaluate` method.
-        raise NotImplementedError(f"Generate tasks for {type(self).__name__}")
+    def _dask_node(self, ir: Any, name: str):
+        raise NotImplementedError(f"Dask node for {type(self).__name__}")
 
 
 class NamedExpr:
@@ -369,28 +351,8 @@ class NamedExpr:
         """Collect information about aggregations in groupbys."""
         return self.value.collect_agg(depth=depth)
 
-    @staticmethod
-    def _make_named(obj, name):
-        return NamedColumn(
-            obj.obj,
-            name,
-            is_sorted=obj.is_sorted,
-            order=obj.order,
-            null_order=obj.null_order,
-        )
-
-    def _get_npartitions(self, ir_npartitions: int):
-        return self.value._get_npartitions(ir_npartitions)
-
-    def _get_dask_key(self, ir_key: str) -> str:
-        return self.value._get_dask_key(ir_key)
-
-    def _get_tasks(self, ir_key: str, ir_npartitions: int):
-        dsk = self.value._get_tasks(ir_key, ir_npartitions)
-        key = self.value._get_dask_key(ir_key)
-        for i in range(self._get_npartitions(ir_npartitions)):
-            dsk[(key, i)] = (self._make_named, dsk[(key, i)], self.name)
-        return dsk
+    def _dask_node(self, ir: Any):
+        return self.value._dask_node(ir, name=self.name)
 
 
 class Literal(Expr):
@@ -478,15 +440,10 @@ class Col(Expr):
         """Collect information about aggregations in groupbys."""
         return AggInfo([(self, plc.aggregation.collect_list(), self)])
 
-    @staticmethod
-    def _op(df, name):
-        return df._column_map[name]
+    def _dask_node(self, ir: Any, name: str | None = None):
+        from cudf_polars.dask.core import Col as DaskCol
 
-    def _get_tasks(self, ir_key: str, npartitions: int):
-        key = self._get_dask_key(ir_key)
-        return {
-            (key, i): (self._op, (ir_key, i), self.name) for i in range(npartitions)
-        }
+        return DaskCol(ir, expr=self, name=name)
 
 
 class Len(Expr):
@@ -1748,60 +1705,12 @@ class Agg(Expr):
         child = self.children[0]
         return self.op(child.evaluate(df, context=context, mapping=mapping))
 
-    def _get_npartitions(self, ir_npartitions: int):
-        return 1  # Assume reduction
+    def _dask_node(self, ir: Any, name: str | None = None):
+        if self.name == "sum":
+            from cudf_polars.dask.core import SumAgg
 
-    @staticmethod
-    def _chunk(
-        column: Column, request: plc.aggregation.Aggregation, dtype: plc.DataType
-    ) -> Column:
-        # TODO: This logic should be different than `request` in many cases
-        return Column(
-            plc.Column.from_scalar(
-                plc.reduce.reduce(column.obj, request, dtype),
-                1,
-            )
-        )
-
-    @staticmethod
-    def _concat(columns: Sequence[Column]) -> Column:
-        return Column(plc.concatenate.concatenate([col.obj for col in columns]))
-
-    @staticmethod
-    def _finalize(
-        column: Column, request: plc.aggregation.Aggregation, dtype: plc.DataType
-    ) -> Column:
-        # TODO: This logic should be different than `request` in many cases
-        return Column(
-            plc.Column.from_scalar(
-                plc.reduce.reduce(column.obj, request, dtype),
-                1,
-            )
-        )
-
-    def _get_tasks(
-        self, ir_key: str, npartitions: int
-    ) -> MutableMapping[tuple[str, int], Any]:
-        child = self.children[0]
-        child_dsk = child._get_tasks(ir_key, npartitions)
-        key = self._get_dask_key(ir_key)
-        child_key = child._get_dask_key(ir_key)
-
-        # Simple all-to-one reduction
-        chunk_key = f"chunk-{key}"
-        concat_key = f"concat-{key}"
-        dsk: MutableMapping[tuple[str, int], Any] = {
-            (chunk_key, i): (
-                self._chunk,
-                child_dsk[(child_key, i)],
-                self.request,
-                self.dtype,
-            )
-            for i in range(npartitions)
-        }
-        dsk[(concat_key, 0)] = (self._concat, list(dsk.keys()))
-        dsk[(key, 0)] = (self._finalize, (concat_key, 0), self.request, self.dtype)
-        return dsk
+            return SumAgg(ir, expr=self, name=name)
+        raise NotImplementedError()
 
 
 class Ternary(Expr):
