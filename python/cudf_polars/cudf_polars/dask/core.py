@@ -5,7 +5,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
 from cudf_polars.containers import Column, DataFrame, NamedColumn
-from cudf_polars.dsl.ir import broadcast, IR
+from cudf_polars.dsl.ir import broadcast, IR, Scan
 from cudf_polars.dsl.expr import Expr
 
 import pylibcudf as plc
@@ -25,13 +25,20 @@ __all__ = [
 
 class DaskNode:
     """
-    A Dask node.
+    Dask-specific version of an IR or Expr node.
+
+    A DaskNode object always stores a reference to an IR object.
+    If the DaskNode will also store a reference to an Expr object
+    if it implements the parallel logic for that Expr.
     """
 
     __slots__ = ("_ir", "_expr", "_name")
     _ir: IR
+    """IR object liked to this node."""
     _expr: Expr | None
+    """Expr object liked to this node (Optional)."""
     _name: str | None
+    """Name of the column produced by this node (Optional)."""
 
     def __init__(
         self,
@@ -56,22 +63,26 @@ class DaskNode:
         )
         return f"{name}-{token}"
 
-    @property
-    def _npartitions(self) -> int:
-        if self._expr is None:
-            raise NotImplementedError(f"Partition count for {type(self).__name__}")
-        return self._ir._dask_node()._npartitions
-
-    def _tasks(self) -> dict:
-        raise NotImplementedError(f"Generate tasks for {type(self).__name__}")
-
     def _ir_dependencies(self):
+        # Return IR dependencies of self._ir
         ir = self._ir
         return [
             getattr(ir, val.name) for val in dataclasses.fields(ir) if val.type == "IR"
         ]
 
-    def _task_graph(self) -> dict:
+    @property
+    def _npartitions(self) -> int:
+        if self._expr is None:
+            raise NotImplementedError(f"Partition count for {type(self).__name__}")
+        # A DaskNode linked only to an IR object must implement _npartitions
+        return self._ir._dask_node()._npartitions
+
+    def _tasks(self) -> MutableMapping[Any, Any]:
+        # A DaskNode must implement _tasks
+        raise NotImplementedError(f"Generate tasks for {type(self).__name__}")
+
+    def _task_graph(self) -> MutableMapping[Any, Any]:
+        # Build a task graph
         import toolz
 
         ir = self._ir
@@ -102,6 +113,8 @@ class DaskNode:
 
 
 class ReadParquet(DaskNode):
+    _ir: Scan
+
     @property
     def _npartitions(self):
         return len(self._ir.paths)
@@ -127,7 +140,7 @@ class ReadParquet(DaskNode):
             (mask,) = broadcast(predicate.evaluate(df), target_length=df.num_rows)
             return df.filter(mask)
 
-    def _tasks(self) -> dict:
+    def _tasks(self) -> MutableMapping[Any, Any]:
         key = self._key
         with_columns = self._ir.with_columns
         n_rows = self._ir.n_rows
@@ -157,7 +170,7 @@ class Select(DaskNode):
 
     @cached_property
     def _npartitions(self):
-        # TODO: Convert this logic into a convenience util
+        # TODO: Convert this logic into a convenience function
         ir = self._ir
         df = self._ir.df
         col_dask_nodes = [e._dask_node(df) for e in ir.expr]
