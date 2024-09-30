@@ -140,31 +140,38 @@ def _callback(
     assert pyarrow_predicate is None
     assert n_rows is None
 
-    # TODO: By default, we can attempt to build
-    # the task graph, and only fall back to single-GPU execution
-    # if that fails. If the user explicitly opts into dask, then
-    # we would want to raise an error if graph-generation fails.
-    CUDF_POLARS_USE_DASK = os.environ.get("CUDF_POLARS_USE_DASK", "FALSE").upper()
-    if CUDF_POLARS_USE_DASK == "TRUE":
-        from dask import get
-        from distributed import Client, get_client
+    CUDF_POLARS_DASK = os.environ.get("CUDF_POLARS_DASK", "FALSE").upper()
+    CUDF_POLARS_DASK_SYNC = os.environ.get("CUDF_POLARS_DASK_SYNC", "TRUE").upper()
+    if CUDF_POLARS_DASK == "TRUE":
+        if CUDF_POLARS_DASK_SYNC == "TRUE":
+            from dask import get
 
-        try:
-            # Check for existing client
-            client = get_client()
-        except ValueError:
-            # Use default LocalCUDACluster
-            # TODO: Integrate device and memory resources?
-            from dask_cuda import LocalCUDACluster
-
-            client = None
-            kwargs: dict = {}
-
-        with client or Client(LocalCUDACluster(**kwargs)) as client:
             dask_node = ir._dask_node()
             dsk = dask_node._task_graph()
             result = get(dsk, dask_node._key)
             return result.to_polars()
+
+        else:
+            # TODO: Need to implement plc serialization
+            # to make this work
+            from distributed import Client, get_client
+
+            try:
+                # Check for existing client
+                client = get_client()
+            except ValueError:
+                # Use default LocalCUDACluster
+                # TODO: Integrate device and memory resources?
+                from dask_cuda import LocalCUDACluster
+
+                client = None
+                kwargs: dict = {}
+
+            with client or Client(LocalCUDACluster(**kwargs)) as client:
+                dask_node = ir._dask_node()
+                dsk = dask_node._task_graph()
+                result = client.get(dsk, dask_node._key)
+                return result.to_polars()
 
     with (
         nvtx.annotate(message="ExecuteIR", domain="cudf_polars"),

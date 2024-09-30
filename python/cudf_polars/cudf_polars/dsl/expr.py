@@ -31,7 +31,7 @@ from cudf_polars.containers import Column, NamedColumn
 from cudf_polars.utils import dtypes, sorting
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, MutableMapping, Sequence
+    from collections.abc import Mapping, Sequence
 
     import polars as pl
     import polars.type_aliases as pl_types
@@ -352,7 +352,7 @@ class NamedExpr:
         return self.value.collect_agg(depth=depth)
 
     def _dask_node(self, ir: Any):
-        return self.value._dask_node(ir, name=self.name)
+        return self.value._dask_node(ir, self.name)
 
 
 class Literal(Expr):
@@ -440,10 +440,10 @@ class Col(Expr):
         """Collect information about aggregations in groupbys."""
         return AggInfo([(self, plc.aggregation.collect_list(), self)])
 
-    def _dask_node(self, ir: Any, name: str | None = None):
-        from cudf_polars.dask.core import Col as DaskCol
+    def _dask_node(self, ir: Any, name: str):
+        from cudf_polars.dask.core import DaskCol
 
-        return DaskCol(ir, expr=self, name=name)
+        return DaskCol(ir, self, name)
 
 
 class Len(Expr):
@@ -1705,11 +1705,11 @@ class Agg(Expr):
         child = self.children[0]
         return self.op(child.evaluate(df, context=context, mapping=mapping))
 
-    def _dask_node(self, ir: Any, name: str | None = None):
+    def _dask_node(self, ir: Any, name: str):
         if self.name == "sum":
             from cudf_polars.dask.core import SumAgg
 
-            return SumAgg(ir, expr=self, name=name)
+            return SumAgg(ir, self, name)
         raise NotImplementedError()
 
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from functools import cache, cached_property
+from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -485,9 +485,9 @@ class Select(IR):
         return DataFrame(columns)
 
     def _dask_node(self):
-        from cudf_polars.dask.core import Select as _Select
+        from cudf_polars.dask.core import DaskSelect
 
-        return _Select(self)
+        return DaskSelect(self)
 
 
 @dataclasses.dataclass

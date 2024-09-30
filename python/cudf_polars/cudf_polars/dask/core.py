@@ -1,64 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
+# TODO: remove need for this
+# ruff: noqa: D101
+
+"""Core Dask logic for cuDF-Polars execution."""
+
 from __future__ import annotations
 
 import dataclasses
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
-from cudf_polars.containers import Column, DataFrame, NamedColumn
-from cudf_polars.dsl.ir import broadcast, IR, Scan
-from cudf_polars.dsl.expr import Expr
-
 import pylibcudf as plc
+
+from cudf_polars.containers import Column, DataFrame, NamedColumn
+from cudf_polars.dsl.ir import broadcast
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping, Sequence
 
+    from cudf_polars.dsl.expr import Agg, Col, Expr
+    from cudf_polars.dsl.ir import IR, Scan, Select
 
 __all__ = [
     "DaskNode",
+    "DaskExprNode",
     "ReadParquet",
-    "Select",
+    "DaskSelect",
     "SumAgg",
-    "Col",
+    "DaskCol",
 ]
 
 
 class DaskNode:
     """
-    Dask-specific version of an IR or Expr node.
+    Dask-specific version of an IR node.
 
     A DaskNode object always stores a reference to an IR object.
-    If the DaskNode will also store a reference to an Expr object
-    if it implements the parallel logic for that Expr.
     """
 
-    __slots__ = ("_ir", "_expr", "_name")
+    __slots__ = ("_ir",)
     _ir: IR
     """IR object liked to this node."""
-    _expr: Expr | None
-    """Expr object liked to this node (Optional)."""
-    _name: str | None
-    """Name of the column produced by this node (Optional)."""
 
-    def __init__(
-        self,
-        ir: IR,
-        expr: Expr | None = None,
-        name: str | None = None,
-    ):
+    def __init__(self, ir: IR):
         self._ir = ir
-        self._expr = expr
-        self._name = name
 
     @cached_property
     def _key(self) -> str:
         from dask.tokenize import tokenize
 
         name = type(self).__name__.lower()
-        expr = self._expr
         token = tokenize(
             dataclasses.fields(self._ir),
-            expr if expr is None else expr.get_hash(),
             ensure_deterministic=True,
         )
         return f"{name}-{token}"
@@ -72,10 +66,8 @@ class DaskNode:
 
     @property
     def _npartitions(self) -> int:
-        if self._expr is None:
-            raise NotImplementedError(f"Partition count for {type(self).__name__}")
-        # A DaskNode linked only to an IR object must implement _npartitions
-        return self._ir._dask_node()._npartitions
+        # A DaskNode must implement _npartitions
+        raise NotImplementedError(f"Partition count for {type(self).__name__}")
 
     def _tasks(self) -> MutableMapping[Any, Any]:
         # A DaskNode must implement _tasks
@@ -96,7 +88,8 @@ class DaskNode:
                 continue
             seen.add(dask_node._key)
             layers.append(dask_node._tasks())
-            stack.extend(dask_node._ir_dependencies())
+            ir_deps = dask_node._ir_dependencies()
+            stack.extend(ir_deps)
         dsk = toolz.merge(layers)
 
         # Add task to reduce output partitions
@@ -110,6 +103,53 @@ class DaskNode:
             dsk[key] = (key, 0)
 
         return dsk
+
+
+class DaskExprNode(DaskNode):
+    """
+    Dask-specific version of an Expr node.
+
+    A DaskExprNode object stores a reference to both an IR,
+    and an Expr object.
+    """
+
+    __slots__ = ("_ir", "_expr", "_name")
+    _ir: IR
+    """IR object liked to this node."""
+    _expr: Expr
+    """Expr object liked to this node (Optional)."""
+    _name: str
+    """Name of the column produced by this node (Optional)."""
+
+    def __init__(
+        self,
+        ir: IR,
+        expr: Expr,
+        name: str,
+    ):
+        self._ir = ir
+        self._expr = expr
+        self._name = name
+
+    @cached_property
+    def _key(self) -> str:
+        from dask.tokenize import tokenize
+
+        name = type(self).__name__.lower()
+        expr = self._expr
+        token = tokenize(
+            dataclasses.fields(self._ir),
+            expr if expr is None else expr.get_hash(),
+            self._name,
+            ensure_deterministic=True,
+        )
+        return f"{name}-{token}"
+
+    @property
+    def _npartitions(self) -> int:
+        # By default, use the partition count of the primary DaskNode
+        # for the linked IR object.
+        return self._ir._dask_node()._npartitions
 
 
 class ReadParquet(DaskNode):
@@ -161,7 +201,9 @@ class ReadParquet(DaskNode):
         }
 
 
-class Select(DaskNode):
+class DaskSelect(DaskNode):
+    _ir: Select
+
     @staticmethod
     def _op(columns, should_broadcast):
         if should_broadcast:
@@ -201,7 +243,9 @@ class Select(DaskNode):
         return toolz.merge([dsk, *col_graphs])
 
 
-class Col(DaskNode):
+class DaskCol(DaskExprNode):
+    _expr: Col
+
     @staticmethod
     def _op(df, name):
         return df._column_map[name]
@@ -217,7 +261,9 @@ class Col(DaskNode):
         }
 
 
-class SumAgg(DaskNode):
+class SumAgg(DaskExprNode):
+    _expr: Agg
+
     @property
     def _npartitions(self):
         return 1  # Assume reduction
@@ -261,38 +307,32 @@ class SumAgg(DaskNode):
         )
 
     def _tasks(self) -> MutableMapping[tuple[str, int], Any]:
-        try:
-            expr = self._expr
-            npartitions = self._ir._dask_node()._npartitions
-            child = expr.children[0]
-            child_dask_node = child._dask_node(self._ir, name=expr.name)
-            child_dsk = child_dask_node._tasks()
-            key = self._key
-            child_key = child_dask_node._key
+        expr = self._expr
+        npartitions_in = self._ir._dask_node()._npartitions
+        child = expr.children[0]
+        child_dask_node = child._dask_node(self._ir, expr.name)
+        child_dsk = child_dask_node._tasks()
+        key = self._key
+        child_key = child_dask_node._key
 
-            # Simple all-to-one reduction
-            chunk_key = f"chunk-{key}"
-            concat_key = f"concat-{key}"
-            dsk: MutableMapping[tuple[str, int], Any] = {
-                (chunk_key, i): (
-                    self._chunk,
-                    child_dsk[(child_key, i)],
-                    expr.request,
-                    expr.dtype,
-                )
-                for i in range(npartitions)
-            }
-            dsk[(concat_key, 0)] = (self._concat, list(dsk.keys()))
-            dsk[(key, 0)] = (
-                self._finalize,
-                (concat_key, 0),
+        # Simple all-to-one reduction
+        chunk_key = f"chunk-{key}"
+        concat_key = f"concat-{key}"
+        dsk: MutableMapping[tuple[str, int], Any] = {
+            (chunk_key, i): (
+                self._chunk,
+                child_dsk[(child_key, i)],
                 expr.request,
                 expr.dtype,
-                self._name,
             )
-        except Exception as err:
-            import pdb
-
-            pdb.set_trace()
-            pass
+            for i in range(npartitions_in)
+        }
+        dsk[(concat_key, 0)] = (self._concat, list(dsk.keys()))
+        dsk[(key, 0)] = (
+            self._finalize,
+            (concat_key, 0),
+            expr.request,
+            expr.dtype,
+            self._name,
+        )
         return dsk
