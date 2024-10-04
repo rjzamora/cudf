@@ -146,9 +146,9 @@ def _callback(
         if CUDF_POLARS_DASK_SYNC == "TRUE":
             from dask import get
 
-            dask_node = ir._dask_node()
-            dsk = dask_node._task_graph()
-            result = get(dsk, dask_node._key)
+            physical_node = ir._physical_node()
+            dsk = physical_node._task_graph()
+            result = get(dsk, physical_node._key)
             return result.to_polars()
 
         else:
@@ -168,9 +168,9 @@ def _callback(
                 kwargs: dict = {}
 
             with client or Client(LocalCUDACluster(**kwargs)) as client:
-                dask_node = ir._dask_node()
-                dsk = dask_node._task_graph()
-                result = client.get(dsk, dask_node._key)
+                physical_node = ir._physical_node()
+                dsk = physical_node._task_graph()
+                result = client.get(dsk, physical_node._key)
                 return result.to_polars()
 
     with (

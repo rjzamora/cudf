@@ -160,7 +160,7 @@ class IR:
             f"Evaluation of plan {type(self).__name__}"
         )  # pragma: no cover
 
-    def _dask_node(self) -> Any:
+    def _physical_node(self) -> Any:
         raise NotImplementedError(f"Dask node for {type(self).__name__}")
 
 
@@ -263,9 +263,9 @@ class Scan(IR):
                 "Reading only parquet metadata to produce row index."
             )
 
-    def _dask_node(self):
+    def _physical_node(self):
         if self.typ == "parquet":
-            from cudf_polars.dask.core import ReadParquet
+            from cudf_polars.physical.core import ReadParquet
 
             return ReadParquet(self)
         raise NotImplementedError()
@@ -484,8 +484,8 @@ class Select(IR):
             columns = broadcast(*columns)
         return DataFrame(columns)
 
-    def _dask_node(self):
-        from cudf_polars.dask.core import DaskSelect
+    def _physical_node(self):
+        from cudf_polars.physical.core import DaskSelect
 
         return DaskSelect(self)
 

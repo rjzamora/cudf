@@ -274,7 +274,7 @@ class Expr:
             f"Collecting aggregation info for {type(self).__name__}"
         )  # pragma: no cover; check_agg trips first
 
-    def _dask_node(self, ir: Any, name: str):
+    def _physical_node(self, ir: Any, name: str):
         raise NotImplementedError(f"Dask node for {type(self).__name__}")
 
 
@@ -351,8 +351,8 @@ class NamedExpr:
         """Collect information about aggregations in groupbys."""
         return self.value.collect_agg(depth=depth)
 
-    def _dask_node(self, ir: Any):
-        return self.value._dask_node(ir, self.name)
+    def _physical_node(self, ir: Any):
+        return self.value._physical_node(ir, self.name)
 
 
 class Literal(Expr):
@@ -440,8 +440,8 @@ class Col(Expr):
         """Collect information about aggregations in groupbys."""
         return AggInfo([(self, plc.aggregation.collect_list(), self)])
 
-    def _dask_node(self, ir: Any, name: str):
-        from cudf_polars.dask.core import DaskCol
+    def _physical_node(self, ir: Any, name: str):
+        from cudf_polars.physical.core import DaskCol
 
         return DaskCol(ir, self, name)
 
@@ -1705,9 +1705,9 @@ class Agg(Expr):
         child = self.children[0]
         return self.op(child.evaluate(df, context=context, mapping=mapping))
 
-    def _dask_node(self, ir: Any, name: str):
+    def _physical_node(self, ir: Any, name: str):
         if self.name == "sum":
-            from cudf_polars.dask.core import SumAgg
+            from cudf_polars.physical.core import SumAgg
 
             return SumAgg(ir, self, name)
         raise NotImplementedError()

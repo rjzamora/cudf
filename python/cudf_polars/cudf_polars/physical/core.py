@@ -3,7 +3,7 @@
 # TODO: remove need for this
 # ruff: noqa: D101
 
-"""Core Dask logic for cuDF-Polars execution."""
+"""Core physical-plan logic for cuDF-Polars execution."""
 
 from __future__ import annotations
 
@@ -83,12 +83,12 @@ class DaskNode:
         layers = []
         while stack:
             node = stack.pop()
-            dask_node = node._dask_node()
-            if dask_node._key in seen:
+            physical_node = node._physical_node()
+            if physical_node._key in seen:
                 continue
-            seen.add(dask_node._key)
-            layers.append(dask_node._tasks())
-            ir_deps = dask_node._ir_dependencies()
+            seen.add(physical_node._key)
+            layers.append(physical_node._tasks())
+            ir_deps = physical_node._ir_dependencies()
             stack.extend(ir_deps)
         dsk = toolz.merge(layers)
 
@@ -149,7 +149,7 @@ class DaskExprNode(DaskNode):
     def _npartitions(self) -> int:
         # By default, use the partition count of the primary DaskNode
         # for the linked IR object.
-        return self._ir._dask_node()._npartitions
+        return self._ir._physical_node()._npartitions
 
 
 class ReadParquet(DaskNode):
@@ -215,8 +215,8 @@ class DaskSelect(DaskNode):
         # TODO: Convert this logic into a convenience function
         ir = self._ir
         df = self._ir.df
-        col_dask_nodes = [e._dask_node(df) for e in ir.expr]
-        col_npartitions = [c._npartitions for c in col_dask_nodes]
+        col_physical_nodes = [e._physical_node(df) for e in ir.expr]
+        col_npartitions = [c._npartitions for c in col_physical_nodes]
         npartitions = col_npartitions[0]
         # TODO: How to deal with mismatched partition counts?
         assert set(col_npartitions) == {npartitions}, "mismatched partitions"
@@ -227,9 +227,9 @@ class DaskSelect(DaskNode):
 
         ir = self._ir
         df = self._ir.df
-        col_dask_nodes = [e._dask_node(df) for e in ir.expr]
-        col_keys = [c._key for c in col_dask_nodes]
-        col_graphs = [c._tasks() for c in col_dask_nodes]
+        col_physical_nodes = [e._physical_node(df) for e in ir.expr]
+        col_keys = [c._key for c in col_physical_nodes]
+        col_graphs = [c._tasks() for c in col_physical_nodes]
         key = self._key
         dsk = {
             (key, i): (
@@ -253,7 +253,7 @@ class DaskCol(DaskExprNode):
     def _tasks(self):
         this_key = self._key
         this_name = self._expr.name
-        ir_node = self._ir._dask_node()
+        ir_node = self._ir._physical_node()
         ir_key = ir_node._key
         return {
             (this_key, i): (self._op, (ir_key, i), this_name)
@@ -308,12 +308,12 @@ class SumAgg(DaskExprNode):
 
     def _tasks(self) -> MutableMapping[tuple[str, int], Any]:
         expr = self._expr
-        npartitions_in = self._ir._dask_node()._npartitions
+        npartitions_in = self._ir._physical_node()._npartitions
         child = expr.children[0]
-        child_dask_node = child._dask_node(self._ir, expr.name)
-        child_dsk = child_dask_node._tasks()
+        child_physical_node = child._physical_node(self._ir, expr.name)
+        child_dsk = child_physical_node._tasks()
         key = self._key
-        child_key = child_dask_node._key
+        child_key = child_physical_node._key
 
         # Simple all-to-one reduction
         chunk_key = f"chunk-{key}"
