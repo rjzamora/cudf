@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from functools import cache
+from functools import cache, cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -30,7 +30,7 @@ from cudf_polars.containers import DataFrame, NamedColumn
 from cudf_polars.utils import dtypes, sorting
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, MutableMapping
+    from collections.abc import Callable, Mapping, MutableMapping
     from typing import Literal
 
     from cudf_polars.typing import Schema
@@ -123,6 +123,24 @@ def broadcast(
     ]
 
 
+def evaluate(node: IR, cache: MutableMapping[str, DataFrame] = None):
+    """Tranverse and evaluate an IR graph."""
+    cache = cache or {}
+    try:
+        return cache[node._key]
+    except KeyError:
+        children = [
+            evaluate(child, cache=cache)
+            for child in node.children
+        ]
+        # Call static node-evaluation function
+        # for this particular node.
+        cache[node._key] = node.evaluator(
+            children, *node._args, **node._kwargs
+        )
+        return cache[node._key]
+
+
 @dataclasses.dataclass
 class IR:
     """Abstract plan node, representing an unevaluated dataframe."""
@@ -133,6 +151,43 @@ class IR:
     def __post_init__(self):
         """Validate preconditions."""
         pass  # noqa: PIE790
+
+    @property
+    def children(self):
+        """IR child dependencies."""
+        return [
+            getattr(self, val.name)
+            for val in dataclasses.fields(self)
+            if val.type == "IR"
+        ]
+
+    @cached_property
+    def _key(self) -> str:
+        # TODO: Use something other than dask...
+        from dask.tokenize import tokenize
+
+        name = type(self).__name__.lower()
+        token = tokenize(
+            dataclasses.fields(self),
+            ensure_deterministic=True,
+        )
+        return f"{name}-{token}"
+
+    @property
+    def evaluator(self) -> Callable:
+        raise NotImplementedError(
+            f"Evaluator for a {type(self).__name__} callable"
+        )  # pragma: no cover
+
+    @property
+    def _args(self) -> tuple[Any]:
+        """Positional arguments for `self.evaluator`."""
+        return tuple()
+
+    @property
+    def _kwargs(self) -> Mapping[str, Any]:
+        """Key-word arguments for `self.evaluator`."""
+        return {}
 
     def evaluate(self, *, cache: MutableMapping[int, DataFrame]) -> DataFrame:
         """
@@ -173,6 +228,155 @@ class PythonScan(IR):
     def __post_init__(self):
         """Validate preconditions."""
         raise NotImplementedError("PythonScan not implemented")
+
+
+def _scan_evaluator(
+    children: list[DataFrame],
+    paths,
+    schema,
+    with_columns,
+    predicate,
+    row_index,
+    n_rows,
+    skip_rows,
+    typ,
+    reader_options,
+) -> DataFrame:
+    """Evaluate and return a dataframe."""
+    if typ == "csv":
+        parse_options = reader_options["parse_options"]
+        sep = chr(parse_options["separator"])
+        quote = chr(parse_options["quote_char"])
+        eol = chr(parse_options["eol_char"])
+        if reader_options["schema"] is not None:
+            # Reader schema provides names
+            column_names = list(reader_options["schema"]["fields"].keys())
+        else:
+            # file provides column names
+            column_names = None
+        usecols = with_columns
+        # TODO: support has_header=False
+        header = 0
+
+        # polars defaults to no null recognition
+        null_values = [""]
+        if parse_options["null_values"] is not None:
+            ((typ, nulls),) = parse_options["null_values"].items()
+            if typ == "AllColumnsSingle":
+                # Single value
+                null_values.append(nulls)
+            else:
+                # List of values
+                null_values.extend(nulls)
+        if parse_options["comment_prefix"] is not None:
+            comment = chr(parse_options["comment_prefix"]["Single"])
+        else:
+            comment = None
+        decimal = "," if parse_options["decimal_comma"] else "."
+
+        # polars skips blank lines at the beginning of the file
+        pieces = []
+        read_partial = n_rows != -1
+        for p in paths:
+            skiprows = reader_options["skip_rows"]
+            path = Path(p)
+            with path.open() as f:
+                while f.readline() == "\n":
+                    skiprows += 1
+            tbl_w_meta = plc.io.csv.read_csv(
+                plc.io.SourceInfo([path]),
+                delimiter=sep,
+                quotechar=quote,
+                lineterminator=eol,
+                col_names=column_names,
+                header=header,
+                usecols=usecols,
+                na_filter=True,
+                na_values=null_values,
+                keep_default_na=False,
+                skiprows=skiprows,
+                comment=comment,
+                decimal=decimal,
+                dtypes=schema,
+                nrows=n_rows,
+            )
+            pieces.append(tbl_w_meta)
+            if read_partial:
+                n_rows -= tbl_w_meta.tbl.num_rows()
+                if n_rows <= 0:
+                    break
+        tables, colnames = zip(
+            *(
+                (piece.tbl, piece.column_names(include_children=False))
+                for piece in pieces
+            ),
+            strict=True,
+        )
+        df = DataFrame.from_table(
+            plc.concatenate.concatenate(list(tables)),
+            colnames[0],
+        )
+    elif typ == "parquet":
+        tbl_w_meta = plc.io.parquet.read_parquet(
+            plc.io.SourceInfo(paths),
+            columns=with_columns,
+            nrows=n_rows,
+            skip_rows=skip_rows,
+        )
+        df = DataFrame.from_table(
+            tbl_w_meta.tbl,
+            # TODO: consider nested column names?
+            tbl_w_meta.column_names(include_children=False),
+        )
+    elif typ == "ndjson":
+        json_schema: list[tuple[str, str, list]] = [
+            (name, typ, []) for name, typ in schema.items()
+        ]
+        plc_tbl_w_meta = plc.io.json.read_json(
+            plc.io.SourceInfo(paths),
+            lines=True,
+            dtypes=json_schema,
+            prune_columns=True,
+        )
+        # TODO: I don't think cudf-polars supports nested types in general right now
+        # (but when it does, we should pass child column names from nested columns in)
+        df = DataFrame.from_table(
+            plc_tbl_w_meta.tbl, plc_tbl_w_meta.column_names(include_children=False)
+        )
+        col_order = list(schema.keys())
+        # TODO: remove condition when dropping support for polars 1.0
+        # https://github.com/pola-rs/polars/pull/17363
+        if row_index is not None and row_index[0] in schema:
+            col_order.remove(row_index[0])
+        if col_order is not None:
+            df = df.select(col_order)
+    else:
+        raise NotImplementedError(
+            f"Unhandled scan type: {typ}"
+        )  # pragma: no cover; post init trips first
+    if row_index is not None:
+        name, offset = row_index
+        dtype = schema[name]
+        step = plc.interop.from_arrow(
+            pa.scalar(1, type=plc.interop.to_arrow(dtype))
+        )
+        init = plc.interop.from_arrow(
+            pa.scalar(offset, type=plc.interop.to_arrow(dtype))
+        )
+        index = NamedColumn(
+            plc.filling.sequence(df.num_rows, init, step),
+            name,
+            is_sorted=plc.types.Sorted.YES,
+            order=plc.types.Order.ASCENDING,
+            null_order=plc.types.NullOrder.AFTER,
+        )
+        df = DataFrame([index, *df.columns])
+    assert all(c.obj.type() == schema[c.name] for c in df.columns)
+    if predicate is None:
+        return df
+    else:
+        (mask,) = broadcast(predicate.evaluate(df), target_length=df.num_rows)
+        return df.filter(mask)
 
 
 @dataclasses.dataclass
@@ -260,145 +464,162 @@ class Scan(IR):
                 "Reading only parquet metadata to produce row index."
             )
 
-    def evaluate(self, *, cache: MutableMapping[int, DataFrame]) -> DataFrame:
-        """Evaluate and return a dataframe."""
-        with_columns = self.with_columns
-        row_index = self.row_index
-        n_rows = self.n_rows
-        if self.typ == "csv":
-            parse_options = self.reader_options["parse_options"]
-            sep = chr(parse_options["separator"])
-            quote = chr(parse_options["quote_char"])
-            eol = chr(parse_options["eol_char"])
-            if self.reader_options["schema"] is not None:
-                # Reader schema provides names
-                column_names = list(self.reader_options["schema"]["fields"].keys())
-            else:
-                # file provides column names
-                column_names = None
-            usecols = with_columns
-            # TODO: support has_header=False
-            header = 0
+    # def evaluate(self, *, cache: MutableMapping[int, DataFrame]) -> DataFrame:
+    #     """Evaluate and return a dataframe."""
+    #     with_columns = self.with_columns
+    #     row_index = self.row_index
+    #     n_rows = self.n_rows
+    #     if self.typ == "csv":
+    #         parse_options = self.reader_options["parse_options"]
+    #         sep = chr(parse_options["separator"])
+    #         quote = chr(parse_options["quote_char"])
+    #         eol = chr(parse_options["eol_char"])
+    #         if self.reader_options["schema"] is not None:
+    #             # Reader schema provides names
+    #             column_names = list(self.reader_options["schema"]["fields"].keys())
+    #         else:
+    #             # file provides column names
+    #             column_names = None
+    #         usecols = with_columns
+    #         # TODO: support has_header=False
+    #         header = 0
 
-            # polars defaults to no null recognition
-            null_values = [""]
-            if parse_options["null_values"] is not None:
-                ((typ, nulls),) = parse_options["null_values"].items()
-                if typ == "AllColumnsSingle":
-                    # Single value
-                    null_values.append(nulls)
-                else:
-                    # List of values
-                    null_values.extend(nulls)
-            if parse_options["comment_prefix"] is not None:
-                comment = chr(parse_options["comment_prefix"]["Single"])
-            else:
-                comment = None
-            decimal = "," if parse_options["decimal_comma"] else "."
+    #         # polars defaults to no null recognition
+    #         null_values = [""]
+    #         if parse_options["null_values"] is not None:
+    #             ((typ, nulls),) = parse_options["null_values"].items()
+    #             if typ == "AllColumnsSingle":
+    #                 # Single value
+    #                 null_values.append(nulls)
+    #             else:
+    #                 # List of values
+    #                 null_values.extend(nulls)
+    #         if parse_options["comment_prefix"] is not None:
+    #             comment = chr(parse_options["comment_prefix"]["Single"])
+    #         else:
+    #             comment = None
+    #         decimal = "," if parse_options["decimal_comma"] else "."
 
-            # polars skips blank lines at the beginning of the file
-            pieces = []
-            read_partial = n_rows != -1
-            for p in self.paths:
-                skiprows = self.reader_options["skip_rows"]
-                path = Path(p)
-                with path.open() as f:
-                    while f.readline() == "\n":
-                        skiprows += 1
-                tbl_w_meta = plc.io.csv.read_csv(
-                    plc.io.SourceInfo([path]),
-                    delimiter=sep,
-                    quotechar=quote,
-                    lineterminator=eol,
-                    col_names=column_names,
-                    header=header,
-                    usecols=usecols,
-                    na_filter=True,
-                    na_values=null_values,
-                    keep_default_na=False,
-                    skiprows=skiprows,
-                    comment=comment,
-                    decimal=decimal,
-                    dtypes=self.schema,
-                    nrows=n_rows,
-                )
-                pieces.append(tbl_w_meta)
-                if read_partial:
-                    n_rows -= tbl_w_meta.tbl.num_rows()
-                    if n_rows <= 0:
-                        break
-            tables, colnames = zip(
-                *(
-                    (piece.tbl, piece.column_names(include_children=False))
-                    for piece in pieces
-                ),
-                strict=True,
-            )
-            df = DataFrame.from_table(
-                plc.concatenate.concatenate(list(tables)),
-                colnames[0],
-            )
-        elif self.typ == "parquet":
-            tbl_w_meta = plc.io.parquet.read_parquet(
-                plc.io.SourceInfo(self.paths),
-                columns=with_columns,
-                nrows=n_rows,
-                skip_rows=self.skip_rows,
-            )
-            df = DataFrame.from_table(
-                tbl_w_meta.tbl,
-                # TODO: consider nested column names?
-                tbl_w_meta.column_names(include_children=False),
-            )
-        elif self.typ == "ndjson":
-            json_schema: list[tuple[str, str, list]] = [
-                (name, typ, []) for name, typ in self.schema.items()
-            ]
-            plc_tbl_w_meta = plc.io.json.read_json(
-                plc.io.SourceInfo(self.paths),
-                lines=True,
-                dtypes=json_schema,
-                prune_columns=True,
-            )
-            # TODO: I don't think cudf-polars supports nested types in general right now
-            # (but when it does, we should pass child column names from nested columns in)
-            df = DataFrame.from_table(
-                plc_tbl_w_meta.tbl, plc_tbl_w_meta.column_names(include_children=False)
-            )
-            col_order = list(self.schema.keys())
-            # TODO: remove condition when dropping support for polars 1.0
-            # https://github.com/pola-rs/polars/pull/17363
-            if row_index is not None and row_index[0] in self.schema:
-                col_order.remove(row_index[0])
-            if col_order is not None:
-                df = df.select(col_order)
-        else:
-            raise NotImplementedError(
-                f"Unhandled scan type: {self.typ}"
-            )  # pragma: no cover; post init trips first
-        if row_index is not None:
-            name, offset = row_index
-            dtype = self.schema[name]
-            step = plc.interop.from_arrow(
-                pa.scalar(1, type=plc.interop.to_arrow(dtype))
-            )
-            init = plc.interop.from_arrow(
-                pa.scalar(offset, type=plc.interop.to_arrow(dtype))
-            )
-            index = NamedColumn(
-                plc.filling.sequence(df.num_rows, init, step),
-                name,
-                is_sorted=plc.types.Sorted.YES,
-                order=plc.types.Order.ASCENDING,
-                null_order=plc.types.NullOrder.AFTER,
-            )
-            df = DataFrame([index, *df.columns])
-        assert all(c.obj.type() == self.schema[c.name] for c in df.columns)
-        if self.predicate is None:
-            return df
-        else:
-            (mask,) = broadcast(self.predicate.evaluate(df), target_length=df.num_rows)
-            return df.filter(mask)
+    #         # polars skips blank lines at the beginning of the file
+    #         pieces = []
+    #         read_partial = n_rows != -1
+    #         for p in self.paths:
+    #             skiprows = self.reader_options["skip_rows"]
+    #             path = Path(p)
+    #             with path.open() as f:
+    #                 while f.readline() == "\n":
+    #                     skiprows += 1
+    #             tbl_w_meta = plc.io.csv.read_csv(
+    #                 plc.io.SourceInfo([path]),
+    #                 delimiter=sep,
+    #                 quotechar=quote,
+    #                 lineterminator=eol,
+    #                 col_names=column_names,
+    #                 header=header,
+    #                 usecols=usecols,
+    #                 na_filter=True,
+    #                 na_values=null_values,
+    #                 keep_default_na=False,
+    #                 skiprows=skiprows,
+    #                 comment=comment,
+    #                 decimal=decimal,
+    #                 dtypes=self.schema,
+    #                 nrows=n_rows,
+    #             )
+    #             pieces.append(tbl_w_meta)
+    #             if read_partial:
+    #                 n_rows -= tbl_w_meta.tbl.num_rows()
+    #                 if n_rows <= 0:
+    #                     break
+    #         tables, colnames = zip(
+    #             *(
+    #                 (piece.tbl, piece.column_names(include_children=False))
+    #                 for piece in pieces
+    #             ),
+    #             strict=True,
+    #         )
+    #         df = DataFrame.from_table(
+    #             plc.concatenate.concatenate(list(tables)),
+    #             colnames[0],
+    #         )
+    #     elif self.typ == "parquet":
+    #         tbl_w_meta = plc.io.parquet.read_parquet(
+    #             plc.io.SourceInfo(self.paths),
+    #             columns=with_columns,
+    #             nrows=n_rows,
+    #             skip_rows=self.skip_rows,
+    #         )
+    #         df = DataFrame.from_table(
+    #             tbl_w_meta.tbl,
+    #             # TODO: consider nested column names?
+    #             tbl_w_meta.column_names(include_children=False),
+    #         )
+    #     elif self.typ == "ndjson":
+    #         json_schema: list[tuple[str, str, list]] = [
+    #             (name, typ, []) for name, typ in self.schema.items()
+    #         ]
+    #         plc_tbl_w_meta = plc.io.json.read_json(
+    #             plc.io.SourceInfo(self.paths),
+    #             lines=True,
+    #             dtypes=json_schema,
+    #             prune_columns=True,
+    #         )
+    #         # TODO: I don't think cudf-polars supports nested types in general right now
+    #         # (but when it does, we should pass child column names from nested columns in)
+    #         df = DataFrame.from_table(
+    #             plc_tbl_w_meta.tbl, plc_tbl_w_meta.column_names(include_children=False)
+    #         )
+    #         col_order = list(self.schema.keys())
+    #         # TODO: remove condition when dropping support for polars 1.0
+    #         # https://github.com/pola-rs/polars/pull/17363
+    #         if row_index is not None and row_index[0] in self.schema:
+    #             col_order.remove(row_index[0])
+    #         if col_order is not None:
+    #             df = df.select(col_order)
+    #     else:
+    #         raise NotImplementedError(
+    #             f"Unhandled scan type: {self.typ}"
+    #         )  # pragma: no cover; post init trips first
+    #     if row_index is not None:
+    #         name, offset = row_index
+    #         dtype = self.schema[name]
+    #         step = plc.interop.from_arrow(
+    #             pa.scalar(1, type=plc.interop.to_arrow(dtype))
+    #         )
+    #         init = plc.interop.from_arrow(
+    #             pa.scalar(offset, type=plc.interop.to_arrow(dtype))
+    #         )
+    #         index = NamedColumn(
+    #             plc.filling.sequence(df.num_rows, init, step),
+    #             name,
+    #             is_sorted=plc.types.Sorted.YES,
+    #             order=plc.types.Order.ASCENDING,
+    #             null_order=plc.types.NullOrder.AFTER,
+    #         )
+    #         df = DataFrame([index, *df.columns])
+    #     assert all(c.obj.type() == self.schema[c.name] for c in df.columns)
+    #     if self.predicate is None:
+    #         return df
+    #     else:
+    #         (mask,) = broadcast(self.predicate.evaluate(df), target_length=df.num_rows)
+    #         return df.filter(mask)
+
+    def _args(self):
+        return (
+            self.paths,
+            self.schema,
+            self.with_columns,
+            self.predicate,
+            self.row_index,
+            self.n_rows,
+            self.skip_rows,
+            self.typ,
+            self.reader_options,
+        )
+
+    @property
+    def evaluator(self) -> Callable:
+        return _scan_evaluator
 
 
 @dataclasses.dataclass

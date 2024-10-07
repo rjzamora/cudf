@@ -145,6 +145,7 @@ def _callback(
         set_device(device),
         set_memory_resource(memory_resource),
     ):
+        import pdb; pdb.set_trace()
         return ir.evaluate(cache={}).to_polars()
 
 
