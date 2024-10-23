@@ -11,6 +11,13 @@ from dask_expr._groupby import (
     GroupbyAggregation,
 )
 from dask_expr._reductions import Reduction, Var
+from dask_expr._shuffle import (
+    DiskShuffle,
+    P2PShuffle,
+    Shuffle,
+    SimpleShuffle,
+    TaskShuffle,
+)
 from dask_expr.io.io import FusedParquetIO
 from dask_expr.io.parquet import FragmentWrapper, ReadParquetPyarrowFS
 
@@ -21,6 +28,7 @@ from dask.dataframe.core import (
     meta_nonempty,
 )
 from dask.dataframe.dispatch import is_categorical_dtype
+from dask.dataframe.shuffle import shuffle_group
 from dask.typing import no_default
 
 import cudf
@@ -371,6 +379,91 @@ class ToCudfBackend(Elemwise):
         ):
             # We already have cudf data
             return self.frame
+
+
+##
+## Host Shuffling
+##
+
+
+def _override_lower(self):
+    from dask.utils import get_default_shuffle_method
+
+    frame = self.frame
+    npartitions_out = self.npartitions_out
+    method = self.method or get_default_shuffle_method()
+    if npartitions_out < frame.npartitions and method != "p2p":
+        from dask_expr._repartition import Repartition
+
+        frame = Repartition(frame, new_partitions=npartitions_out)
+
+    ops = [
+        self.partitioning_index,
+        self.npartitions_out,
+        self.ignore_index,
+        self.options,
+        self.original_partitioning_index,
+    ]
+    if method == "p2p":
+        return P2PShuffle(frame, *ops)
+    elif method == "disk":
+        return DiskShuffle(frame, *ops)
+    elif method in ("simple", "tasks"):
+        use_host_mem = hasattr(
+            frame._meta, "to_pandas"
+        )  # TODO: Check spilling?
+        if method == "simple":
+            cls = HostSimpleShuffle if use_host_mem else SimpleShuffle
+            return cls(frame, *ops)
+        elif method == "tasks":
+            cls = HostTaskShuffle if use_host_mem else TaskShuffle
+            return cls(frame, *ops)
+    else:
+        raise ValueError(f"{method} not supported")
+
+
+Shuffle._lower = _override_lower
+
+
+def _host_shuffle_group(df, _filter, *args):
+    convert = isinstance(df, cudf.DataFrame)
+    if _filter is None:
+        splits = shuffle_group(df, *args)
+    else:
+        splits = {
+            k: v for k, v in shuffle_group(df, *args).items() if k in _filter
+        }
+    if convert:
+        for k in splits.keys():
+            splits[k] = splits[k].to_pandas()
+    return splits
+
+
+def _update_output(dsk, name, npartitions):
+    for part in range(npartitions):
+        dsk[(name, part)] = (
+            cudf.DataFrame.from_pandas,
+            dsk[(name, part)],
+        )
+    return dsk
+
+
+class HostSimpleShuffle(SimpleShuffle):
+    _shuffle_group = staticmethod(_host_shuffle_group)
+
+    def _layer(self):
+        return _update_output(
+            super()._layer(), self._name, self.npartitions_out
+        )
+
+
+class HostTaskShuffle(TaskShuffle):
+    _shuffle_group = staticmethod(_host_shuffle_group)
+
+    def _layer(self):
+        return _update_output(
+            super()._layer(), self._name, self.npartitions_out
+        )
 
 
 ##
