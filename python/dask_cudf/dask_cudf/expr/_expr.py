@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.
 import functools
+import math
 
 import dask_expr._shuffle as _shuffle_module
 import pandas as pd
@@ -234,43 +235,6 @@ def _maybe_get_custom_expr(
     )
 
 
-class CudfFusedParquetIO(FusedParquetIO):
-    @staticmethod
-    def _load_multiple_files(
-        frag_filters,
-        columns,
-        schema,
-        *to_pandas_args,
-    ):
-        import pyarrow as pa
-
-        from dask.base import apply, tokenize
-        from dask.threaded import get
-
-        token = tokenize(frag_filters, columns, schema)
-        name = f"pq-file-{token}"
-        dsk = {
-            (name, i): (
-                CudfReadParquetPyarrowFS._fragment_to_table,
-                frag,
-                filter,
-                columns,
-                schema,
-            )
-            for i, (frag, filter) in enumerate(frag_filters)
-        }
-        dsk[name] = (
-            apply,
-            pa.concat_tables,
-            [list(dsk.keys())],
-            {"promote_options": "permissive"},
-        )
-        return CudfReadParquetPyarrowFS._table_to_pandas(
-            get(dsk, name),
-            *to_pandas_args,
-        )
-
-
 class CudfReadParquetPyarrowFS(ReadParquetPyarrowFS):
     @functools.cached_property
     def _dataset_info(self):
@@ -303,10 +267,76 @@ class CudfReadParquetPyarrowFS(ReadParquetPyarrowFS):
 
     @staticmethod
     def _table_to_pandas(table, index_name):
-        df = cudf.DataFrame.from_arrow(table)
+        if isinstance(table, cudf.DataFrame):
+            df = table
+        else:
+            df = cudf.DataFrame.from_arrow(table)
         if index_name is not None:
-            df = df.set_index(index_name)
+            return df.set_index(index_name)
         return df
+
+    @staticmethod
+    def _fragments_to_cudf_dataframe(
+        fragment_wrappers,
+        filters,
+        columns,
+        schema,
+    ):
+        from dask.dataframe.io.utils import _is_local_fs
+
+        from cudf.io.parquet import _apply_post_filters, _normalize_filters
+
+        if not isinstance(fragment_wrappers, list):
+            fragment_wrappers = [fragment_wrappers]
+
+        filesystem = None
+        paths, row_groups = [], []
+        for fw in fragment_wrappers:
+            frag = fw.fragment if isinstance(fw, FragmentWrapper) else fw
+            paths.append(frag.path)
+            row_groups.append(
+                [rg.id for rg in frag.row_groups] if frag.row_groups else None
+            )
+            if filesystem is None:
+                filesystem = frag.filesystem
+
+        if _is_local_fs(filesystem):
+            filesystem = None
+        else:
+            from fsspec.implementations.arrow import ArrowFSWrapper
+
+            filesystem = ArrowFSWrapper(filesystem)
+            protocol = filesystem.protocol
+            paths = [f"{protocol}://{path}" for path in paths]
+
+        filters = _normalize_filters(filters)
+        if row_groups == [None for path in paths]:
+            row_groups = None
+
+        df = cudf.read_parquet(
+            paths,
+            columns=columns,
+            filters=filters,
+            row_groups=row_groups,
+            dataset_kwargs={"schema": schema},
+        )
+
+        # Apply filters (if any are defined)
+        df = _apply_post_filters(df, filters)
+
+        # TODO: Deal with hive partitioning
+        return df
+
+    @functools.cached_property
+    def _use_device_io(self):
+        from dask.dataframe.io.utils import _is_local_fs
+
+        # Use host for remote filesystem only, or
+        # if KvikIO-S3 is enabled
+        return _is_local_fs(self.fs) or (
+            self.fs.type_name
+            == "s3"  # TODO: and cudf.get_option("kvikio_remote_io")
+        )
 
     def _filtered_task(self, index: int):
         columns = self.columns.copy()
@@ -318,10 +348,14 @@ class CudfReadParquetPyarrowFS(ReadParquetPyarrowFS):
             if columns is None:
                 columns = list(schema.names)
             columns.append(index_name)
+
+        frag_to_table = self._fragment_to_table
+        if self._use_device_io:
+            frag_to_table = self._fragments_to_cudf_dataframe
         return (
             self._table_to_pandas,
             (
-                self._fragment_to_table,
+                frag_to_table,
                 FragmentWrapper(self.fragments[index], filesystem=self.fs),
                 self.filters,
                 columns,
@@ -333,9 +367,88 @@ class CudfReadParquetPyarrowFS(ReadParquetPyarrowFS):
     def _tune_up(self, parent):
         if self._fusion_compression_factor >= 1:
             return
-        if isinstance(parent, CudfFusedParquetIO):
+        fused_cls = (
+            CudfFusedParquetIO
+            if self._use_device_io
+            else CudfFusedParquetIOHost
+        )
+        if isinstance(parent, fused_cls):
             return
-        return parent.substitute(self, CudfFusedParquetIO(self))
+        return parent.substitute(self, fused_cls(self))
+
+
+class CudfFusedParquetIO(FusedParquetIO):
+    @functools.cached_property
+    def _fusion_buckets(self):
+        partitions = self.operand("_expr")._partitions
+        npartitions = len(partitions)
+
+        step = math.ceil(1 / self.operand("_expr")._fusion_compression_factor)
+        heuristic = max(math.ceil(math.sqrt(npartitions)), 10)
+        step = min(step, heuristic, 100)
+
+        buckets = [
+            partitions[i : i + step] for i in range(0, npartitions, step)
+        ]
+        return buckets
+
+    @classmethod
+    def _load_multiple_files(
+        cls,
+        frag_filters,
+        columns,
+        schema,
+        *to_pandas_args,
+    ):
+        frag_to_table = CudfReadParquetPyarrowFS._fragments_to_cudf_dataframe
+        return CudfReadParquetPyarrowFS._table_to_pandas(
+            frag_to_table(
+                [frag[0] for frag in frag_filters],
+                frag_filters[0][1],  # TODO: Check for consistent filters?
+                columns,
+                schema,
+            ),
+            *to_pandas_args,
+        )
+
+
+class CudfFusedParquetIOHost(CudfFusedParquetIO):
+    @classmethod
+    def _load_multiple_files(
+        cls,
+        frag_filters,
+        columns,
+        schema,
+        *to_pandas_args,
+    ):
+        import pyarrow as pa
+
+        from dask.base import apply, tokenize
+        from dask.threaded import get
+
+        token = tokenize(frag_filters, columns, schema)
+        name = f"pq-file-{token}"
+        dsk = {
+            (name, i): (
+                CudfReadParquetPyarrowFS._fragment_to_table,
+                frag,
+                filter,
+                columns,
+                schema,
+            )
+            for i, (frag, filter) in enumerate(frag_filters)
+        }
+        dsk[name] = (
+            apply,
+            pa.concat_tables,
+            [list(dsk.keys())],
+            {"promote_options": "permissive"},
+        )
+
+        return CudfReadParquetPyarrowFS._table_to_pandas(
+            get(dsk, name),
+            *to_pandas_args,
+        )
 
 
 class RenameAxisCudf(RenameAxis):
