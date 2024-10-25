@@ -139,12 +139,20 @@ def _callback(
     assert with_columns is None
     assert pyarrow_predicate is None
     assert n_rows is None
+
     with (
         nvtx.annotate(message="ExecuteIR", domain="cudf_polars"),
         # Device must be set before memory resource is obtained.
         set_device(device),
         set_memory_resource(memory_resource),
     ):
+        if os.environ.get("CUDF_POLARS_DASK", "TRUE").upper() == "TRUE":
+            from dask import get
+
+            dsk = ir._task_graph()
+            result = get(dsk, ir._key)
+            return result.to_polars()
+
         return ir.evaluate(cache={}).to_polars()
 
 
