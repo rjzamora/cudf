@@ -147,10 +147,11 @@ def _callback(
         set_memory_resource(memory_resource),
     ):
         if os.environ.get("CUDF_POLARS_DASK", "TRUE").upper() == "TRUE":
+            from cudf_polars.dsl.parallel import task_graph
             from dask import get
 
-            dsk = ir._task_graph()
-            result = get(dsk, ir._key)
+            dsk, key = task_graph(ir)
+            result = get(dsk, key)
             return result.to_polars()
 
         return ir.evaluate(cache={}).to_polars()

@@ -209,41 +209,41 @@ class IR(Node["IR"]):
             *(child.evaluate(cache=cache) for child in self.children),
         )
 
-    @property
-    def _npartitions(self):
-        return 1
+    # @property
+    # def _npartitions(self):
+    #     return 1
 
-    @property
-    def _key(self):
-        name = type(self).__name__.lower()
-        token = hash(self)
-        return f"{name}-{token}"
+    # @property
+    # def _key(self):
+    #     name = type(self).__name__.lower()
+    #     token = hash(self)
+    #     return f"{name}-{token}"
 
-    def _tasks(self):
-        assert self._npartitions == 1
-        child_names = []
-        for child in self.children:
-            assert child._npartitions == 1
-            child_names.append(child._key)
-        name = self._key
-        return {
-            (name, 0): (
-                self.do_evaluate,
-                *self._non_child_args,
-                *((child_name, 0) for child_name in child_names),
-            )
-        }
+    # def _tasks(self):
+    #     assert self._npartitions == 1
+    #     child_names = []
+    #     for child in self.children:
+    #         assert child._npartitions == 1
+    #         child_names.append(child._key)
+    #     name = self._key
+    #     return {
+    #         (name, 0): (
+    #             self.do_evaluate,
+    #             *self._non_child_args,
+    #             *((child_name, 0) for child_name in child_names),
+    #         )
+    #     }
 
-    def _task_graph(self):
-        from cudf_polars.dsl.traversal import traversal
+    # def _task_graph(self):
+    #     from cudf_polars.dsl.traversal import traversal
 
-        dsk = {
-            k: v
-            for layer in [n._tasks() for n in traversal(self)]
-            for k, v in layer.items()
-        }
-        dsk[self._key] = (self._key, 0)
-        return dsk
+    #     dsk = {
+    #         k: v
+    #         for layer in [n._tasks() for n in traversal(self)]
+    #         for k, v in layer.items()
+    #     }
+    #     dsk[self._key] = (self._key, 0)
+    #     return dsk
 
 
 class PythonScan(IR):

@@ -252,3 +252,12 @@ class DataFrame:
         end = max(min(end, self.num_rows), 0)
         (table,) = plc.copying.slice(self.table, [start, end])
         return type(self).from_table(table, self.column_names).sorted_like(self)
+
+    @classmethod
+    def concat(cls, dfs: list[Self]) -> Self:
+        """Concatenate a list of dataframes."""
+        assert len(dfs), "Cannot concatenate an empty list"
+        if len(dfs) == 1:
+            return dfs[0]
+        table = plc.concatenate.concatenate([df.table for df in dfs])
+        return cls.from_table(table, dfs[0].column_names)
