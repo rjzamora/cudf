@@ -75,7 +75,17 @@ class CudfReadParquetFSSpec(ReadParquetFSSpec):
             ]
         }
 
-    @functools.cached_property
+    # ## OLD
+    # @property
+    # def _fusion_compression_factor(self):
+    #     if self.operand("columns") is None:
+    #         return 1
+    #     nr_original_columns = max(len(self._dataset_info["schema"].names) - 1, 1)
+    #     return max(
+    #         len(_convert_to_list(self.operand("columns"))) / nr_original_columns, 0.001
+    #     )
+
+    @property
     def _fusion_compression_factor(self):
         blocksize = self.blocksize
         if blocksize is None or self.aggregate_files:
