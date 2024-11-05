@@ -85,7 +85,7 @@ class CudfReadParquetFSSpec(ReadParquetFSSpec):
     #         len(_convert_to_list(self.operand("columns"))) / nr_original_columns, 0.001
     #     )
 
-    @property
+    @functools.cached_property
     def _fusion_compression_factor(self):
         blocksize = self.blocksize
         if blocksize is None or self.aggregate_files:
