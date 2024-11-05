@@ -1,7 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.
 
 import functools
+import itertools
 import math
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -15,6 +17,7 @@ from dask_expr.io.parquet import (
 )
 
 from dask.dataframe.io.parquet.arrow import _filters_to_expression
+from dask.dataframe.io.parquet.core import ParquetFunctionWrapper
 from dask.utils import parse_bytes
 
 import cudf
@@ -75,7 +78,10 @@ class CudfReadParquetFSSpec(ReadParquetFSSpec):
     @functools.cached_property
     def _fusion_compression_factor(self):
         blocksize = self.blocksize
-        if blocksize is None:
+        if blocksize is None or self.aggregate_files:
+            # NOTE: We cannot fuse files *again* if
+            # aggregate_files is True (this creates
+            # too much OOM risk)
             return 1
         elif blocksize == "default":
             blocksize = "256MiB"
@@ -84,8 +90,14 @@ class CudfReadParquetFSSpec(ReadParquetFSSpec):
         projected_size = 0
         col_op = self.operand("columns") or self.columns
         for col in approx_stats["columns"]:
-            if col["path_in_schema"] in col_op:
+            if col["path_in_schema"] in col_op or (
+                (split_name := col["path_in_schema"].split("."))
+                and split_name[0] in col_op
+            ):
                 projected_size += col["total_uncompressed_size"]
+
+        if projected_size < 1:
+            return 1
 
         aggregate_files = max(1, int(parse_bytes(blocksize) / projected_size))
         return max(1 / aggregate_files, 0.001)
@@ -95,7 +107,7 @@ class CudfReadParquetFSSpec(ReadParquetFSSpec):
             return
         if isinstance(parent, FusedIO):
             return
-        return parent.substitute(self, FusedIO(self))
+        return parent.substitute(self, CudfFusedIO(self))
 
 
 class CudfReadParquetPyarrowFS(ReadParquetPyarrowFS):
@@ -170,8 +182,8 @@ class CudfReadParquetPyarrowFS(ReadParquetPyarrowFS):
             df = table
         else:
             df = cudf.DataFrame.from_arrow(table)
-        if index_name is not None:
-            return df.set_index(index_name)
+            if index_name is not None:
+                return df.set_index(index_name)
         return df
 
     @staticmethod
@@ -209,6 +221,14 @@ class CudfReadParquetPyarrowFS(ReadParquetPyarrowFS):
             paths = [f"{protocol}://{path}" for path in paths]
 
         filters = _normalize_filters(filters)
+        projected_columns = None
+        if columns and filters:
+            projected_columns = [c for c in columns if c is not None]
+            columns = sorted(
+                set(v[0] for v in itertools.chain.from_iterable(filters))
+                | set(projected_columns)
+            )
+
         if row_groups == [None for path in paths]:
             row_groups = None
 
@@ -222,8 +242,16 @@ class CudfReadParquetPyarrowFS(ReadParquetPyarrowFS):
 
         # Apply filters (if any are defined)
         df = _apply_post_filters(df, filters)
+        if projected_columns:
+            # Elements of `projected_columns` may now be in the index.
+            # We must filter these names from our projection
+            projected_columns = [
+                col for col in projected_columns if col in df._column_names
+            ]
+            df = df[projected_columns]
 
-        # TODO: Deal with hive partitioning
+        # TODO: Deal with hive partitioning.
+        # Note that ReadParquetPyarrowFS does NOT support this yet anyway.
         return df
 
     @functools.cached_property
@@ -276,8 +304,14 @@ class CudfReadParquetPyarrowFS(ReadParquetPyarrowFS):
         projected_size = 0
         col_op = self.operand("columns") or self.columns
         for col in approx_stats["columns"]:
-            if col["path_in_schema"] in col_op:
+            if col["path_in_schema"] in col_op or (
+                (split_name := col["path_in_schema"].split("."))
+                and split_name[0] in col_op
+            ):
                 projected_size += col["total_uncompressed_size"]
+
+        if projected_size < 1:
+            return 1
 
         aggregate_files = max(1, int(parse_bytes(blocksize) / projected_size))
         return max(1 / aggregate_files, 0.001)
@@ -293,6 +327,29 @@ class CudfReadParquetPyarrowFS(ReadParquetPyarrowFS):
         if isinstance(parent, fused_cls):
             return
         return parent.substitute(self, fused_cls(self))
+
+
+class CudfFusedIO(FusedIO):
+    def _task(self, index: int):
+        expr = self.operand("_expr")
+        bucket = self._fusion_buckets[index]
+
+        io_func = expr._filtered_task(0)[0]
+        if not isinstance(
+            io_func, ParquetFunctionWrapper
+        ) or io_func.common_kwargs.get("partitions", None):
+            # Just use "simple" fusion if we have an unexpected
+            # callable, or we are dealing with hive partitioning.
+            return (cudf.concat, [expr._filtered_task(i) for i in bucket])
+
+        pieces = []
+        for i in bucket:
+            piece = expr._filtered_task(i)[1]
+            if isinstance(piece, list):
+                pieces.extend(piece)
+            else:
+                pieces.append(piece)
+        return (io_func, pieces)
 
 
 class CudfFusedParquetIO(FusedParquetIO):
@@ -440,8 +497,7 @@ def read_parquet(
         and filesystem.lower() in ("arrow", "pyarrow")
     ):
         # EXPERIMENTAL filesystem="arrow" support.
-        # This code path uses PyArrow for IO, which is only
-        # beneficial for remote storage (e.g. S3)
+        # This code path may use PyArrow for remote IO.
 
         # CudfReadParquetPyarrowFS requires import of distributed beforehand
         # (See: https://github.com/dask/dask/issues/11352)
@@ -452,12 +508,19 @@ def read_parquet(
                 "pyarrow>=15.0.0 is required to use the pyarrow filesystem."
             )
         if metadata_task_size is not None:
-            raise NotImplementedError(
+            warnings.warn(
                 "metadata_task_size is not supported when using the pyarrow filesystem."
+                " This argument will be ignored!"
+            )
+        if aggregate_files is not None:
+            warnings.warn(
+                "aggregate_files is not supported when using the pyarrow filesystem."
+                " This argument will be ignored!"
             )
         if split_row_groups != "infer":
-            raise NotImplementedError(
+            warnings.warn(
                 "split_row_groups is not supported when using the pyarrow filesystem."
+                " This argument will be ignored!"
             )
         if parquet_file_extension != (".parq", ".parquet", ".pq"):
             raise NotImplementedError(

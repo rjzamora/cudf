@@ -45,7 +45,7 @@ def test_roundtrip_backend_dispatch(tmpdir):
     tmpdir = str(tmpdir)
     ddf.to_parquet(tmpdir, engine="pyarrow")
     with dask.config.set({"dataframe.backend": "cudf"}):
-        ddf2 = dd.read_parquet(tmpdir, index=False)
+        ddf2 = dd.read_parquet(tmpdir, index=False, blocksize=None)
     assert isinstance(ddf2, dask_cudf.DataFrame)
     dd.assert_eq(ddf.reset_index(drop=False), ddf2)
 
@@ -99,7 +99,7 @@ def test_roundtrip_from_dask_index_false(tmpdir):
     tmpdir = str(tmpdir)
     ddf.to_parquet(tmpdir, engine="pyarrow")
 
-    ddf2 = dask_cudf.read_parquet(tmpdir, index=False)
+    ddf2 = dask_cudf.read_parquet(tmpdir, index=False, blocksize=None)
     dd.assert_eq(ddf.reset_index(drop=False), ddf2)
 
 
@@ -662,5 +662,5 @@ def test_to_parquet_append(tmpdir, write_metadata_file):
         write_metadata_file=write_metadata_file,
         write_index=False,
     )
-    ddf2 = dask_cudf.read_parquet(tmpdir)
+    ddf2 = dask_cudf.read_parquet(tmpdir, blocksize=None)
     dd.assert_eq(cudf.concat([df, df]), ddf2)
