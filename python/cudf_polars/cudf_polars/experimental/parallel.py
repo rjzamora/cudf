@@ -7,8 +7,10 @@ from __future__ import annotations
 from functools import singledispatch
 from typing import TYPE_CHECKING, Any
 
-from cudf_polars.dsl.expr import NamedExpr
-from cudf_polars.dsl.ir import PartitionInfo
+import pylibcudf as plc
+
+from cudf_polars.dsl.expr import Agg, BinOp, Col, NamedExpr
+from cudf_polars.dsl.ir import GroupBy, PartitionInfo, Select
 from cudf_polars.dsl.traversal import traversal
 
 if TYPE_CHECKING:
@@ -30,7 +32,7 @@ def get_key_name(node: Node | NamedExpr) -> str:
 def lower_ir_node(ir: IR, rec) -> IR:
     """Rewrite an IR node with proper partitioning."""
     # Return same node by default
-    return ir
+    return ir.reconstruct([rec(child) for child in ir.children])
 
 
 def lower_ir_graph(ir: IR) -> IR:
@@ -118,3 +120,102 @@ def evaluate_dask(ir: IR) -> DataFrame:
 
     graph, key = task_graph(ir)
     return get(graph, key)
+
+
+##
+## GroupBy
+##
+
+
+class GroupByChunk(GroupBy):
+    """Chunkwise groupby operation."""
+
+
+class GroupByTree(GroupBy):
+    """Groupby tree-reduction operation."""
+
+
+_GB_AGG_SUPPORTED = ("mean",)
+
+
+@lower_ir_node.register(GroupBy)
+def _(ir: GroupBy, rec) -> GroupBy | Select:
+    for ne in ir.keys:
+        if not isinstance(ne.value, Col):
+            return ir
+
+    name_map: MutableMapping[str, Any] = {}
+    agg_requests_chunk = []
+    agg_requests_tree = []
+    for ne in ir.agg_requests:
+        if not isinstance(ne.value, Agg):
+            return ir
+
+        agg = ne.value
+        if agg.name not in _GB_AGG_SUPPORTED:
+            return ir
+
+        if len(agg.children) > 1:
+            return ir
+
+        name = ne.name
+        for child in agg.children:
+            if not isinstance(child, Col) or child.name != name:
+                return ir
+
+        if agg.name == "mean":
+            name_map[name] = {agg.name: {}}
+            for sub in ["sum", "count"]:
+                tmp_name = f"{name}__{sub}"
+                name_map[name][agg.name][sub] = tmp_name
+                agg_chunk = Agg(agg.dtype, sub, agg.options, *agg.children)
+                agg_requests_chunk.append(NamedExpr(tmp_name, agg_chunk))
+
+                child = Col(agg.dtype, tmp_name)
+                agg_tree = Agg(agg.dtype, "sum", agg.options, child)
+                agg_requests_tree.append(NamedExpr(tmp_name, agg_tree))
+
+    gb_chunk = GroupByChunk(
+        ir.schema,
+        ir.keys,
+        agg_requests_chunk,
+        ir.maintain_order,
+        ir.options,
+        *ir.children,
+    )
+
+    gb_tree = GroupByTree(
+        ir.schema,
+        ir.keys,
+        agg_requests_tree,
+        ir.maintain_order,
+        ir.options,
+        gb_chunk,
+    )
+
+    schema = ir.schema
+    output_exprs = []
+    for name, dtype in schema.items():
+        agg_mapping = name_map.get(name, None)
+        if agg_mapping is None:
+            output_exprs.append(NamedExpr(name, Col(dtype, name)))
+        elif "mean" in agg_mapping:
+            mean_cols = agg_mapping["mean"]
+            output_exprs.append(
+                NamedExpr(
+                    name,
+                    BinOp(
+                        dtype,
+                        plc.binaryop.BinaryOperator.DIV,
+                        Col(dtype, mean_cols["sum"]),
+                        Col(dtype, mean_cols["count"]),
+                    ),
+                )
+            )
+    should_broadcast: bool = False
+    return Select(
+        schema,
+        output_exprs,
+        should_broadcast,
+        gb_tree,
+    )
