@@ -127,12 +127,16 @@ def evaluate_dask(ir: IR) -> DataFrame:
 ##
 
 
-class GroupByChunk(GroupBy):
+class GroupByPart(GroupBy):
     """Chunkwise groupby operation."""
 
 
 class GroupByTree(GroupBy):
     """Groupby tree-reduction operation."""
+
+
+class GroupByFinalize(Select):
+    """Finalize a groupby aggregation."""
 
 
 _GB_AGG_SUPPORTED = ("mean",)
@@ -175,7 +179,7 @@ def _(ir: GroupBy, rec) -> GroupBy | Select:
                 agg_tree = Agg(agg.dtype, "sum", agg.options, child)
                 agg_requests_tree.append(NamedExpr(tmp_name, agg_tree))
 
-    gb_chunk = GroupByChunk(
+    gb_chunk = GroupByPart(
         ir.schema,
         ir.keys,
         agg_requests_chunk,
@@ -213,7 +217,7 @@ def _(ir: GroupBy, rec) -> GroupBy | Select:
                 )
             )
     should_broadcast: bool = False
-    return Select(
+    return GroupByFinalize(
         schema,
         output_exprs,
         should_broadcast,
