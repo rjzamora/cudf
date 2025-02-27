@@ -79,7 +79,14 @@ def get_data(path, table_name, suffix=""):
 
 def q1(args):
     """Query 1."""
-    lineitem = get_data(args.path, "lineitem", args.suffix)
+    lineitem = get_data(args.path, "lineitem", args.suffix).cast(
+        {
+            "l_extendedprice": pl.Float64,
+            "l_discount": pl.Float64,
+            "l_tax": pl.Float64,
+            "l_quantity": pl.Float64,
+        }
+    )
 
     var1 = date(1998, 9, 2)
 
@@ -113,7 +120,12 @@ def q5(args):
     path = args.path
     suffix = args.suffix
     customer = get_data(path, "customer", suffix)
-    lineitem = get_data(path, "lineitem", suffix)
+    lineitem = get_data(path, "lineitem", suffix).cast(
+        {
+            "l_extendedprice": pl.Float64,
+            "l_discount": pl.Float64,
+        }
+    )
     nation = get_data(path, "nation", suffix)
     orders = get_data(path, "orders", suffix)
     region = get_data(path, "region", suffix)
@@ -148,7 +160,13 @@ def q6(args):
     """Query 6."""
     path = args.path
     suffix = args.suffix
-    lineitem = get_data(path, "lineitem", suffix)
+    lineitem = get_data(path, "lineitem", suffix).cast(
+        {
+            "l_extendedprice": pl.Float64,
+            "l_discount": pl.Float64,
+            "l_quantity": pl.Float64,
+        }
+    )
 
     var1 = date(1994, 1, 1)
     var2 = date(1995, 1, 1)
@@ -171,11 +189,17 @@ def q9(args):
     """Query 9."""
     path = args.path
     suffix = args.suffix
-    lineitem = get_data(path, "lineitem", suffix)
+    lineitem = get_data(path, "lineitem", suffix).cast(
+        {
+            "l_extendedprice": pl.Float64,
+            "l_discount": pl.Float64,
+            "l_quantity": pl.Float64,
+        }
+    )
     nation = get_data(path, "nation", suffix)
     orders = get_data(path, "orders", suffix)
     part = get_data(path, "part", suffix)
-    partsupp = get_data(path, "partsupp", suffix)
+    partsupp = get_data(path, "partsupp", suffix).cast({"ps_supplycost": pl.Float64})
     supplier = get_data(path, "supplier", suffix)
 
     return (
@@ -207,8 +231,13 @@ def q10(args):
     """Query 10."""
     path = args.path
     suffix = args.suffix
-    customer = get_data(path, "customer", suffix)
-    lineitem = get_data(path, "lineitem", suffix)
+    customer = get_data(path, "customer", suffix).cast({"c_acctbal": pl.Float64})
+    lineitem = get_data(path, "lineitem", suffix).cast(
+        {
+            "l_extendedprice": pl.Float64,
+            "l_discount": pl.Float64,
+        }
+    )
     nation = get_data(path, "nation", suffix)
     orders = get_data(path, "orders", suffix)
 
@@ -339,16 +368,20 @@ def run(args):
     else:
         if executor == "pylibcudf":
             executor_options = {}
+            engine_options = {}
         else:
             executor_options = {
                 "parquet_blocksize": args.blocksize,
                 "shuffle_method": args.shuffle,
                 "bcast_join_limit": 2 if executor == "dask-cuda" else 32,
             }
+            # Avoid chunked reading (Decimal hack/work-around)
+            engine_options = {"parquet_options": {"chunked": False}}
         engine = pl.GPUEngine(
             raise_on_fail=True,
             executor="dask-experimental" if executor.startswith("dask") else executor,
             executor_options=executor_options,
+            **engine_options,
         )
         if args.debug:
             ir = Translator(q._ldf.visit(), engine).translate_ir()

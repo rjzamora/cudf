@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
 """Datatype utilities."""
@@ -204,5 +204,8 @@ def from_polars(dtype: pl.DataType) -> plc.DataType:
         # Recurse to catch unsupported inner types
         _ = from_polars(dtype.inner)
         return plc.DataType(plc.TypeId.LIST)
+    # Decimal HACK
+    elif isinstance(dtype, pl.Decimal):
+        return plc.DataType(plc.TypeId.FLOAT64)
     else:
         raise NotImplementedError(f"{dtype=} conversion not supported")

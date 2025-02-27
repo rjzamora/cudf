@@ -591,11 +591,34 @@ class Scan(IR):
                 if filters is not None:
                     options.set_filter(filters)
                 tbl_w_meta = plc.io.parquet.read_parquet(options)
-                df = DataFrame.from_table(
-                    tbl_w_meta.tbl,
-                    # TODO: consider nested column names?
-                    tbl_w_meta.column_names(include_children=False),
+                # HACK:
+                df = DataFrame(
+                    Column(
+                        (
+                            # Cast all Decimal types to Float64
+                            plc.unary.cast(c, plc.DataType(plc.TypeId.FLOAT64))
+                            if c.type().id()
+                            in (
+                                plc.TypeId.DECIMAL32,
+                                plc.TypeId.DECIMAL64,
+                                plc.TypeId.DECIMAL128,
+                            )
+                            else c
+                        ),
+                        name=name,
+                    )
+                    for c, name in zip(
+                        tbl_w_meta.tbl.columns(),
+                        tbl_w_meta.column_names(include_children=False),
+                        strict=True,
+                    )
                 )
+                # ORIGINAL:
+                # df = DataFrame.from_table(
+                #     tbl_w_meta.tbl,
+                #     # TODO: consider nested column names?
+                #     tbl_w_meta.column_names(include_children=False),
+                # )
                 if filters is not None:
                     # Mask must have been applied.
                     return df
