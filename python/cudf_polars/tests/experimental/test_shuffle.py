@@ -12,6 +12,7 @@ from cudf_polars import Translator
 from cudf_polars.dsl.expr import Col, NamedExpr
 from cudf_polars.experimental.parallel import evaluate_dask, lower_ir_graph
 from cudf_polars.experimental.shuffle import Shuffle
+from cudf_polars.testing.asserts import assert_gpu_result_equal
 
 
 @pytest.fixture(scope="module")
@@ -64,3 +65,29 @@ def test_hash_shuffle(df, engine):
     result = evaluate_dask(qir3).to_polars()
     expect = df.collect(engine="cpu")
     assert_frame_equal(result, expect, check_row_order=False)
+
+
+@pytest.mark.parametrize(
+    "sort_keys",
+    [
+        (pl.col("a"),),
+        # (pl.col("d").abs(),),
+        # (pl.col("a"), pl.col("d")),
+        # (pl.col("b"),),
+    ],
+)
+def test_sort(sort_keys, engine):
+    ldf = pl.DataFrame(
+        {
+            "a": [1, 2, 1, 3, 5, None, None],
+            "b": [1.5, 2.5, None, 1.5, 3, float("nan"), 3],
+            "c": [True, True, True, True, False, False, True],
+            "d": [1, 2, -1, 10, 6, -1, -7],
+        }
+    ).lazy()
+
+    query = ldf.sort(
+        *sort_keys,
+        descending=True,
+    )
+    assert_gpu_result_equal(query, engine=engine)

@@ -13,7 +13,7 @@ import pyarrow as pa
 import pylibcudf as plc
 
 from cudf_polars.containers import DataFrame
-from cudf_polars.dsl.ir import IR
+from cudf_polars.dsl.ir import IR, Sort
 from cudf_polars.experimental.base import _concat, get_key_name
 from cudf_polars.experimental.dispatch import generate_ir_tasks, lower_ir_node
 
@@ -202,3 +202,34 @@ def _(
         partition_info[ir.children[0]].count,
         partition_info[ir].count,
     )
+
+
+@lower_ir_node.register(Sort)
+def _(
+    ir: Shuffle, rec: LowerIRTransformer
+) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    from cudf_polars.experimental.parallel import PartitionInfo
+
+    (child,) = ir.children
+    new_child, pi = rec(child)
+    new_node = ir.reconstruct([new_child])
+    pi[new_node] = PartitionInfo(
+        # Default sort preserves partition count
+        count=pi[new_child].count
+    )
+    return new_node, pi
+
+
+@generate_ir_tasks.register(Sort)
+def _(
+    ir: Sort, partition_info: MutableMapping[IR, PartitionInfo]
+) -> MutableMapping[Any, Any]:
+    # Step 1. find splits on each partition
+
+    # Step 2. Combine the splits in a single task
+
+    # Step 3. Shuffle (using the splits from step 2)
+
+    # Step 4. Local sort
+
+    raise NotImplementedError()
