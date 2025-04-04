@@ -195,13 +195,59 @@ def get_scheduler(config_options: ConfigOptions | None = None) -> Any:
         raise ValueError(f"{scheduler} not a supported scheduler option.")
 
 
+def process_task_graph(
+    graph: MutableMapping[Any, Any],
+    key: str | tuple[str, int],
+    config_options: ConfigOptions | None,
+) -> MutableMapping[Any, Any]:
+    """
+    Post-process the task graph.
+
+    Parameters
+    ----------
+    graph
+        Task graph to pre-process.
+    key
+        Output key for the graph.
+    config_options
+        GPUEngine configuration options.
+
+    Returns
+    -------
+    graph
+        A Dask-compatible task graph.
+    """
+    config_options = config_options or ConfigOptions({})
+    if config_options.get("executor_options.rapidsmp_spill", default=False):
+        from cudf_polars.experimental.spilling import wrap_dataframe_in_spillable
+
+        return wrap_dataframe_in_spillable(graph, ignore_key=key)
+    return graph
+
+
 def evaluate_dask(ir: IR, config_options: ConfigOptions | None = None) -> DataFrame:
-    """Evaluate an IR graph with partitioning."""
+    """
+    Evaluate an IR graph with partitioning.
+
+    Parameters
+    ----------
+    ir
+        Logical plan to evaluate.
+    config_options
+        GPUEngine configuration options.
+
+    Returns
+    -------
+    A cudf-polars DataFrame object.
+    """
     ir, partition_info = lower_ir_graph(ir, config_options)
 
     get = get_scheduler(config_options)
 
     graph, key = task_graph(ir, partition_info)
+
+    graph = process_task_graph(graph, key, config_options)
+
     return get(graph, key)
 
 

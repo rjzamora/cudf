@@ -16,6 +16,12 @@ import rmm
 
 from cudf_polars.containers import Column, DataFrame
 
+try:
+    from rapidsmp.integrations.dask.spilling import register_dask_serialize
+except ImportError:
+    register_dask_serialize = None
+
+
 if TYPE_CHECKING:
     from cudf_polars.typing import ColumnHeader, DataFrameHeader
 
@@ -102,3 +108,7 @@ def register() -> None:
             # Copy the second frame (the gpudata in host memory) back to the gpu
             frames = frames[0], plc.gpumemoryview(rmm.DeviceBuffer.to_device(frames[1]))
             return Column.deserialize(header, frames)
+
+    # Register rapidsmp serializer if it's installed.
+    if callable(register_dask_serialize):
+        register_dask_serialize()

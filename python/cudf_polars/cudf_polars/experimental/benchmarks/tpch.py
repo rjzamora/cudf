@@ -877,6 +877,12 @@ parser.add_argument(
     help="Shuffle method to use for distributed execution.",
 )
 parser.add_argument(
+    "--rapidsmp-spill",
+    default=False,
+    action="store_true",
+    help="Whether to use rapidsmp spilling.",
+)
+parser.add_argument(
     "--broadcast-join-limit",
     default=None,
     type=int,
@@ -912,6 +918,9 @@ def run(args: Any) -> None:
         os.environ["POLARS_GPU_ENABLE_CUDA_MANAGED_MEMORY"] = "0"
         client = Client(LocalCUDACluster(**kwargs))
         client.wait_for_workers(args.n_workers)
+        import pdb
+
+        pdb.set_trace()
         if args.shuffle != "tasks":
             try:
                 from rapidsmp.integrations.dask import bootstrap_dask_cluster
@@ -945,6 +954,7 @@ def run(args: Any) -> None:
                 executor_options = {
                     "parquet_blocksize": args.blocksize,
                     "shuffle_method": args.shuffle,
+                    "rapidsmp_spill": args.rapidsmp_spill,
                     "broadcast_join_limit": broadcast_join_limit,
                     "cardinality_factor": {
                         "c_custkey": 0.05,  # Q10
