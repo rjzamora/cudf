@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import itertools
 import operator
-from functools import reduce
+from functools import partial, reduce
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import cudf_polars.experimental.groupby
@@ -161,34 +161,45 @@ def task_graph(
         return graph, (key_name, 0)
 
 
-# The true type signature for get_client() needs an overload. Not worth it.
+# The true type signature for get_scheduler() needs an overload. Not worth it.
 
 
-def get_client() -> Any:
-    """Get appropriate Dask client or scheduler."""
-    SerializerManager.register_serialize()
-
-    try:  # pragma: no cover; block depends on executor type and Distributed cluster
+def get_scheduler(config_options: ConfigOptions | None = None) -> Any:
+    """Get appropriate task scheduler."""
+    config_options = config_options or ConfigOptions({})
+    scheduler = config_options.get("executor_options.scheduler", default="sync")
+    scheduler_options = config_options.get(
+        "executor_options.scheduler_options", default={}
+    )
+    if (
+        scheduler == "distributed"
+    ):  # pragma: no cover; block depends on executor type and Distributed cluster
         from distributed import get_client
+
+        SerializerManager.register_serialize()
 
         client = get_client()
         SerializerManager.run_on_cluster(client)
-    except (
-        ImportError,
-        ValueError,
-    ):  # pragma: no cover; block depends on Dask local scheduler
+        return client.get
+    elif scheduler == "threaded":  # pragma: no cover
+        from dask.threaded import get
+
+        kwargs = {"num_workers": 2}
+        kwargs.update(scheduler_options)
+        return partial(get, **kwargs)
+    elif scheduler == "sync":
         from dask import get
 
         return get
-    else:  # pragma: no cover; block depends on executor type and Distributed cluster
-        return client.get
+    else:  # pragma: no cover
+        raise ValueError(f"{scheduler} not a supported scheduler option.")
 
 
 def evaluate_dask(ir: IR, config_options: ConfigOptions | None = None) -> DataFrame:
     """Evaluate an IR graph with partitioning."""
     ir, partition_info = lower_ir_graph(ir, config_options)
 
-    get = get_client()
+    get = get_scheduler(config_options)
 
     graph, key = task_graph(ir, partition_info)
     return get(graph, key)

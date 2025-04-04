@@ -882,6 +882,12 @@ parser.add_argument(
     type=int,
     help="Set an explicit `broadcast_join_limit` option.",
 )
+parser.add_argument(
+    "--threads",
+    default=1,
+    type=int,
+    help="Number of threads to use on each GPU.",
+)
 args = parser.parse_args()
 
 
@@ -899,6 +905,7 @@ def run(args: Any) -> None:
             "dashboard_address": ":8585",
             "protocol": "ucx",
             "rmm_pool_size": 0.85,
+            "threads_per_worker": args.threads,
         }
 
         # Avoid UVM in distributed cluster
@@ -944,6 +951,12 @@ def run(args: Any) -> None:
                         "l_orderkey": 1.0,  # Q18
                     },
                 }
+                if executor == "dask" and args.threads > 1:
+                    executor_options["scheduler"] = "threaded"
+                    executor_options["scheduler_options"] = {
+                        "num_workers": args.threads,
+                    }
+
             engine = pl.GPUEngine(
                 raise_on_fail=True,
                 executor="dask-experimental"
@@ -952,11 +965,12 @@ def run(args: Any) -> None:
                 executor_options=executor_options,
             )
             if args.debug:
-                ir = Translator(q._ldf.visit(), engine).translate_ir()
+                translator = Translator(q._ldf.visit(), engine)
+                ir = translator.translate_ir()
                 if executor == "pylibcudf":
                     result = ir.evaluate(cache={}, timer=None).to_polars()
                 elif executor.startswith("dask"):
-                    result = evaluate_dask(ir).to_polars()
+                    result = evaluate_dask(ir, translator.config_options).to_polars()
             else:
                 result = q.collect(engine=engine)
 
@@ -974,6 +988,7 @@ def run(args: Any) -> None:
     print(f"shuffle_method: {args.shuffle}")
     print(f"broadcast_join_limit: {args.broadcast_join_limit}")
     print(f"n_workers: {args.n_workers}")
+    print(f"threads: {args.threads}")
     print(f"n_trials: {args.trials}")
     print("---------------------------------------")
     print(f"min time: {min(trials)}")
