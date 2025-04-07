@@ -956,6 +956,8 @@ def run(args: Any) -> None:
                     executor_options["scheduler_options"] = {
                         "num_workers": args.threads,
                     }
+                elif executor == "dask-cuda":
+                    executor_options["scheduler"] = "distributed"
 
             engine = pl.GPUEngine(
                 raise_on_fail=True,
