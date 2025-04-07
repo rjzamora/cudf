@@ -918,9 +918,6 @@ def run(args: Any) -> None:
         os.environ["POLARS_GPU_ENABLE_CUDA_MANAGED_MEMORY"] = "0"
         client = Client(LocalCUDACluster(**kwargs))
         client.wait_for_workers(args.n_workers)
-        import pdb
-
-        pdb.set_trace()
         if args.shuffle != "tasks":
             try:
                 from rapidsmp.integrations.dask import bootstrap_dask_cluster
