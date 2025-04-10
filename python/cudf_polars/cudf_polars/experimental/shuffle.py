@@ -146,6 +146,10 @@ def _partition_dataframe(
     A dictionary mapping between int partition indices and
     DataFrame fragments.
     """
+    if df.num_rows == 0:
+        # Fast path for empty DataFrame
+        return {i: df for i in range(count)}
+
     # Hash the specified keys to calculate the output
     # partition for each row
     partition_map = plc.binaryop.binary_operation(
@@ -266,6 +270,8 @@ def _(
                 RMPIntegration,
             )
         except (ImportError, ValueError) as err:
+            # ImportError: rapidsmp is not installed
+            # ValueError: rapidsmp couldn't find a distributed client
             if shuffle_method == "rapidsmp":
                 # Only raise an error if the user specifically
                 # set the shuffle method to "rapidsmp"
