@@ -894,6 +894,12 @@ parser.add_argument(
     type=int,
     help="Number of threads to use on each GPU.",
 )
+parser.add_argument(
+    "--rmm-pool-size",
+    default=0.8,
+    type=float,
+    help="RMM pool size (fractional).",
+)
 args = parser.parse_args()
 
 
@@ -910,7 +916,7 @@ def run(args: Any) -> None:
             "n_workers": args.n_workers,
             "dashboard_address": ":8585",
             "protocol": "ucx",
-            "rmm_pool_size": 0.85,
+            "rmm_pool_size": args.rmm_pool_size,
             "threads_per_worker": args.threads,
         }
 
@@ -918,11 +924,12 @@ def run(args: Any) -> None:
         os.environ["POLARS_GPU_ENABLE_CUDA_MANAGED_MEMORY"] = "0"
         client = Client(LocalCUDACluster(**kwargs))
         client.wait_for_workers(args.n_workers)
-        if args.shuffle != "tasks":
+        if args.shuffle != "tasks" or args.rapidsmp_spill:
             try:
                 from rapidsmp.integrations.dask import bootstrap_dask_cluster
 
-                bootstrap_dask_cluster(client, spill_device=0.5)
+                spill_device = args.rmm_pool_size if args.rapidsmp_spill else 0.5
+                bootstrap_dask_cluster(client, spill_device=spill_device)
             except ImportError as err:
                 if args.shuffle == "rapidsmp":
                     raise ImportError from err
