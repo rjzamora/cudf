@@ -49,7 +49,7 @@ def test_select_reduce_fallback(df, fallback_mode):
             "max_rows_per_partition": 3,
         },
     )
-    match = "This selection not support for multiple partitions."
+    match = "This selection is not supported for multiple partitions."
 
     query = df.select(
         (pl.col("a") + pl.col("b")).max(),
@@ -63,7 +63,7 @@ def test_select_reduce_fallback(df, fallback_mode):
         ctx = pytest.raises(pl.exceptions.ComputeError, match=match)
     elif fallback_mode == "foo":
         ctx = pytest.raises(
-            pl.exceptions.ComputeError, match="not a supported 'fallback_mode' option"
+            pl.exceptions.ComputeError, match="not a supported 'fallback_mode'"
         )
     else:
         ctx = pytest.warns(UserWarning, match=match)
