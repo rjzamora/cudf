@@ -928,7 +928,7 @@ def run(args: Any) -> None:
             try:
                 from rapidsmp.integrations.dask import bootstrap_dask_cluster
 
-                spill_device = args.rmm_pool_size if args.rapidsmp_spill else 0.5
+                spill_device = 0.66 if args.rapidsmp_spill else 0.5
                 bootstrap_dask_cluster(client, spill_device=spill_device)
             except ImportError as err:
                 if args.shuffle == "rapidsmp":

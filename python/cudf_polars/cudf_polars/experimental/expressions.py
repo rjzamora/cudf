@@ -33,21 +33,6 @@ if TYPE_CHECKING:
 _SUPPORTED_AGGS = ("count", "min", "max", "sum", "mean", "n_unique")
 
 
-def _check_sub_expr(sub_expr: Expr) -> None:
-    """Check that a multi-partition expression is supported."""
-    if sub_expr.is_pointwise:
-        # Pointwise expression
-        return
-    elif isinstance(sub_expr, Agg) and sub_expr.name in _SUPPORTED_AGGS:
-        # Supported Agg expression
-        return
-    else:
-        # Un-supported
-        raise NotImplementedError(
-            f"{type(sub_expr)} not supported for multiple partitions."
-        )
-
-
 class FusedExpr(Expr):
     """
     A single fused component of a decomposed Expr graph.
