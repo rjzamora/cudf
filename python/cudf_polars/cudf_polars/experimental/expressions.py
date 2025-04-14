@@ -4,629 +4,481 @@
 
 from __future__ import annotations
 
-from itertools import chain
-from typing import TYPE_CHECKING, Any
+import operator
+from functools import reduce
+from typing import TYPE_CHECKING
 
 import pylibcudf as plc
 
-from cudf_polars.containers import Column, DataFrame
+from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.expressions.aggregation import Agg
-from cudf_polars.dsl.expressions.base import Col, ExecutionContext, Expr, NamedExpr
+from cudf_polars.dsl.expressions.base import Col, Expr, NamedExpr
 from cudf_polars.dsl.expressions.binaryop import BinOp
 from cudf_polars.dsl.expressions.literal import Literal
 from cudf_polars.dsl.expressions.unary import Cast
+from cudf_polars.dsl.ir import IR, HConcatBcast, Select
 from cudf_polars.dsl.traversal import (
     CachingVisitor,
-    traversal,
 )
-from cudf_polars.experimental.base import get_key_name
+from cudf_polars.dsl.utils.naming import unique_names
+from cudf_polars.experimental.base import PartitionInfo
+from cudf_polars.experimental.repartition import Repartition
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, MutableMapping, Sequence
+    from collections.abc import Generator, MutableMapping, Sequence
+    from typing import Any, TypeAlias
 
-    from cudf_polars.dsl.ir import IR
-    from cudf_polars.experimental.base import PartitionInfo
-    from cudf_polars.typing import ExprTransformer
+    from cudf_polars.dsl.expressions.base import Expr
+    from cudf_polars.typing import GenericTransformer, Schema
     from cudf_polars.utils.config import ConfigOptions
+
+
+ExprDecomposer: TypeAlias = (
+    "GenericTransformer[Expr, tuple[Expr, IR, MutableMapping[IR, PartitionInfo]]]"
+)
 
 
 _SUPPORTED_AGGS = ("count", "min", "max", "sum", "mean", "n_unique")
 
 
-class FusedExpr(Expr):
+class _Placeholder(IR):
     """
-    A single fused component of a decomposed Expr graph.
+    Placeholder leaf node.
 
     Notes
     -----
-    - A FusedExpr object points to a single node in a
-    decomposed Expr graph (i.e. ``sub_expr``).
-    - A FusedExpr object may have children, but those
-    children must be other FusedExpr objects.
-    - When a FusedExpr object is evaluated, it will
-    substitute it's evaluated children into ``sub_expr``,
-    and evaluate the re-written sub-expression.
-    - The specific structure of ``sub_expr`` depends on
-    the ``kind`` attribute.
+    This is used as the required IR for ``Literal``
+    expressions in ``_decompose``.
     """
-
-    __slots__ = ("kind", "sub_expr")
-    _non_child = ("dtype", "sub_expr", "kind")
-
-    def __init__(
-        self,
-        dtype: plc.DataType,
-        sub_expr: Expr,
-        kind: str | None,
-        *children: FusedExpr,
-    ):
-        self.dtype = dtype
-        self.sub_expr = sub_expr
-        self.kind = kind
-        self.children = children
-        self.is_pointwise = self.kind == "pointwise"
-        assert all(isinstance(c, FusedExpr) for c in children)
-        assert kind in ("pointwise", "shuffle", "aggregation")
-
-    def do_evaluate(
-        self,
-        df: DataFrame,
-        *,
-        context: ExecutionContext = ExecutionContext.FRAME,
-        mapping: Mapping[Expr, Column] | None = None,
-    ) -> Column:
-        """Evaluate this expression given a dataframe for context."""
-        return self.sub_expr.evaluate(df, context=context, mapping=mapping)
-
-
-class NoOp(Expr):
-    """No-op expression."""
 
     __slots__ = ()
-    _non_child = ("dtype",)
+    _non_child = ("schema",)
 
-    def __init__(self, dtype: plc.DataType, value: Expr) -> None:
-        self.dtype = dtype
-        self.children = (value,)
-        self.is_pointwise = True
+    def __init__(self, schema: Schema):
+        self.schema = schema
+        self._non_child_args = ()
+        self.children = ()
 
-    def do_evaluate(
-        self,
-        df: DataFrame,
-        *,
-        context: ExecutionContext = ExecutionContext.FRAME,
-        mapping: Mapping[Expr, Column] | None = None,
-    ) -> Column:
-        """Evaluate this expression given a dataframe for context."""
-        (child,) = self.children
-        return child.evaluate(df, context=context, mapping=mapping)
+    @classmethod
+    def do_evaluate(cls) -> DataFrame:
+        """Evaluate and return a dataframe."""
+        return DataFrame([])
 
 
-class ShuffleColumn(Expr):
-    """Shuffle expression."""
-
-    __slots__ = ("config_options",)
-    _non_child = ("dtype", "config_options")
-
-    def __init__(
-        self,
-        dtype: plc.DataType,
-        config_options: ConfigOptions,
-        value: Expr,
-    ) -> None:
-        self.dtype = dtype
-        self.config_options = config_options
-        self.children = (value,)
-        self.is_pointwise = False
-
-    def do_evaluate(
-        self,
-        df: DataFrame,
-        *,
-        context: ExecutionContext = ExecutionContext.FRAME,
-        mapping: Mapping[Expr, Column] | None = None,
-    ) -> Column:
-        """Evaluate this expression given a dataframe for context."""
-        (child,) = self.children
-        return child.evaluate(df, context=context, mapping=mapping)
-
-
-def extract_partition_counts(
+def _add_select_ir(
     exprs: Sequence[Expr],
-    input_ir_count: int,
+    input_ir: IR,
+    partition_info: MutableMapping[IR, PartitionInfo],
     *,
-    update: MutableMapping[Expr, int] | None = None,
-    skip_fused_exprs: bool = False,
-) -> MutableMapping[Expr, int]:
+    names: Generator[str, None, None],
+    repartition: bool = False,
+) -> tuple[list[Col], Repartition | Select, MutableMapping[IR, PartitionInfo]]:
     """
-    Extract a partition-count mapping for Expr nodes.
+    Add a new Select node.
 
     Parameters
     ----------
     exprs
-        Sequence of root expressions to traverse and
-        get partition counts.
-    input_ir_count
-        Partition count for the child-IR node.
-    update
-        Existing mapping to update.
-    skip_fused_exprs
-        Whether to skip over FusedExpr objects. This
-        can be used to stay within a local FusedExpr
-        sub-expression.
+        Expressions to select.
+    input_ir
+        The input IR node to select from.
+    partition_info
+        A mapping from all unique IR nodes to the
+        associated partitioning information.
+    names
+        Generator of unique names for temporaries.
+    repartition
+        Whether to add a Repartition node after the
+        new selection.
 
     Returns
     -------
-    Mapping between Expr nodes and partition counts.
+    columns
+        New expressions to use with ``new_ir``.
+    new_ir
+        The new IR node that can be evaluated by ``columns``.
+    partition_info
+        A mapping from unique nodes in the new graph to associated
+        partitioning information.
+
+    See Also
+    --------
+    _decompose_agg_node
+
+    Notes
+    -----
+    This function is called by ``_decompose_agg_node`` to decompose
+    Agg operations into multiple IR nodes.
     """
-    expr_partition_counts: MutableMapping[Expr, int] = update or {}
-    cutoff_types = (FusedExpr,) if skip_fused_exprs else ()
-    for expr in exprs:
-        for node in list(traversal([expr], cutoff_types=cutoff_types))[::-1]:
-            if isinstance(node, FusedExpr):
-                # Process the fused sub-expression graph first
-                expr_partition_counts = extract_partition_counts(
-                    [node.sub_expr],
-                    input_ir_count,
-                    update=expr_partition_counts,
-                    skip_fused_exprs=True,
-                )
-                expr_partition_counts[node] = expr_partition_counts[node.sub_expr]
-            elif isinstance(node, (Agg, Literal)):
-                # Assume all aggregations produce 1 partition
-                expr_partition_counts[node] = 1
-            elif node.is_pointwise or isinstance(node, ShuffleColumn):
-                # Pointwise expressions should preserve child partition count
-                if node.children:
-                    # Assume maximum child partition count
-                    expr_partition_counts[node] = max(
-                        [expr_partition_counts[c] for c in node.children]
-                    )
-                else:
-                    # If no children, we are preserving the child-IR partition count
-                    expr_partition_counts[node] = input_ir_count
-            else:  # pragma: no cover
-                raise NotImplementedError(
-                    f"{type(node)} not supported for multiple partitions."
-                )
+    output_names = [next(names) for _ in range(len(exprs))]
+    named_exprs = [
+        NamedExpr(name, expr) for name, expr in zip(output_names, exprs, strict=True)
+    ]
+    new_ir: Repartition | Select = Select(
+        {ne.name: ne.value.dtype for ne in named_exprs},
+        named_exprs,
+        True,  # noqa: FBT003
+        input_ir,
+    )
+    partition_info[new_ir] = PartitionInfo(count=partition_info[input_ir].count)
 
-    return expr_partition_counts
+    # Optionally collapse into one output partition
+    if repartition:
+        new_ir = Repartition(new_ir.schema, new_ir)
+        partition_info[new_ir] = PartitionInfo(count=1)
+
+    columns = [Col(ne.value.dtype, ne.name) for ne in named_exprs]
+    return columns, new_ir, partition_info
 
 
-def _decompose(expr: Expr, rec: ExprTransformer) -> FusedExpr:
-    # Used by `decompose_expr_graph`
+def _maybe_shuffle(
+    child: Expr,
+    input_ir: IR,
+    partition_info: MutableMapping[IR, PartitionInfo],
+    config_options: ConfigOptions,
+    *,
+    names: Generator[str, None, None],
+) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    # Inject shuffle (if necessary)
+    # Used by `_decompose_agg_node`
+    pi = partition_info[input_ir]
+    if pi.count > 1 and [ne.value for ne in pi.partitioned_on] != [child]:
+        from cudf_polars.experimental.shuffle import Shuffle
 
-    # We are translating our original expression graph to
-    # comprise only of FusedExpr nodes. We use a depth-first
-    # traversal, so that we start with FusedExpr leaf nodes.
-    # As we work our way back towards the root node, the
-    # existing FusedExpr nodes will "absorb" their parents
-    # as long as all sub-expression nodes are "pointwise".
-    # As soon as a FusedExpr object contains a non-pointwise
-    # sub-expression node, that object may no-longer absorb
-    # its parents.
+        shuffle_on = (NamedExpr(next(names), child),)
+        input_ir = Shuffle(
+            input_ir.schema,
+            shuffle_on,
+            config_options,
+            input_ir,
+        )
+        partition_info[input_ir] = PartitionInfo(
+            count=pi.count,
+            partitioned_on=shuffle_on,
+        )
 
-    # Transform child expressions first
-    new_children = tuple(map(rec, expr.children))
-    fused_children: list[FusedExpr] = []
-    if new_children:
-        # Non-leaf node.
-        # Construct child lists for new expressions
-        # (both the fused expression and the sub-expression)
-        sub_expr_children: list[Expr] = []
-        for child in new_children:
-            # All children should be FusedExpr
-            assert isinstance(child, FusedExpr), "FusedExpr children must be FusedExpr."
-            if child.is_pointwise:
-                # Pointwise children must be fused into the
-                # "new" FusedExpr node with root `expr`
-                for c in child.children:
-                    assert isinstance(c, FusedExpr), (
-                        "FusedExpr children must be FusedExpr."
-                    )
-                    fused_children.append(c)
-                sub_expr_children.append(child.sub_expr)
-            else:
-                # Non-pointwise children must remain as
-                # distinct FusedExpr nodes
-                fused_children.append(child)
-                sub_expr_children.append(child)
-        sub_expr = expr.reconstruct(sub_expr_children)
-    else:
-        # Leaf node.
-        # Convert to simple FusedExpr with no children
-        sub_expr = expr
-
-    return construct_fused_expr(sub_expr, fused_children, rec.state["config_options"])
+    return input_ir, partition_info
 
 
-def construct_fused_expr(
-    sub_expr: Expr, fused_children: list[FusedExpr], config_options: ConfigOptions
-) -> FusedExpr:
+def _decompose_agg_node(
+    agg: Agg,
+    input_ir: IR,
+    partition_info: MutableMapping[IR, PartitionInfo],
+    config_options: ConfigOptions,
+    *,
+    names: Generator[str, None, None],
+) -> tuple[Expr, IR, MutableMapping[IR, PartitionInfo]]:
     """
-    Construct new FusedExpr object.
+    Decompose an Agg expression into multiple IR nodes.
 
     Parameters
     ----------
-    sub_expr
-        Expression to be wrapped in a ``FusedExpr`` class.
-    fused_children
-        Children of ``sub_expr`` that are already ``FusedExpr`` nodes.
+    agg
+        The Agg node to decompose.
+    input_ir
+        The original input-IR node that ``agg`` will evaluate.
+    partition_info
+        A mapping from all unique IR nodes to the
+        associated partitioning information.
+    config_options
+        GPUEngine configuration options.
+    names
+        Generator of unique names for temporaries.
+
+    Returns
+    -------
+    expr
+        Decomposed Agg node.
+    input_ir
+        The rewritten ``input_ir`` to be evaluated by ``expr``.
+    partition_info
+        A mapping from unique nodes in the new graph to associated
+        partitioning information.
+
+    See Also
+    --------
+    _add_select_ir
+    _decompose_expr_node
+
+    Notes
+    -----
+    This function is called by ``_decompose_expr_node`` to decompose
+    an Agg node into multiple IR nodes. The new IR nodes are added
+    with ``_add_select_ir``.
+    """
+    expr: Expr
+    exprs: list[Expr]
+    if agg.name == "count":
+        # Chunkwise stage
+        columns, input_ir, partition_info = _add_select_ir(
+            [agg],
+            input_ir,
+            partition_info,
+            names=names,
+            repartition=True,  # Repartition
+        )
+
+        # Combined stage
+        (column,) = columns
+        columns, input_ir, partition_info = _add_select_ir(
+            [Agg(agg.dtype, "sum", None, column)],
+            input_ir,
+            partition_info,
+            names=names,
+        )
+        (expr,) = columns
+    elif agg.name == "mean":
+        # Chunkwise stage
+        exprs = [
+            Agg(agg.dtype, "sum", None, *agg.children),
+            Agg(agg.dtype, "count", None, *agg.children),
+        ]
+        columns, input_ir, partition_info = _add_select_ir(
+            exprs,
+            input_ir,
+            partition_info,
+            names=names,
+            repartition=True,
+        )
+
+        # Combined stage
+        exprs = [
+            BinOp(
+                agg.dtype,
+                plc.binaryop.BinaryOperator.DIV,
+                *(
+                    Agg(
+                        agg.dtype,
+                        "sum",
+                        None,
+                        column,
+                    )
+                    for column in columns
+                ),
+            )
+        ]
+        columns, input_ir, partition_info = _add_select_ir(
+            exprs,
+            input_ir,
+            partition_info,
+            names=names,
+            repartition=True,
+        )
+        (expr,) = columns
+    elif agg.name == "n_unique":
+        # Inject shuffle (if necessary)
+        (child,) = agg.children
+        input_ir, partition_info = _maybe_shuffle(
+            child,
+            input_ir,
+            partition_info,
+            config_options,
+            names=names,
+        )
+
+        # Chunkwise stage
+        columns, input_ir, partition_info = _add_select_ir(
+            [Cast(agg.dtype, agg)],
+            input_ir,
+            partition_info,
+            names=names,
+            repartition=True,  # Repartition
+        )
+
+        # Combined stage
+        (column,) = columns
+        columns, input_ir, partition_info = _add_select_ir(
+            [Agg(agg.dtype, "sum", None, column)],
+            input_ir,
+            partition_info,
+            names=names,
+        )
+        (expr,) = columns
+    else:
+        # Chunkwise stage
+        columns, input_ir, partition_info = _add_select_ir(
+            [agg],
+            input_ir,
+            partition_info,
+            names=names,
+            repartition=True,
+        )
+
+        # Combined stage
+        (column,) = columns
+        columns, input_ir, partition_info = _add_select_ir(
+            [Agg(agg.dtype, agg.name, agg.options, column)],
+            input_ir,
+            partition_info,
+            names=names,
+        )
+        (expr,) = columns
+
+    return expr, input_ir, partition_info
+
+
+def _decompose_expr_node(
+    expr: Expr,
+    input_ir: IR,
+    partition_info: MutableMapping[IR, PartitionInfo],
+    config_options: ConfigOptions,
+    *,
+    names: Generator[str, None, None],
+) -> tuple[Expr, IR, MutableMapping[IR, PartitionInfo]]:
+    """
+    Decompose an expression into one or more IR nodes.
+
+    Parameters
+    ----------
+    expr
+        The Expr node to decompose.
+    input_ir
+        The input IR node that ``expr`` will evaluate.
+    partition_info
+        A mapping from all unique IR nodes to the
+        associated partitioning information.
+    config_options
+        GPUEngine configuration options.
+    names
+        Generator of unique names for temporaries.
+
+    Returns
+    -------
+    expr
+        Decomposed Expr node.
+    input_ir
+        The rewritten ``input_ir`` to be evaluated by ``expr``.
+    partition_info
+        A mapping from unique nodes in the new graph to associated
+        partitioning information.
+
+    See Also
+    --------
+    _decompose
+    _decompose_agg_node
+    decompose_expr_graph
+
+    Notes
+    -----
+    This function is called by ``decompose_expr_graph`` (via ``_decompose``).
+    """
+    partition_count = partition_info[input_ir]
+    if partition_count == 1 or expr.is_pointwise:
+        # Single-partition and pointwise expressions are always supported.
+        return expr, input_ir, partition_info
+    elif isinstance(expr, Agg) and expr.name in _SUPPORTED_AGGS:
+        # This is a supported Agg expression.
+        return _decompose_agg_node(
+            expr, input_ir, partition_info, config_options, names=names
+        )
+    else:
+        # This is an un-supported expression - raise.
+        raise NotImplementedError(
+            f"{type(expr)} not supported for multiple partitions."
+        )
+
+
+def _decompose(
+    expr: Expr, rec: ExprDecomposer
+) -> tuple[Expr, IR, MutableMapping[IR, PartitionInfo]]:
+    # Used by `decompose_expr_graph``
+
+    # Process child Exprs first
+    if expr.children:
+        children, input_irs, _partition_info = zip(
+            *(rec(c) for c in expr.children), strict=True
+        )
+        partition_info = reduce(operator.or_, _partition_info)
+    else:
+        # Leaf node: Use initial state or place-holder IR
+        if isinstance(expr, Literal):
+            # For Literal nodes, we don't actually want an
+            # input IR with real columns, because it will
+            # mess up the result of ``HConcatBcast``.
+            ir = _Placeholder({})
+            pi = {ir: PartitionInfo(count=1)}
+        else:
+            ir = rec.state["input_ir"]
+            pi = {rec.state["input_ir"]: rec.state["input_partition_info"]}
+        children, input_irs, partition_info = (), (ir,), pi
+
+    # Assume the partition count is the maximum input-IR partition count
+    input_ir: IR
+    assert len(input_irs) > 0  # Must have at least one input IR
+    partition_count = max(partition_info[ir].count for ir in input_irs)
+    unique_input_irs = list(set(input_irs))
+    if len(unique_input_irs) > 1:
+        # Need to make sure we only have a single input IR
+        # TODO: Check that we aren't concatenating misaligned
+        # columns that cannot be broadcasted. For example, what
+        # if one of the columns is sorted?
+        schema: MutableMapping[str, Any] = {}
+        for ir in unique_input_irs:
+            schema.update(ir.schema)
+        input_ir = HConcatBcast(schema, *unique_input_irs)
+        partition_info[input_ir] = PartitionInfo(count=partition_count)
+    else:
+        input_ir = input_irs[0]
+
+    # Call into class-specific logic to decompose ``expr``
+    return _decompose_expr_node(
+        expr.reconstruct(children),
+        input_ir,
+        partition_info,
+        rec.state["config_options"],
+        names=rec.state["unique_names"],
+    )
+
+
+def decompose_expr_graph(
+    named_expr: NamedExpr,
+    input_ir: IR,
+    partition_info: MutableMapping[IR, PartitionInfo],
+    config_options: ConfigOptions,
+) -> tuple[NamedExpr, IR, MutableMapping[IR, PartitionInfo]]:
+    """
+    Decompose a NamedExpr into multiple IR nodes.
+
+    Parameters
+    ----------
+    named_expr
+        The original NamedExpr to decompose.
+    input_ir
+        The input-IR node that ``named_expr`` will be
+        evaluated on.
+    partition_info
+        A mapping from all unique IR nodes to the
+        associated partitioning information.
     config_options
         GPUEngine configuration options.
 
     Returns
     -------
-    New ``FusedExpr`` object.
+    named_expr
+        Decomposed NamedExpr object.
+    input_ir
+        The rewritten ``input_ir`` to be evaluated by ``named_expr``.
+    partition_info
+        A mapping from unique nodes in the new graph to associated
+        partitioning information.
+
+    Notes
+    -----
+    This function recursively decomposes ``named_expr.value`` and
+    ``input_ir`` into multiple IR nodes that support multi-partition
+    execution.
+
+    See Also
+    --------
+    _decompose
+    decompose_select
     """
-    if sub_expr.is_pointwise:
-        # Pointwise expressions are always supported.
-        kind = "pointwise"
-        final_expr = sub_expr
-    elif isinstance(sub_expr, Agg) and sub_expr.name in _SUPPORTED_AGGS:
-        # This is a supported Agg expression.
-        kind = "aggregation"
-        agg = sub_expr
-        agg_name = agg.name
-        chunk_expr: Expr
-        if agg_name == "count":
-            # Chunkwise
-            chunk_expr = agg
-            # Combine
-            combine_expr = Agg(
-                agg.dtype,
-                "sum",
-                None,
-                chunk_expr,
-            )
-            # Finalize
-            final_expr = NoOp(agg.dtype, combine_expr)
-        elif agg_name == "mean":
-            # Chunkwise
-            chunk_exprs = [
-                Agg(agg.dtype, "sum", None, *agg.children),
-                Agg(agg.dtype, "count", None, *agg.children),
-            ]
-            # Combine
-            combine_exprs = [
-                Agg(
-                    agg.dtype,
-                    "sum",
-                    None,
-                    chunk_expr,
-                )
-                for chunk_expr in chunk_exprs
-            ]
-            # Finalize
-            final_expr = BinOp(
-                agg.dtype,
-                plc.binaryop.BinaryOperator.DIV,
-                *combine_exprs,
-            )
-        elif agg_name == "n_unique":
-            # Inject shuffle
-            # TODO: Avoid shuffle if possible
-            (child,) = agg.children
-            shuffled = FusedExpr(
-                child.dtype,
-                ShuffleColumn(child.dtype, config_options, child),
-                "shuffle",
-                *fused_children,
-            )
-            fused_children = [shuffled]
-            # Chunkwise
-            chunk_expr = Cast(
-                agg.dtype,
-                Agg(agg.dtype, "n_unique", agg.options, shuffled),
-            )
-            # Combine
-            combine_expr = Agg(agg.dtype, "sum", None, chunk_expr)
-            # Finalize
-            final_expr = NoOp(agg.dtype, combine_expr)
-        else:
-            # Chunkwise
-            chunk_expr = agg
-            # Combine
-            combine_expr = Agg(
-                agg.dtype,
-                agg.name,
-                agg.options,
-                chunk_expr,
-            )
-            # Finalize
-            final_expr = NoOp(agg.dtype, combine_expr)
-    else:
-        # This is an un-supported expression - raise.
-        raise NotImplementedError(
-            f"{type(sub_expr)} not supported for multiple partitions."
-        )
-
-    return FusedExpr(final_expr.dtype, final_expr, kind, *fused_children)
-
-
-def decompose_expr_graph(expr: Expr, config_options: ConfigOptions) -> Expr:
-    """Transform an Expr into a graph of FusedExpr nodes."""
-    mapper = CachingVisitor(_decompose, state={"config_options": config_options})
-    return mapper(expr)
-
-
-def evaluate_chunk(
-    df: DataFrame,
-    expr: Expr,
-    children: tuple[Expr, ...],
-    *references: Column,
-) -> Column:
-    """Evaluate the sub-expression of a simple FusedExpr node."""
-    return expr.evaluate(df, mapping=dict(zip(children, references, strict=True)))
-
-
-def evaluate_chunk_multi_agg(
-    df: DataFrame,
-    exprs: Sequence[Expr],
-    children: tuple[Expr, ...],
-    *references: Column,
-) -> tuple[Column, ...]:
-    """Evaluate multiple aggregations."""
-    mapping = dict(zip(children, references, strict=True))
-    return tuple(expr.evaluate(df, mapping=mapping) for expr in exprs)
-
-
-def combine_chunks_multi_agg(
-    column_chunks: Sequence[tuple[Column, ...]],
-    combine_aggs: Sequence[Agg],
-    finalize: Expr,
-    name: str,
-) -> Column:
-    """Aggregate Column chunks."""
-    column_chunk_lists = zip(*column_chunks, strict=True)
-
-    combined = [
-        agg.op(
-            Column(
-                plc.concatenate.concatenate([col.obj for col in column_chunk_list]),
-                name=column_chunk_list[0].name,
-            )
-        )
-        for agg, column_chunk_list in zip(combine_aggs, column_chunk_lists, strict=True)
-    ]
-
-    if isinstance(finalize, NoOp):
-        (col,) = combined
-    else:
-        col = finalize.evaluate(
-            DataFrame([]),  # Placeholder DataFrame
-            mapping=dict(zip(finalize.children, combined, strict=True)),
-        )
-
-    return col.rename(name)
-
-
-def make_agg_graph(
-    named_expr: NamedExpr,
-    expr_partition_counts: MutableMapping[Expr, int],
-    input_ir: IR,
-) -> MutableMapping[Any, Any]:
-    """Build a FusedExpr aggregation graph."""
-    expr = named_expr.value
-    assert isinstance(expr, FusedExpr)
-    assert expr.kind == "aggregation"
-
-    # Define aggregation steps
-    final_expr = expr.sub_expr
-    combine_exprs = final_expr.children
-    chunkwise_exprs = tuple(
-        chain.from_iterable(combine_expr.children for combine_expr in combine_exprs)
-    )
-    (chunkwise_child,) = chunkwise_exprs[0].children
-    if isinstance(chunkwise_child, Agg):
-        # We may have needed a cast after the chunkwise agg
-        (chunkwise_child,) = chunkwise_child.children
-
-    # NOTE: This algorithm assumes we are doing nested
-    # aggregations, or we are only aggregating a single
-    # column. If we are performing aligned aggregations
-    # across multiple columns at once, we should perform
-    # our reduction at the DataFrame level instead.
-
-    key_name = get_key_name(expr, input_ir)
-    expr_child_names = [get_key_name(c, input_ir) for c in expr.children]
-    expr_bcast = [expr_partition_counts[c] == 1 for c in expr.children]
-    input_count = expr_partition_counts[chunkwise_child]
-
-    graph: MutableMapping[Any, Any] = {}
-
-    # Pointwise stage
-    pointwise_keys = []
-    key_name = get_key_name(expr, input_ir)
-    inpit_ir_name = get_key_name(input_ir)
-    chunk_name = f"chunk-{key_name}"
-    for i in range(input_count):
-        pointwise_keys.append((chunk_name, i))
-        graph[pointwise_keys[-1]] = (
-            evaluate_chunk_multi_agg,
-            (inpit_ir_name, i),
-            chunkwise_exprs,
-            expr.children,
-            *(
-                (name, 0) if bcast else (name, i)
-                for name, bcast in zip(expr_child_names, expr_bcast, strict=True)
-            ),
-        )
-
-    # Combine and finalize
-    graph[(key_name, 0)] = (
-        combine_chunks_multi_agg,
-        pointwise_keys,
-        combine_exprs,
-        final_expr,
-        named_expr.name,
-    )
-
-    return graph
-
-
-def _project(df: DataFrame, selection: NamedExpr) -> DataFrame:
-    # Select a Column from a DataFrame.
-    # (Used by `make_shuffle_graph`)
-    return DataFrame([selection.evaluate(df)])
-
-
-def _df_to_column(df: DataFrame, name: str) -> Column:
-    # Convert a DataFrame to a Column.
-    # (Used by `make_shuffle_graph`)
-    (column,) = df.columns
-    return column.rename(name)
-
-
-def make_shuffle_graph(
-    named_expr: NamedExpr,
-    expr_partition_counts: MutableMapping[Expr, int],
-    input_ir: IR,
-    ir_partition_info: PartitionInfo,
-) -> MutableMapping[Any, Any]:
-    """Build a FusedExpr aggregation graph for shuffling."""
-    from cudf_polars.experimental.shuffle import (
-        _SHUFFLE_METHODS,
-        RMPIntegration,
-        _simple_shuffle_graph,
-    )
-
-    expr = named_expr.value
-    col_name = named_expr.name
-    assert isinstance(expr, FusedExpr)
-    assert isinstance(expr.sub_expr, ShuffleColumn)
-    (child,) = expr.sub_expr.children
-
-    key_name = get_key_name(expr, input_ir)
-    name_ir_in = get_key_name(input_ir)
-    name_projected = f"projected-{key_name}"
-    name_shuffled = f"shuffled-{key_name}"
-    partition_count = ir_partition_info.count
-
-    # Check if we can avoid the shuffle
-    if partition_count == 1 or (
-        ir_partition_info.partitioned_on == (named_expr.reconstruct(child),)
-        and ir_partition_info.count == partition_count
-    ):
-        return make_pointwise_graph(
-            named_expr,
-            expr_partition_counts,
-            input_ir,
-        )
-
-    # Select the column needed for shuffling
-    selection = NamedExpr(col_name, child)
-    graph: MutableMapping[Any, Any] = {
-        (name_projected, i): (_project, (name_ir_in, i), selection)
-        for i in range(partition_count)
+    state = {
+        "input_ir": input_ir,
+        "input_partition_info": partition_info[input_ir],
+        "config_options": config_options,
+        "unique_names": unique_names((named_expr.name, *input_ir.schema.keys())),
     }
-
-    shuffle_on = NamedExpr(col_name, Col(child.dtype, col_name))
-    if (
-        shuffle_method := expr.sub_expr.config_options.get(
-            "executor_options.shuffle_method",
-            default=None,
-        )
-    ) not in (*_SHUFFLE_METHODS, None):  # pragma: no cover
-        raise ValueError(
-            f"{shuffle_method} is not a supported shuffle method. "
-            f"Expected one of: {_SHUFFLE_METHODS}."
-        )
-
-    if shuffle_method in (None, "rapidsmp"):  # pragma: no cover
-        try:
-            from rapidsmp.integrations.dask import rapidsmp_shuffle_graph
-
-            graph.update(
-                rapidsmp_shuffle_graph(
-                    name_projected,
-                    name_shuffled,
-                    [col_name],
-                    [col_name],
-                    partition_count,
-                    partition_count,
-                    RMPIntegration,
-                )
-            )
-
-        except (ImportError, ValueError) as err:
-            # ImportError: rapidsmp is not installed
-            # ValueError: rapidsmp couldn't find a distributed client
-            if shuffle_method == "rapidsmp":
-                # Only raise an error if the user specifically
-                # set the shuffle method to "rapidsmp"
-                raise ValueError(
-                    "Rapidsmp is not installed correctly or the current "
-                    "Dask cluster does not support rapidsmp shuffling."
-                ) from err
-
-    graph.update(
-        _simple_shuffle_graph(
-            name_projected,
-            name_shuffled,
-            (shuffle_on,),
-            partition_count,
-            partition_count,
-        )
-    )
-
-    # Convert DataFrame back to Column
-    # TODO: Use fusion/nesting?
-    graph.update(
-        {
-            (key_name, i): (_df_to_column, (name_shuffled, i), col_name)
-            for i in range(partition_count)
-        }
-    )
-
-    return graph
-
-
-def make_pointwise_graph(
-    named_expr: NamedExpr,
-    expr_partition_counts: MutableMapping[Expr, int],
-    input_ir: IR,
-) -> MutableMapping[Any, Any]:
-    """Build simple pointwise FusedExpr graph."""
-    expr = named_expr.value
-    input_ir_name = get_key_name(input_ir)
-    key_name = get_key_name(expr, input_ir)
-    expr_child_names = [get_key_name(c, input_ir) for c in expr.children]
-    expr_bcast = [expr_partition_counts[c] == 1 for c in expr.children]
-    count = expr_partition_counts[expr]
-    assert isinstance(expr, FusedExpr)
-    sub_expr = named_expr.reconstruct(expr.sub_expr)
-    return {
-        (key_name, i): (
-            evaluate_chunk,
-            (input_ir_name, i),
-            sub_expr,
-            expr.children,
-            *(
-                (name, 0) if bcast else (name, i)
-                for name, bcast in zip(expr_child_names, expr_bcast, strict=True)
-            ),
-        )
-        for i in range(count)
-    }
-
-
-def make_fusedexpr_graph(
-    named_expr: NamedExpr,
-    expr_partition_counts: MutableMapping[Expr, int],
-    input_ir: IR,
-    input_ir_partition_info: PartitionInfo,
-) -> MutableMapping[Any, Any]:
-    """Build task graph for a FusedExpr node."""
-    expr = named_expr.value
-    assert isinstance(expr, FusedExpr)
-    if expr.kind == "pointwise":
-        return make_pointwise_graph(named_expr, expr_partition_counts, input_ir)
-    elif expr.kind == "shuffle":
-        return make_shuffle_graph(
-            named_expr, expr_partition_counts, input_ir, input_ir_partition_info
-        )
-    elif expr.kind == "aggregation":
-        return make_agg_graph(named_expr, expr_partition_counts, input_ir)
-    else:  # pragma: no cover
-        raise ValueError(f"{expr.kind} is not a supported `FusedExpr.kind` value.")
+    mapper = CachingVisitor(_decompose, state=state)
+    expr, input_ir, partition_info = mapper(named_expr.value)
+    return named_expr.reconstruct(expr), input_ir, partition_info

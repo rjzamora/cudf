@@ -74,6 +74,7 @@ def test_select_reduce_fallback(df, fallback_mode):
 @pytest.mark.parametrize(
     "aggs",
     [
+        (pl.col("a").sum(),),
         (
             (pl.col("a") + pl.col("b")).sum(),
             (pl.col("a") * 2 + pl.col("b")).alias("d").min(),
@@ -83,8 +84,12 @@ def test_select_reduce_fallback(df, fallback_mode):
         (pl.col("b").len(),),
         (pl.col("a") - (pl.col("b") + pl.col("c").max()).mean(),),
         (
-            pl.col("b").n_unique().cast(pl.Int32),
-            (pl.col("c").n_unique() + 1).cast(pl.Int32),
+            pl.col("b").sum(),
+            (pl.col("c").sum() + 1),
+        ),
+        (
+            pl.col("b").n_unique(),
+            (pl.col("c").n_unique() + 1),
         ),
     ],
 )
