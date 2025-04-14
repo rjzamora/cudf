@@ -23,9 +23,7 @@ __all__: list[str] = [
 ]
 
 
-def traversal(
-    nodes: Sequence[NodeT], *, cutoff_types: tuple[type[NodeT], ...] = ()
-) -> Generator[NodeT, None, None]:
+def traversal(nodes: Sequence[NodeT]) -> Generator[NodeT, None, None]:
     """
     Pre-order traversal of nodes in an expression.
 
@@ -33,9 +31,6 @@ def traversal(
     ----------
     nodes
         Roots of expressions to traverse.
-    cutoff_types
-        Types to terminate traversal at. If a type is in this tuple
-        then we do not yield any of its children.
 
     Yields
     ------
@@ -48,8 +43,6 @@ def traversal(
     while lifo:
         node = lifo.pop()
         yield node
-        if cutoff_types and isinstance(node, cutoff_types):
-            continue
         for child in reversed(node.children):
             if child not in seen:
                 seen.add(child)
