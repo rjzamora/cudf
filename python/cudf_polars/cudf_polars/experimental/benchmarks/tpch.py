@@ -924,11 +924,11 @@ def run(args: Any) -> None:
         os.environ["POLARS_GPU_ENABLE_CUDA_MANAGED_MEMORY"] = "0"
         client = Client(LocalCUDACluster(**kwargs))
         client.wait_for_workers(args.n_workers)
-        if args.shuffle != "tasks" or args.rapidsmp_spill:
+        if args.shuffle != "tasks" or args.rapidsmpf_spill:
             try:
                 from rapidsmpf.integrations.dask import bootstrap_dask_cluster
 
-                spill_device = 0.66 if args.rapidsmp_spill else 0.5
+                spill_device = 0.66 if args.rapidsmpf_spill else 0.5
                 bootstrap_dask_cluster(client, spill_device=spill_device)
             except ImportError as err:
                 if args.shuffle == "rapidsmpf":
