@@ -126,7 +126,7 @@ class ConfigOptions:
             unsupported = config.get("executor_options", {}).keys() - {
                 "scheduler",
                 "scheduler_options",
-                "rapidsmp_spill",
+                "rapidsmpf_spill",
                 "fallback_mode",
                 "max_rows_per_partition",
                 "parquet_blocksize",

@@ -220,7 +220,7 @@ def process_task_graph(
         A Dask-compatible task graph.
     """
     config_options = config_options or ConfigOptions({})
-    if config_options.get("executor_options.rapidsmp_spill", default=False):
+    if config_options.get("executor_options.rapidsmpf_spill", default=False):
         from cudf_polars.experimental.spilling import wrap_dataframe_in_spillable
 
         return wrap_dataframe_in_spillable(graph, ignore_key=key)
