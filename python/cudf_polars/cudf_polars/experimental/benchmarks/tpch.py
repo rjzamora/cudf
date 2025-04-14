@@ -873,14 +873,14 @@ parser.add_argument(
     "--shuffle",
     default=None,
     type=str,
-    choices=[None, "rapidsmp", "tasks"],
+    choices=[None, "rapidsmpf", "tasks"],
     help="Shuffle method to use for distributed execution.",
 )
 parser.add_argument(
-    "--rapidsmp-spill",
+    "--rapidsmpf-spill",
     default=False,
     action="store_true",
-    help="Whether to use rapidsmp spilling.",
+    help="Whether to use rapidsmpf spilling.",
 )
 parser.add_argument(
     "--broadcast-join-limit",
@@ -920,11 +920,11 @@ def run(args: Any) -> None:
         client.wait_for_workers(args.n_workers)
         if args.shuffle != "tasks":
             try:
-                from rapidsmp.integrations.dask import bootstrap_dask_cluster
+                from rapidsmpf.integrations.dask import bootstrap_dask_cluster
 
                 bootstrap_dask_cluster(client, spill_device=0.5)
             except ImportError as err:
-                if args.shuffle == "rapidsmp":
+                if args.shuffle == "rapidsmpf":
                     raise ImportError from err
         broadcast_join_limit = args.broadcast_join_limit or 2
     else:
@@ -951,7 +951,7 @@ def run(args: Any) -> None:
                 executor_options = {
                     "parquet_blocksize": args.blocksize,
                     "shuffle_method": args.shuffle,
-                    "rapidsmp_spill": args.rapidsmp_spill,
+                    "rapidsmpf_spill": args.rapidsmpf_spill,
                     "broadcast_join_limit": broadcast_join_limit,
                     "cardinality_factor": {
                         "c_custkey": 0.05,  # Q10
