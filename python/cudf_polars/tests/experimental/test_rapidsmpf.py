@@ -39,7 +39,7 @@ def test_join_rapidsmpf(max_rows_per_partition: int) -> None:
         raise_on_fail=True,
         executor="dask-experimental",
         executor_options={
-            "scheduler": "distributed", 
+            "scheduler": "distributed",
             "shuffle_method": "rapidsmpf",
             "max_rows_per_partition": max_rows_per_partition,
             "broadcast_join_limit": 2,
