@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
-"""Spilling in multi-partition Dask execution using RAPIDSMP."""
+"""Spilling in multi-partition Dask execution using RAPIDSMPF."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from rapidsmp.integrations.dask.spilling import SpillableWrapper
+from rapidsmpf.integrations.dask.spilling import SpillableWrapper
 
 from cudf_polars.containers import DataFrame
 
@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, MutableMapping
     from typing import Any
 
-    from rapidsmp.integrations.dask.spilling import WrappedType
+    from rapidsmpf.integrations.dask.spilling import WrappedType
 
 T = TypeVar("T")
 

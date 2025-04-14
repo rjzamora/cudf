@@ -896,7 +896,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--rmm-pool-size",
-    default=0.8,
+    default=0.5,
     type=float,
     help="RMM pool size (fractional).",
 )
