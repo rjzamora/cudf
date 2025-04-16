@@ -15,7 +15,7 @@ from cudf_polars.dsl.expressions.aggregation import Agg
 from cudf_polars.dsl.expressions.base import Col, Expr, NamedExpr
 from cudf_polars.dsl.expressions.binaryop import BinOp
 from cudf_polars.dsl.expressions.literal import Literal
-from cudf_polars.dsl.expressions.unary import Cast
+from cudf_polars.dsl.expressions.unary import Cast, UnaryFunction
 from cudf_polars.dsl.ir import IR, HConcatBcast, Select
 from cudf_polars.dsl.traversal import (
     CachingVisitor,
@@ -317,6 +317,27 @@ def _decompose_agg_node(
     return expr, input_ir, partition_info
 
 
+def _decompose_unique(
+    expr: UnaryFunction,
+    input_ir: IR,
+    partition_info: MutableMapping[IR, PartitionInfo],
+    config_options: ConfigOptions,
+    *,
+    names: Generator[str, None, None],
+) -> tuple[Expr, IR, MutableMapping[IR, PartitionInfo]]:
+    """Decompose a unique UnaryFunction node."""
+    # TODO: Use shuffle for high-cardinality unique
+    (child,) = expr.children
+    columns, input_ir, partition_info = _add_select_ir(
+        [child],
+        input_ir,
+        partition_info,
+        names=names,
+        repartition=True,
+    )
+    return expr.reconstruct(columns), input_ir, partition_info
+
+
 def _decompose_expr_node(
     expr: Expr,
     input_ir: IR,
@@ -369,6 +390,11 @@ def _decompose_expr_node(
     elif isinstance(expr, Agg) and expr.name in _SUPPORTED_AGGS:
         # This is a supported Agg expression.
         return _decompose_agg_node(
+            expr, input_ir, partition_info, config_options, names=names
+        )
+    elif isinstance(expr, UnaryFunction) and expr.name == "unique":
+        # This is a `unique` expression.
+        return _decompose_unique(
             expr, input_ir, partition_info, config_options, names=names
         )
     else:
