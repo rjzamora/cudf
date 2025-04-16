@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
-"""Multi-partition Dask execution."""
+"""Multi-partition evaluation."""
 
 from __future__ import annotations
 
 import itertools
 import operator
 from functools import partial, reduce
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any
 
 import cudf_polars.experimental.groupby
 import cudf_polars.experimental.io
@@ -33,42 +33,14 @@ from cudf_polars.experimental.dispatch import (
     lower_ir_node,
 )
 from cudf_polars.experimental.utils import _concat, _lower_ir_fallback
-from cudf_polars.utils.config import ConfigOptions
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping
     from typing import Any
 
-    from distributed import Client
-
     from cudf_polars.containers import DataFrame
     from cudf_polars.experimental.dispatch import LowerIRTransformer
-
-
-class SerializerManager:
-    """Manager to ensure ensure serializer is only registered once."""
-
-    _serializer_registered: bool = False
-    _client_run_executed: ClassVar[set[str]] = set()
-
-    @classmethod
-    def register_serialize(cls) -> None:
-        """Register Dask/cudf-polars serializers in calling process."""
-        if not cls._serializer_registered:
-            from cudf_polars.experimental.dask_serialize import register
-
-            register()
-            cls._serializer_registered = True
-
-    @classmethod
-    def run_on_cluster(cls, client: Client) -> None:
-        """Run serializer registration on the workers and scheduler."""
-        if (
-            client.id not in cls._client_run_executed
-        ):  # pragma: no cover; Only executes with Distributed scheduler
-            client.run(cls.register_serialize)
-            client.run_on_scheduler(cls.register_serialize)
-            cls._client_run_executed.add(client.id)
+    from cudf_polars.utils.config import ConfigOptions
 
 
 @lower_ir_node.register(IR)
@@ -87,7 +59,7 @@ def _(ir: IR, rec: LowerIRTransformer) -> tuple[IR, MutableMapping[IR, Partition
 
 
 def lower_ir_graph(
-    ir: IR, config_options: ConfigOptions | None = None
+    ir: IR, config_options: ConfigOptions
 ) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
     """
     Rewrite an IR graph and extract partitioning information.
@@ -114,7 +86,6 @@ def lower_ir_graph(
     --------
     lower_ir_node
     """
-    config_options = config_options or ConfigOptions({})
     mapper = CachingVisitor(lower_ir_node, state={"config_options": config_options})
     return mapper(ir)
 
@@ -166,30 +137,30 @@ def task_graph(
 # The true type signature for get_scheduler() needs an overload. Not worth it.
 
 
-def get_scheduler(config_options: ConfigOptions | None = None) -> Any:
+def get_scheduler(config_options: ConfigOptions) -> Any:
     """Get appropriate task scheduler."""
-    config_options = config_options or ConfigOptions({})
-    scheduler = config_options.get("executor_options.scheduler", default="sync")
-    scheduler_options = config_options.get(
-        "executor_options.scheduler_options", default={}
-    )
+    scheduler = config_options.get("executor_options.scheduler")
     if (
         scheduler == "distributed"
     ):  # pragma: no cover; block depends on executor type and Distributed cluster
         from distributed import get_client
 
-        SerializerManager.register_serialize()
+        from cudf_polars.experimental.dask_serialize import SerializerManager
 
         client = get_client()
+        SerializerManager.register_serialize()
         SerializerManager.run_on_cluster(client)
         return client.get
     elif scheduler == "threaded":  # pragma: no cover
         from dask.threaded import get
 
         kwargs = {"num_workers": 2}
+        scheduler_options = config_options.get(
+            "executor_options.scheduler_options", default={}
+        )
         kwargs.update(scheduler_options)
         return partial(get, **kwargs)
-    elif scheduler == "sync":
+    elif scheduler == "synchronous":
         from dask import get
 
         return get
@@ -197,10 +168,10 @@ def get_scheduler(config_options: ConfigOptions | None = None) -> Any:
         raise ValueError(f"{scheduler} not a supported scheduler option.")
 
 
-def process_task_graph(
+def post_process_task_graph(
     graph: MutableMapping[Any, Any],
     key: str | tuple[str, int],
-    config_options: ConfigOptions | None,
+    config_options: ConfigOptions,
 ) -> MutableMapping[Any, Any]:
     """
     Post-process the task graph.
@@ -219,15 +190,14 @@ def process_task_graph(
     graph
         A Dask-compatible task graph.
     """
-    config_options = config_options or ConfigOptions({})
-    if config_options.get("executor_options.rapidsmpf_spill", default=False):
+    if config_options.get("executor_options.rapidsmpf_spill"):
         from cudf_polars.experimental.spilling import wrap_dataframe_in_spillable
 
         return wrap_dataframe_in_spillable(graph, ignore_key=key)
     return graph
 
 
-def evaluate_dask(ir: IR, config_options: ConfigOptions | None = None) -> DataFrame:
+def evaluate_streaming(ir: IR, config_options: ConfigOptions) -> DataFrame:
     """
     Evaluate an IR graph with partitioning.
 
@@ -244,13 +214,11 @@ def evaluate_dask(ir: IR, config_options: ConfigOptions | None = None) -> DataFr
     """
     ir, partition_info = lower_ir_graph(ir, config_options)
 
-    get = get_scheduler(config_options)
-
     graph, key = task_graph(ir, partition_info)
 
-    graph = process_task_graph(graph, key, config_options)
+    graph = post_process_task_graph(graph, key, config_options)
 
-    return get(graph, key)
+    return get_scheduler(config_options)(graph, key)
 
 
 @generate_ir_tasks.register(IR)

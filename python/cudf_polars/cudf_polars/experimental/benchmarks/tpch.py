@@ -16,7 +16,7 @@ import numpy as np
 import polars as pl
 
 from cudf_polars.dsl.translate import Translator
-from cudf_polars.experimental.parallel import evaluate_dask
+from cudf_polars.experimental.parallel import evaluate_streaming
 
 # Without this setting, the first IO task to run
 # on each worker takes ~15 sec extra
@@ -818,7 +818,7 @@ class TPCHQueries:
 
 parser = argparse.ArgumentParser(
     prog="Cudf-Polars TPC-H Benchmarks",
-    description="Experimental Dask-Executor benchmarks.",
+    description="Experimental Streaming-Executor benchmarks.",
 )
 parser.add_argument(
     "query",
@@ -842,14 +842,33 @@ parser.add_argument(
     "--executor",
     default="dask",
     type=str,
-    choices=["dask", "dask-cuda", "dask-experimental", "pylibcudf", "polars"],
+    choices=[
+        # "Official" executors
+        "in-memory",
+        "streaming",
+        "cpu",
+        # Compat
+        "dask",  # Same as "streaming" + --scheduler "synchronous"
+        "dask-cuda",  # Same as "streaming" + --scheduler "distributed"
+        "dask-experimental",  # Same as "streaming" + --scheduler "synchronous"
+        "pylibcudf",  # Same as "in-memory"
+        "polars",  # Same as "cpu"
+    ],
+    help="Executor.",
+)
+parser.add_argument(
+    "-s",
+    "--scheduler",
+    default="synchronous",
+    type=str,
+    choices=["synchronous", "distributed"],
     help="Executor.",
 )
 parser.add_argument(
     "--n-workers",
     default=1,
     type=int,
-    help="Number of Dask-CUDA workers (requires dask-cuda executor).",
+    help="Number of Dask-CUDA workers (requires 'distributed' scheduler).",
 )
 parser.add_argument(
     "--blocksize",
@@ -905,10 +924,21 @@ args = parser.parse_args()
 
 def run(args: Any) -> None:
     """Run the benchmark once."""
-    executor = args.executor
     client = None
+    executor = args.executor
+    scheduler = args.scheduler
+    if executor in ("streaming", "dask", "dask-cuda", "dask-experimental"):
+        if executor == "dask-cuda":
+            scheduler = "distributed"
+        executor = "streaming"
+    elif executor in ("in-memory", "pylibcudf"):
+        scheduler = None
+        executor = "in-memory"
+    elif executor in ("cpu", "polars"):
+        scheduler = None
+        executor = "cpu"
 
-    if executor == "dask-cuda":
+    if scheduler == "distributed":
         from dask_cuda import LocalCUDACluster
         from distributed import Client
 
@@ -949,10 +979,10 @@ def run(args: Any) -> None:
     for _ in range(args.trials):
         t0 = time.time()
 
-        if executor == "polars":
+        if executor == "cpu":
             result = q.collect(new_streaming=True)
         else:
-            if executor == "pylibcudf":
+            if executor == "in-memory":
                 executor_options = {}
             else:
                 executor_options = {
@@ -965,28 +995,28 @@ def run(args: Any) -> None:
                         "l_orderkey": 1.0,  # Q18
                     },
                 }
-                if executor == "dask" and args.threads > 1:
-                    executor_options["scheduler"] = "threaded"
+                if scheduler == "synchronous" and args.threads > 1:
+                    executor_options["scheduler"] = "threads"
                     executor_options["scheduler_options"] = {
                         "num_workers": args.threads,
                     }
-                elif executor == "dask-cuda":
+                elif scheduler == "distributed":
                     executor_options["scheduler"] = "distributed"
 
             engine = pl.GPUEngine(
                 raise_on_fail=True,
-                executor="dask-experimental"
-                if executor.startswith("dask")
-                else executor,
+                executor=executor,
                 executor_options=executor_options,
             )
             if args.debug:
                 translator = Translator(q._ldf.visit(), engine)
                 ir = translator.translate_ir()
-                if executor == "pylibcudf":
+                if executor == "in-memory":
                     result = ir.evaluate(cache={}, timer=None).to_polars()
-                elif executor.startswith("dask"):
-                    result = evaluate_dask(ir, translator.config_options).to_polars()
+                elif executor == "streaming":
+                    result = evaluate_streaming(
+                        ir, translator.config_options
+                    ).to_polars()
             else:
                 result = q.collect(engine=engine)
 
