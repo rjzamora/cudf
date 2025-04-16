@@ -12,7 +12,7 @@ import pyarrow as pa
 import pylibcudf as plc
 
 from cudf_polars.containers import Column
-from cudf_polars.dsl.expressions.base import AggInfo, ExecutionContext, Expr
+from cudf_polars.dsl.expressions.base import ExecutionContext, Expr
 from cudf_polars.dsl.expressions.literal import Literal
 from cudf_polars.utils import dtypes
 
@@ -51,12 +51,6 @@ class Cast(Expr):
         column = child.evaluate(df, context=context, mapping=mapping)
         return column.astype(self.dtype)
 
-    def collect_agg(self, *, depth: int) -> AggInfo:
-        """Collect information about aggregations in groupbys."""
-        # TODO: Could do with sort-based groupby and segmented filter
-        (child,) = self.children
-        return child.collect_agg(depth=depth)
-
 
 class Len(Expr):
     """Class representing the length of an expression."""
@@ -83,12 +77,9 @@ class Len(Expr):
             )
         )
 
-    def collect_agg(self, *, depth: int) -> AggInfo:
-        """Collect information about aggregations in groupbys."""
-        # TODO: polars returns a uint, not an int for count
-        return AggInfo(
-            [(None, plc.aggregation.count(plc.types.NullPolicy.INCLUDE), self)]
-        )
+    @property
+    def agg_request(self) -> plc.aggregation.Aggregation:  # noqa: D102
+        return plc.aggregation.count(plc.types.NullPolicy.INCLUDE)
 
 
 class UnaryFunction(Expr):
@@ -256,6 +247,8 @@ class UnaryFunction(Expr):
                 child.evaluate(df, context=context, mapping=mapping)
                 for child in self.children
             )
+            if column.null_count == 0:
+                return column
             return Column(
                 plc.stream_compaction.drop_nulls(
                     plc.Table([column.obj]), [0], 1
@@ -263,6 +256,8 @@ class UnaryFunction(Expr):
             )
         elif self.name == "fill_null":
             column = self.children[0].evaluate(df, context=context, mapping=mapping)
+            if column.null_count == 0:
+                return column
             if isinstance(self.children[1], Literal):
                 arg = plc.interop.from_arrow(self.children[1].value)
             else:
@@ -325,16 +320,3 @@ class UnaryFunction(Expr):
         raise NotImplementedError(
             f"Unimplemented unary function {self.name=}"
         )  # pragma: no cover; init trips first
-
-    def collect_agg(self, *, depth: int) -> AggInfo:
-        """Collect information about aggregations in groupbys."""
-        if self.name in {"unique", "drop_nulls"} | self._supported_cum_aggs:
-            raise NotImplementedError(f"{self.name} in groupby")
-        if depth == 1:
-            # inside aggregation, need to pre-evaluate, groupby
-            # construction has checked that we don't have nested aggs,
-            # so stop the recursion and return ourselves for pre-eval
-            return AggInfo([(self, plc.aggregation.collect_list(), self)])
-        else:
-            (child,) = self.children
-            return child.collect_agg(depth=depth)

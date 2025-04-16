@@ -441,7 +441,7 @@ def _decompose(
         schema: MutableMapping[str, Any] = {}
         for ir in unique_input_irs:
             schema.update(ir.schema)
-        input_ir = HConcatBcast(schema, *unique_input_irs)
+        input_ir = HConcatBcast(dict(schema), *unique_input_irs)
         partition_info[input_ir] = PartitionInfo(count=partition_count)
     else:
         input_ir = input_irs[0]
