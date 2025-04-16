@@ -186,7 +186,7 @@ def _valid_streaming_options(
                     options,
                     key,
                     default="synchronous",
-                    choices=("synchronous", "distributed"),
+                    choices=("synchronous", "threads", "distributed"),
                 )
             case "scheduler_options":
                 options = _valid_option(options, key, default={}, astype=dict)

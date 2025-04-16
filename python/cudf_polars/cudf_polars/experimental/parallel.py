@@ -152,7 +152,7 @@ def get_scheduler(config_options: ConfigOptions) -> Any:
         SerializerManager.register_serialize()
         SerializerManager.run_on_cluster(client)
         return client.get
-    elif scheduler == "threaded":  # pragma: no cover
+    elif scheduler == "threads":  # pragma: no cover
         from dask.threaded import get
 
         kwargs = {"num_workers": 2}
