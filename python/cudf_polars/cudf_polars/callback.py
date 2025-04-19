@@ -287,13 +287,6 @@ def execute_with_cudf(
     executor = config.config.get("executor", None)
     with nvtx.annotate(message="ConvertIR", domain="cudf_polars"):
         translator = Translator(nt, config)
-        if (
-            memory_resource is None
-            and executor == "streaming"
-            and translator.config_options.get("executor_options.scheduler")
-            == "distributed"
-        ):
-            memory_resource = rmm.mr.get_current_device_resource()
         ir = translator.translate_ir()
         ir_translation_errors = translator.errors
         if timer is not None:
