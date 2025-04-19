@@ -4,22 +4,33 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, overload
 
 from rapidsmpf.integrations.dask.spilling import SpillableWrapper
 
 from cudf_polars.containers import DataFrame
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, MutableMapping
+    from collections.abc import MutableMapping
     from typing import Any
 
-    from rapidsmpf.integrations.dask.spilling import WrappedType
 
 T = TypeVar("T")
 
 
-def wrap_dataframe(obj: T) -> WrappedType | T:
+class _Callable[T](Protocol):
+    def __call__(self, *args: Any) -> T: ...
+
+
+@overload
+def wrap_arg(obj: DataFrame) -> SpillableWrapper[DataFrame]: ...
+
+
+@overload
+def wrap_arg(obj: T) -> T: ...
+
+
+def wrap_arg(obj: DataFrame | T) -> SpillableWrapper[DataFrame] | T:
     """
     Make `obj` spillable if it is a DataFrame.
 
@@ -37,9 +48,9 @@ def wrap_dataframe(obj: T) -> WrappedType | T:
     return obj
 
 
-def unwrap_dataframe(obj: T) -> DataFrame | T:
+def unwrap_arg(obj: SpillableWrapper[T] | T) -> T:
     """
-    Unwraps a SpillableWrapper to retrieve the original DataFrame.
+    Unwraps a SpillableWrapper to retrieve the original object.
 
     Parameters
     ----------
@@ -48,16 +59,30 @@ def unwrap_dataframe(obj: T) -> DataFrame | T:
 
     Returns
     -------
-    The unwrapped DataFrame if obj is a SpillableWrapper, otherwise the original object.
+    The unwrapped obj is a SpillableWrapper, otherwise the original object.
     """
     if isinstance(obj, SpillableWrapper):
         return obj.unspill()
     return obj
 
 
+@overload
 def wrap_func_spillable(
-    func: Callable[..., T], *, make_func_output_spillable: bool
-) -> Callable[..., T]:
+    func: _Callable[DataFrame], *, make_func_output_spillable: Literal[True]
+) -> _Callable[SpillableWrapper[DataFrame]]: ...
+
+
+@overload
+def wrap_func_spillable(
+    func: _Callable[T], *, make_func_output_spillable: bool
+) -> _Callable[T]: ...
+
+
+def wrap_func_spillable(
+    func: _Callable[T] | _Callable[DataFrame],
+    *,
+    make_func_output_spillable: bool,
+) -> _Callable[T] | _Callable[SpillableWrapper[DataFrame]]:
     """
     Wraps a function to handle spillable DataFrames.
 
@@ -74,9 +99,9 @@ def wrap_func_spillable(
     """
 
     def wrapper(*args: Any) -> T:
-        ret: Any = func(*(unwrap_dataframe(arg) for arg in args))
+        ret: Any = func(*(unwrap_arg(arg) for arg in args))
         if make_func_output_spillable:
-            ret = wrap_dataframe(ret)
+            ret = wrap_arg(ret)
         return ret
 
     return wrapper
@@ -86,10 +111,10 @@ def wrap_dataframe_in_spillable(
     graph: MutableMapping[Any, Any], ignore_key: str | tuple[str, int]
 ) -> MutableMapping[Any, Any]:
     """
-    Wraps functions within a dask graph to handle spillable DataFrames.
+    Wraps functions within a task graph to handle spillable DataFrames.
 
-    Only support flat dask graphs where each DataFrame can be found in the
-    outermost level. Currently, this is true for most dask-polars graphs.
+    Only supports flat task graphs where each DataFrame can be found in the
+    outermost level. Currently, this is true for all cudf-polars task graphs.
 
     Parameters
     ----------
@@ -101,7 +126,7 @@ def wrap_dataframe_in_spillable(
 
     Returns
     -------
-    A modified dask graph with wrapped functions.
+    A new task graph with wrapped functions.
     """
     ret = {}
     for key, task in graph.items():
