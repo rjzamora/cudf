@@ -287,6 +287,20 @@ def _(
     }
 
 
+@lower_ir_node.register(MapFunction)
+def _(
+    ir: MapFunction, rec: LowerIRTransformer
+) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    # Allow pointwise operations
+    if ir.name in ("rename", "explode"):
+        return _lower_ir_pwise(ir, rec)
+
+    # Fallback for everything else
+    return _lower_ir_fallback(
+        ir, rec, msg=f"{ir.name} is not supported for multiple partitions."
+    )
+
+
 def _lower_ir_pwise(
     ir: IR, rec: LowerIRTransformer
 ) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
@@ -398,23 +412,6 @@ def _(
             (_concat, *graph.keys()),
         )
     return graph
-
-
-@lower_ir_node.register(MapFunction)
-def _(
-    ir: MapFunction, rec: LowerIRTransformer
-) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
-    # Specialized IR-lowering logic for MapFunction.
-    (child,) = ir.children
-    new_child, pi = rec(child)
-    count = pi[new_child].count
-    if count > 1 and ir.name != "rename":
-        raise NotImplementedError(
-            f"Class {type(ir)} does not support multiple partitions for name={ir.name}."
-        )
-    new_node = ir.reconstruct([new_child])
-    pi[new_node] = PartitionInfo(count=count)
-    return new_node, pi
 
 
 generate_ir_tasks.register(MapFunction, _generate_ir_tasks_pwise)
