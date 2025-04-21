@@ -6,22 +6,209 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import importlib
+import json
 import os
+import sys
 import time
-from datetime import date
-from typing import Any
+from datetime import date, datetime, timezone
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import pynvml
 
 import polars as pl
 
 from cudf_polars.dsl.translate import Translator
 from cudf_polars.experimental.parallel import evaluate_streaming
 
+if TYPE_CHECKING:
+    import pathlib
+
 # Without this setting, the first IO task to run
 # on each worker takes ~15 sec extra
 os.environ["KVIKIO_COMPAT_MODE"] = os.environ.get("KVIKIO_COMPAT_MODE", "on")
 os.environ["KVIKIO_NTHREADS"] = os.environ.get("KVIKIO_NTHREADS", "8")
+
+
+@dataclasses.dataclass
+class Record:
+    """Results for a single run of a single TPCH query."""
+
+    query: int
+    duration: float
+
+
+@dataclasses.dataclass
+class VersionInfo:
+    """Information about the version of the software used to run the query."""
+
+    version: str
+    commit: str | None
+
+
+@dataclasses.dataclass
+class PackageVersions:
+    """Information about the versions of the software used to run the query."""
+
+    cudf_polars: VersionInfo
+    polars: VersionInfo
+    python: VersionInfo
+    rapidsmpf: VersionInfo | None
+
+    @classmethod
+    def collect(cls) -> PackageVersions:
+        """Collect the versions of the software used to run the query."""
+        packages = [
+            "cudf_polars",
+            "polars",
+        ]
+        versions = {}
+        for name in packages:
+            package = importlib.import_module(name)
+            versions[name] = VersionInfo(
+                version=package.__version__,
+                commit=getattr(package, "__git_commit__", None),
+            )
+        versions["python"] = VersionInfo(
+            version=".".join(str(v) for v in sys.version_info[:3]),
+            commit=None,
+        )
+        try:
+            import rapidsmp
+
+            versions["rapidsmpf"] = VersionInfo(
+                version=rapidsmp.__version__,
+                commit=getattr(rapidsmp, "__git_commit__", None),
+            )
+        except ImportError:
+            versions["rapidsmpf"] = None
+        return cls(**versions)
+
+
+@dataclasses.dataclass
+class GPUInfo:
+    """Information about a specific GPU."""
+
+    name: str
+    index: int
+    free_memory: int
+    used_memory: int
+    total_memory: int
+
+    @classmethod
+    def from_index(cls, index: int) -> GPUInfo:
+        """Create a GPUInfo from an index."""
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        return cls(
+            name=pynvml.nvmlDeviceGetName(handle),
+            index=index,
+            free_memory=memory.free,
+            used_memory=memory.used,
+            total_memory=memory.total,
+        )
+
+
+@dataclasses.dataclass
+class HardwareInfo:
+    """Information about the hardware used to run the query."""
+
+    gpus: list[GPUInfo]
+    # TODO: ucx
+
+    @classmethod
+    def collect(cls) -> HardwareInfo:
+        """Collect the hardware information."""
+        pynvml.nvmlInit()
+        gpus = [GPUInfo.from_index(i) for i in range(pynvml.nvmlDeviceGetCount())]
+        return cls(gpus=gpus)
+
+
+@dataclasses.dataclass(kw_only=True)
+class RunConfig:
+    """Results for a TPCH query run."""
+
+    executor: str
+    scheduler: str
+    n_workers: int
+    versions: PackageVersions = dataclasses.field(
+        default_factory=PackageVersions.collect
+    )
+    records: dict[int, list[Record]] = dataclasses.field(default_factory=dict)
+    dataset_path: pathlib.Path
+    shuffle: str | None = None
+    rapidsmpf_spill: bool = False
+    broadcast_join_limit: int
+    blocksize: int
+    threads: int
+    trials: int
+    timestamp: str = dataclasses.field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    hardware: HardwareInfo = dataclasses.field(default_factory=HardwareInfo.collect)
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> RunConfig:
+        """Create a RunConfig from command line arguments."""
+        executor = args.executor
+        scheduler = args.scheduler
+
+        if executor in ("streaming", "dask", "dask-cuda", "dask-experimental"):
+            if executor == "dask-cuda":
+                scheduler = "distributed"
+            executor = "streaming"
+        elif executor in ("in-memory", "pylibcudf"):
+            scheduler = None
+            executor = "in-memory"
+        elif executor in ("cpu", "polars"):
+            scheduler = None
+            executor = "cpu"
+
+        if scheduler == "distributed":
+            broadcast_join_limit = args.broadcast_join_limit or 2
+        else:
+            broadcast_join_limit = args.broadcast_join_limit or 32
+
+        return cls(
+            executor=executor,
+            scheduler=scheduler,
+            n_workers=args.n_workers,
+            shuffle=args.shuffle,
+            rapidsmpf_spill=args.rapidsmpf_spill,
+            broadcast_join_limit=broadcast_join_limit,
+            dataset_path=args.path,
+            blocksize=args.blocksize,
+            threads=args.threads,
+            trials=args.trials,
+        )
+
+    def serialize(self) -> dict:
+        """Serialize the run config to a dictionary."""
+        return dataclasses.asdict(self)
+
+    def summarize(self) -> None:
+        """Print a summary of the results."""
+        print("Trial Summary")
+        print("=======================================")
+
+        for query, records in self.records.items():
+            print(f"query: {query}")
+            print(f"path: {self.dataset_path}")
+            print(f"executor: {self.executor}")
+            print(f"blocksize: {self.blocksize}")
+            print(f"shuffle_method: {self.shuffle}")
+            print(f"broadcast_join_limit: {self.broadcast_join_limit}")
+            print(f"n_workers: {self.n_workers}")
+            print(f"threads: {self.threads}")
+            print(f"n_trials: {self.trials}")
+            print("---------------------------------------")
+            print(f"min time : {min([record.duration for record in records]):0.4f}")
+            print(f"max time : {max(record.duration for record in records):0.4f}")
+            print(f"mean time: {np.mean([record.duration for record in records]):0.4f}")
+            print("=======================================")
 
 
 def get_data(path: str, table_name: str, suffix: str = "") -> pl.LazyFrame:
@@ -51,6 +238,11 @@ class TPCHQueries:
     Query 22:
       - Multi-partition NOT supported (unique)
     """
+
+    @staticmethod
+    def q0(args: Any) -> pl.LazyFrame:
+        """Query 0."""
+        return pl.LazyFrame()
 
     @staticmethod
     def q1(args: Any) -> pl.LazyFrame:
@@ -816,13 +1008,22 @@ class TPCHQueries:
         )
 
 
+def _query_type(query: int | str) -> list[int]:
+    if isinstance(query, int):
+        return [query]
+    elif query == "all":
+        return list(range(1, 23))
+    else:
+        return [int(q) for q in query.split(",")]
+
+
 parser = argparse.ArgumentParser(
     prog="Cudf-Polars TPC-H Benchmarks",
     description="Experimental Streaming-Executor benchmarks.",
 )
 parser.add_argument(
     "query",
-    type=int,
+    type=_query_type,
     help="Query number.",
 )
 parser.add_argument(
@@ -919,31 +1120,39 @@ parser.add_argument(
     type=float,
     help="RMM pool size (fractional).",
 )
+parser.add_argument(
+    "-o",
+    "--output",
+    type=argparse.FileType("at"),
+    default="tpch_results.json",
+    help="Output file path.",
+)
+parser.add_argument(
+    "--summarize",
+    action=argparse.BooleanOptionalAction,
+    help="Summarize the results.",
+    default=True,
+)
+parser.add_argument(
+    "--print-results",
+    action=argparse.BooleanOptionalAction,
+    help="Print the query results",
+    default=True,
+)
 args = parser.parse_args()
 
 
 def run(args: Any) -> None:
     """Run the benchmark once."""
     client = None
-    executor = args.executor
-    scheduler = args.scheduler
-    if executor in ("streaming", "dask", "dask-cuda", "dask-experimental"):
-        if executor == "dask-cuda":
-            scheduler = "distributed"
-        executor = "streaming"
-    elif executor in ("in-memory", "pylibcudf"):
-        scheduler = None
-        executor = "in-memory"
-    elif executor in ("cpu", "polars"):
-        scheduler = None
-        executor = "cpu"
+    run_config = RunConfig.from_args(args)
 
-    if scheduler == "distributed":
+    if run_config.scheduler == "distributed":
         from dask_cuda import LocalCUDACluster
         from distributed import Client
 
         kwargs = {
-            "n_workers": args.n_workers,
+            "n_workers": run_config.n_workers,
             "dashboard_address": ":8585",
             "protocol": "ucx",
             "rmm_pool_size": args.rmm_pool_size,
@@ -954,7 +1163,7 @@ def run(args: Any) -> None:
         os.environ["POLARS_GPU_ENABLE_CUDA_MANAGED_MEMORY"] = "0"
         client = Client(LocalCUDACluster(**kwargs))
         client.wait_for_workers(args.n_workers)
-        if args.shuffle != "tasks" or args.rapidsmpf_spill:
+        if run_config.shuffle != "tasks" or run_config.rapidsmpf_spill:
             try:
                 from rapidsmpf.integrations.dask import bootstrap_dask_cluster
 
@@ -963,87 +1172,81 @@ def run(args: Any) -> None:
             except ImportError as err:
                 if args.shuffle == "rapidsmpf":
                     raise ImportError from err
-        broadcast_join_limit = args.broadcast_join_limit or 2
+        broadcast_join_limit = args.broadcast_join_limit
     else:
         # Use UVM with synchronous scheduler
         os.environ["POLARS_GPU_ENABLE_CUDA_MANAGED_MEMORY"] = "1"
-        broadcast_join_limit = args.broadcast_join_limit or 32
+        broadcast_join_limit = run_config.broadcast_join_limit
 
-    q_id = args.query
-    try:
-        q = getattr(TPCHQueries, f"q{q_id}")(args)
-    except AttributeError as err:
-        raise NotImplementedError(f"Query {q_id} not implemented.") from err
-
+    query_ids = args.query
     trials = []
-    for _ in range(args.trials):
-        t0 = time.time()
 
-        if executor == "cpu":
-            result = q.collect(new_streaming=True)
-        else:
-            if executor == "in-memory":
-                executor_options = {}
+    for q_id in query_ids:
+        try:
+            q = getattr(TPCHQueries, f"q{q_id}")(args)
+        except AttributeError as err:
+            raise NotImplementedError(f"Query {q_id} not implemented.") from err
+
+        for _ in range(args.trials):
+            t0 = time.monotonic()
+
+            if run_config.executor == "cpu":
+                result = q.collect(new_streaming=True)
             else:
-                executor_options = {
-                    "parquet_blocksize": args.blocksize,
-                    "shuffle_method": args.shuffle,
-                    "rapidsmpf_spill": args.rapidsmpf_spill,
-                    "broadcast_join_limit": broadcast_join_limit,
-                    "cardinality_factor": {
-                        "c_custkey": 0.05,  # Q10
-                        "l_orderkey": 1.0,  # Q18
-                    },
-                }
-                if scheduler == "synchronous" and args.threads > 1:
-                    executor_options["scheduler"] = "threads"
-                    executor_options["scheduler_options"] = {
-                        "num_workers": args.threads,
+                if run_config.executor == "in-memory":
+                    executor_options = {}
+                else:
+                    executor_options = {
+                        "parquet_blocksize": args.blocksize,
+                        "shuffle_method": args.shuffle,
+                        "rapidsmpf_spill": args.rapidsmpf_spill,
+                        "broadcast_join_limit": broadcast_join_limit,
+                        "cardinality_factor": {
+                            "c_custkey": 0.05,  # Q10
+                            "l_orderkey": 1.0,  # Q18
+                        },
                     }
-                elif scheduler == "distributed":
-                    executor_options["scheduler"] = "distributed"
+                    if run_config.scheduler == "synchronous" and args.threads > 1:
+                        executor_options["scheduler"] = "threads"
+                        executor_options["scheduler_options"] = {
+                            "num_workers": args.threads,
+                        }
+                    elif run_config.scheduler == "distributed":
+                        executor_options["scheduler"] = "distributed"
 
-            engine = pl.GPUEngine(
-                raise_on_fail=True,
-                executor=executor,
-                executor_options=executor_options,
-            )
-            if args.debug:
-                translator = Translator(q._ldf.visit(), engine)
-                ir = translator.translate_ir()
-                if executor == "in-memory":
-                    result = ir.evaluate(cache={}, timer=None).to_polars()
-                elif executor == "streaming":
-                    result = evaluate_streaming(
-                        ir, translator.config_options
-                    ).to_polars()
-            else:
-                result = q.collect(engine=engine)
+                engine = pl.GPUEngine(
+                    raise_on_fail=True,
+                    executor=run_config.executor,
+                    executor_options=executor_options,
+                )
+                if args.debug:
+                    translator = Translator(q._ldf.visit(), engine)
+                    ir = translator.translate_ir()
+                    if run_config.executor == "in-memory":
+                        result = ir.evaluate(cache={}, timer=None).to_polars()
+                    elif run_config.executor == "streaming":
+                        result = evaluate_streaming(
+                            ir, translator.config_options
+                        ).to_polars()
+                else:
+                    result = q.collect(engine=engine)
 
-        t1 = time.time()
-        print(result)
-        print(f"time is {t1 - t0}")
-        trials.append(t1 - t0)
+            t1 = time.monotonic()
+            record = Record(query=q_id, duration=t1 - t0)
+            if args.print_results:
+                print(result)
+            print(f"Ran query={q_id} in {record.duration:0.4f}s")
+            trials.append(record)
 
-    print("Trial Summary")
-    print("=======================================")
-    print(f"query: {q_id}")
-    print(f"path: {args.path}")
-    print(f"executor: {executor}")
-    print(f"blocksize: {args.blocksize}")
-    print(f"shuffle_method: {args.shuffle}")
-    print(f"broadcast_join_limit: {args.broadcast_join_limit}")
-    print(f"n_workers: {args.n_workers}")
-    print(f"threads: {args.threads}")
-    print(f"n_trials: {args.trials}")
-    print("---------------------------------------")
-    print(f"min time: {min(trials)}")
-    print(f"max time: {max(trials)}")
-    print(f"mean time: {np.mean(trials)}")
-    print("=======================================")
+    run_config = dataclasses.replace(run_config, records={q_id: trials})
+
+    if args.summarize:
+        run_config.summarize()
 
     if client is not None:
         client.close(timeout=60)
+
+    args.output.write(json.dumps(run_config.serialize()))
 
 
 if __name__ == "__main__":
