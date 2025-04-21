@@ -62,19 +62,35 @@ def unwrap_arg(obj: SpillableWrapper[T] | T) -> T:
     The unwrapped obj is a SpillableWrapper, otherwise the original object.
     """
     if isinstance(obj, SpillableWrapper):
+        # Add headroom and unspill
+        try:
+            import dask.sizeof
+            from distributed import get_worker
+
+            buffer_resource = get_worker()._rmp_buffer_resource
+            headroom = dask.sizeof.sizeof(obj._on_host)
+            buffer_resource.spill_manager.spill_to_make_headroom(headroom=headroom)
+        except ValueError:
+            pass
         return obj.unspill()
     return obj
 
 
 @overload
 def wrap_func_spillable(
-    func: _Callable[DataFrame], *, make_func_output_spillable: Literal[True]
+    func: _Callable[DataFrame],
+    *,
+    make_func_output_spillable: Literal[True],
+    leaf: bool = False,
 ) -> _Callable[SpillableWrapper[DataFrame]]: ...
 
 
 @overload
 def wrap_func_spillable(
-    func: _Callable[T], *, make_func_output_spillable: bool
+    func: _Callable[T],
+    *,
+    make_func_output_spillable: bool,
+    leaf: bool = False,
 ) -> _Callable[T]: ...
 
 
@@ -82,6 +98,7 @@ def wrap_func_spillable(
     func: _Callable[T] | _Callable[DataFrame],
     *,
     make_func_output_spillable: bool,
+    leaf: bool = False,
 ) -> _Callable[T] | _Callable[SpillableWrapper[DataFrame]]:
     """
     Wraps a function to handle spillable DataFrames.
@@ -99,7 +116,32 @@ def wrap_func_spillable(
     """
 
     def wrapper(*args: Any) -> T:
-        ret: Any = func(*(unwrap_arg(arg) for arg in args))
+        from distributed import get_worker
+
+        worker = get_worker()
+        spill_manager = worker._rmp_buffer_resource.spill_manager
+        if not hasattr(worker, "_cudf_polars_retries"):
+            worker._cudf_polars_retries = 0
+
+        while True:
+            try:
+                ret: Any = func(*(unwrap_arg(arg) for arg in args))
+                worker._cudf_polars_retries = 0
+            except MemoryError as err:
+                # OOM Error - Try to spill as much as possible
+                worker._cudf_polars_retries += 1
+                spilled = spill_manager.spill_to_make_headroom(headroom=10_000_000_000)
+                if spilled < 1_000_000 and leaf:
+                    # Couldn't spill much.
+                    # Reschedule the task if it's a leaf task (usually IO)
+                    from distributed.exceptions import Reschedule
+
+                    raise Reschedule()
+                elif spilled < 1_000_000 or worker._cudf_polars_retries > 10:
+                    raise err
+            else:
+                worker._cudf_polars_retries = 0
+                break
         if make_func_output_spillable:
             ret = wrap_arg(ret)
         return ret
@@ -130,11 +172,16 @@ def wrap_dataframe_in_spillable(
     """
     ret = {}
     for key, task in graph.items():
-        assert isinstance(task, tuple)
-        ret[key] = tuple(
-            wrap_func_spillable(a, make_func_output_spillable=key != ignore_key)
-            if callable(a)
-            else a
-            for a in task
-        )
+        if isinstance(task, tuple) and task and callable(task[0]):
+            leaf = not any(isinstance(arg, tuple) and arg in graph for arg in task[1:])
+            ret[key] = (
+                wrap_func_spillable(
+                    task[0],
+                    make_func_output_spillable=key != ignore_key,
+                    leaf=leaf,
+                ),
+                *task[1:],
+            )
+        else:
+            ret[key] = task
     return ret
