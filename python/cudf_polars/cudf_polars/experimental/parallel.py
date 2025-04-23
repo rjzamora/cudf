@@ -162,9 +162,9 @@ def get_scheduler(config_options: ConfigOptions) -> Any:
         kwargs.update(scheduler_options)
         return partial(get, **kwargs)
     elif scheduler == "synchronous":
-        from dask import get
+        from cudf_polars.experimental.scheduler import synchronous_scheduler
 
-        return get
+        return synchronous_scheduler
     else:  # pragma: no cover
         raise ValueError(f"{scheduler} not a supported scheduler option.")
 
