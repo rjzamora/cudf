@@ -1156,14 +1156,14 @@ def run(args: Any) -> None:
             except ImportError as err:
                 if args.shuffle == "rapidsmpf":
                     raise ImportError from err
-        broadcast_join_limit = args.broadcast_join_limit
+        broadcast_join_limit = run_config.broadcast_join_limit
     else:
         # Use UVM with synchronous scheduler
         os.environ["POLARS_GPU_ENABLE_CUDA_MANAGED_MEMORY"] = "1"
         broadcast_join_limit = run_config.broadcast_join_limit
 
     query_ids = args.query
-    records = defaultdict(list)
+    records: defaultdict[int, list[Record]] = defaultdict(list)
 
     for q_id in query_ids:
         try:
@@ -1221,7 +1221,7 @@ def run(args: Any) -> None:
             record = Record(query=q_id, duration=t1 - t0)
             if args.print_results:
                 print(result)
-            print(f"Ran query={q_id} in {record.duration:0.4f}s")
+            print(f"Ran query={q_id} in {record.duration:0.4f}s", flush=True)
             records[q_id].append(record)
 
     run_config = dataclasses.replace(run_config, records=dict(records))
