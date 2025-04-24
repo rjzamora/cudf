@@ -166,7 +166,7 @@ class RunConfig:
             shuffle=args.shuffle,
             rapidsmpf_spill=args.rapidsmpf_spill,
             broadcast_join_limit=broadcast_join_limit,
-            dataset_path=args.dataset_path,
+            dataset_path=args.path,
             blocksize=args.blocksize,
             threads=args.threads,
             trials=args.trials,
@@ -1114,7 +1114,7 @@ parser.add_argument(
     "-o",
     "--output",
     type=argparse.FileType("at"),
-    default="tpch_results.json",
+    default="tpch_results.jsonl",
     help="Output file path.",
 )
 parser.add_argument(
@@ -1239,6 +1239,7 @@ def run(args: argparse.Namespace) -> None:
         client.close(timeout=60)
 
     args.output.write(json.dumps(run_config.serialize()))
+    args.output.write("\n")
 
 
 if __name__ == "__main__":
