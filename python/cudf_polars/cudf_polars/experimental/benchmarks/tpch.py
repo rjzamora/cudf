@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import time
+from collections import defaultdict
 from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -1179,13 +1180,15 @@ def run(args: Any) -> None:
         broadcast_join_limit = run_config.broadcast_join_limit
 
     query_ids = args.query
-    trials = []
+    records = defaultdict(list)
 
     for q_id in query_ids:
         try:
             q = getattr(TPCHQueries, f"q{q_id}")(args)
         except AttributeError as err:
             raise NotImplementedError(f"Query {q_id} not implemented.") from err
+
+        records[q_id] = []
 
         for _ in range(args.trials):
             t0 = time.monotonic()
@@ -1236,9 +1239,9 @@ def run(args: Any) -> None:
             if args.print_results:
                 print(result)
             print(f"Ran query={q_id} in {record.duration:0.4f}s")
-            trials.append(record)
+            records[q_id].append(record)
 
-    run_config = dataclasses.replace(run_config, records={q_id: trials})
+    run_config = dataclasses.replace(run_config, records=dict(records))
 
     if args.summarize:
         run_config.summarize()
@@ -1246,6 +1249,7 @@ def run(args: Any) -> None:
     if client is not None:
         client.close(timeout=60)
 
+    # with run_config.output_path.open("at") as f:
     args.output.write(json.dumps(run_config.serialize()))
 
 
