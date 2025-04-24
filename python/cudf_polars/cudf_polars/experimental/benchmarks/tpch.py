@@ -14,7 +14,7 @@ import sys
 import time
 from collections import defaultdict
 from datetime import date, datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pynvml
@@ -115,6 +115,8 @@ class HardwareInfo:
 class RunConfig:
     """Results for a TPCH query run."""
 
+    queries: list[int]
+    suffix: str
     executor: str
     scheduler: str
     n_workers: int
@@ -157,16 +159,18 @@ class RunConfig:
             broadcast_join_limit = args.broadcast_join_limit or 32
 
         return cls(
+            queries=args.query,
             executor=executor,
             scheduler=scheduler,
             n_workers=args.n_workers,
             shuffle=args.shuffle,
             rapidsmpf_spill=args.rapidsmpf_spill,
             broadcast_join_limit=broadcast_join_limit,
-            dataset_path=args.path,
+            dataset_path=args.dataset_path,
             blocksize=args.blocksize,
             threads=args.threads,
             trials=args.trials,
+            suffix=args.suffix,
         )
 
     def serialize(self) -> dict:
@@ -195,7 +199,9 @@ class RunConfig:
             print("=======================================")
 
 
-def get_data(path: str, table_name: str, suffix: str = "") -> pl.LazyFrame:
+def get_data(
+    path: str | pathlib.Path, table_name: str, suffix: str = ""
+) -> pl.LazyFrame:
     """Get table from dataset."""
     return pl.scan_parquet(f"{path}/{table_name}{suffix}")
 
@@ -224,14 +230,14 @@ class TPCHQueries:
     """
 
     @staticmethod
-    def q0(args: Any) -> pl.LazyFrame:
+    def q0(run_config: RunConfig) -> pl.LazyFrame:
         """Query 0."""
         return pl.LazyFrame()
 
     @staticmethod
-    def q1(args: Any) -> pl.LazyFrame:
+    def q1(run_config: RunConfig) -> pl.LazyFrame:
         """Query 1."""
-        lineitem = get_data(args.path, "lineitem", args.suffix)
+        lineitem = get_data(run_config.dataset_path, "lineitem", run_config.suffix)
 
         var1 = date(1998, 9, 2)
 
@@ -260,13 +266,13 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q2(args: Any) -> pl.LazyFrame:
+    def q2(run_config: RunConfig) -> pl.LazyFrame:
         """Query 2."""
-        nation = get_data(args.path, "nation", args.suffix)
-        part = get_data(args.path, "part", args.suffix)
-        partsupp = get_data(args.path, "partsupp", args.suffix)
-        region = get_data(args.path, "region", args.suffix)
-        supplier = get_data(args.path, "supplier", args.suffix)
+        nation = get_data(run_config.dataset_path, "nation", run_config.suffix)
+        part = get_data(run_config.dataset_path, "part", run_config.suffix)
+        partsupp = get_data(run_config.dataset_path, "partsupp", run_config.suffix)
+        region = get_data(run_config.dataset_path, "region", run_config.suffix)
+        supplier = get_data(run_config.dataset_path, "supplier", run_config.suffix)
 
         var1 = 15
         var2 = "BRASS"
@@ -304,11 +310,11 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q3(args: Any) -> pl.LazyFrame:
+    def q3(run_config: RunConfig) -> pl.LazyFrame:
         """Query 3."""
-        customer = get_data(args.path, "customer", args.suffix)
-        lineitem = get_data(args.path, "lineitem", args.suffix)
-        orders = get_data(args.path, "orders", args.suffix)
+        customer = get_data(run_config.dataset_path, "customer", run_config.suffix)
+        lineitem = get_data(run_config.dataset_path, "lineitem", run_config.suffix)
+        orders = get_data(run_config.dataset_path, "orders", run_config.suffix)
 
         var1 = "BUILDING"
         var2 = date(1995, 3, 15)
@@ -337,10 +343,10 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q4(args: Any) -> pl.LazyFrame:
+    def q4(run_config: RunConfig) -> pl.LazyFrame:
         """Query 4."""
-        lineitem = get_data(args.path, "lineitem", args.suffix)
-        orders = get_data(args.path, "orders", args.suffix)
+        lineitem = get_data(run_config.dataset_path, "lineitem", run_config.suffix)
+        orders = get_data(run_config.dataset_path, "orders", run_config.suffix)
 
         var1 = date(1993, 7, 1)
         var2 = date(1993, 10, 1)
@@ -360,10 +366,10 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q5(args: Any) -> pl.LazyFrame:
+    def q5(run_config: RunConfig) -> pl.LazyFrame:
         """Query 5."""
-        path = args.path
-        suffix = args.suffix
+        path = run_config.dataset_path
+        suffix = run_config.suffix
         customer = get_data(path, "customer", suffix)
         lineitem = get_data(path, "lineitem", suffix)
         nation = get_data(path, "nation", suffix)
@@ -398,10 +404,10 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q6(args: Any) -> pl.LazyFrame:
+    def q6(run_config: RunConfig) -> pl.LazyFrame:
         """Query 6."""
-        path = args.path
-        suffix = args.suffix
+        path = run_config.dataset_path
+        suffix = run_config.suffix
         lineitem = get_data(path, "lineitem", suffix)
 
         var1 = date(1994, 1, 1)
@@ -421,13 +427,13 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q7(args: Any) -> pl.LazyFrame:
+    def q7(run_config: RunConfig) -> pl.LazyFrame:
         """Query 7."""
-        customer = get_data(args.path, "customer", args.suffix)
-        lineitem = get_data(args.path, "lineitem", args.suffix)
-        nation = get_data(args.path, "nation", args.suffix)
-        orders = get_data(args.path, "orders", args.suffix)
-        supplier = get_data(args.path, "supplier", args.suffix)
+        customer = get_data(run_config.dataset_path, "customer", run_config.suffix)
+        lineitem = get_data(run_config.dataset_path, "lineitem", run_config.suffix)
+        nation = get_data(run_config.dataset_path, "nation", run_config.suffix)
+        orders = get_data(run_config.dataset_path, "orders", run_config.suffix)
+        supplier = get_data(run_config.dataset_path, "supplier", run_config.suffix)
 
         var1 = "FRANCE"
         var2 = "GERMANY"
@@ -472,15 +478,15 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q8(args: Any) -> pl.LazyFrame:
+    def q8(run_config: RunConfig) -> pl.LazyFrame:
         """Query 8."""
-        customer = get_data(args.path, "customer", args.suffix)
-        lineitem = get_data(args.path, "lineitem", args.suffix)
-        nation = get_data(args.path, "nation", args.suffix)
-        orders = get_data(args.path, "orders", args.suffix)
-        part = get_data(args.path, "part", args.suffix)
-        region = get_data(args.path, "region", args.suffix)
-        supplier = get_data(args.path, "supplier", args.suffix)
+        customer = get_data(run_config.dataset_path, "customer", run_config.suffix)
+        lineitem = get_data(run_config.dataset_path, "lineitem", run_config.suffix)
+        nation = get_data(run_config.dataset_path, "nation", run_config.suffix)
+        orders = get_data(run_config.dataset_path, "orders", run_config.suffix)
+        part = get_data(run_config.dataset_path, "part", run_config.suffix)
+        region = get_data(run_config.dataset_path, "region", run_config.suffix)
+        supplier = get_data(run_config.dataset_path, "supplier", run_config.suffix)
 
         var1 = "BRAZIL"
         var2 = "AMERICA"
@@ -521,10 +527,10 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q9(args: Any) -> pl.LazyFrame:
+    def q9(run_config: RunConfig) -> pl.LazyFrame:
         """Query 9."""
-        path = args.path
-        suffix = args.suffix
+        path = run_config.dataset_path
+        suffix = run_config.suffix
         lineitem = get_data(path, "lineitem", suffix)
         nation = get_data(path, "nation", suffix)
         orders = get_data(path, "orders", suffix)
@@ -557,10 +563,10 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q10(args: Any) -> pl.LazyFrame:
+    def q10(run_config: RunConfig) -> pl.LazyFrame:
         """Query 10."""
-        path = args.path
-        suffix = args.suffix
+        path = run_config.dataset_path
+        suffix = run_config.suffix
         customer = get_data(path, "customer", suffix)
         lineitem = get_data(path, "lineitem", suffix)
         nation = get_data(path, "nation", suffix)
@@ -605,11 +611,11 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q11(args: Any) -> pl.LazyFrame:
+    def q11(run_config: RunConfig) -> pl.LazyFrame:
         """Query 11."""
-        nation = get_data(args.path, "nation", args.suffix)
-        partsupp = get_data(args.path, "partsupp", args.suffix)
-        supplier = get_data(args.path, "supplier", args.suffix)
+        nation = get_data(run_config.dataset_path, "nation", run_config.suffix)
+        partsupp = get_data(run_config.dataset_path, "partsupp", run_config.suffix)
+        supplier = get_data(run_config.dataset_path, "supplier", run_config.suffix)
 
         var1 = "GERMANY"
         var2 = 0.0001
@@ -642,10 +648,10 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q12(args: Any) -> pl.LazyFrame:
+    def q12(run_config: RunConfig) -> pl.LazyFrame:
         """Query 12."""
-        lineitem = get_data(args.path, "lineitem", args.suffix)
-        orders = get_data(args.path, "orders", args.suffix)
+        lineitem = get_data(run_config.dataset_path, "lineitem", run_config.suffix)
+        orders = get_data(run_config.dataset_path, "orders", run_config.suffix)
 
         var1 = "MAIL"
         var2 = "SHIP"
@@ -674,10 +680,10 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q13(args: Any) -> pl.LazyFrame:
+    def q13(run_config: RunConfig) -> pl.LazyFrame:
         """Query 13."""
-        customer = get_data(args.path, "customer", args.suffix)
-        orders = get_data(args.path, "orders", args.suffix)
+        customer = get_data(run_config.dataset_path, "customer", run_config.suffix)
+        orders = get_data(run_config.dataset_path, "orders", run_config.suffix)
 
         var1 = "special"
         var2 = "requests"
@@ -696,10 +702,10 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q14(args: Any) -> pl.LazyFrame:
+    def q14(run_config: RunConfig) -> pl.LazyFrame:
         """Query 14."""
-        lineitem = get_data(args.path, "lineitem", args.suffix)
-        part = get_data(args.path, "part", args.suffix)
+        lineitem = get_data(run_config.dataset_path, "lineitem", run_config.suffix)
+        part = get_data(run_config.dataset_path, "part", run_config.suffix)
 
         var1 = date(1995, 9, 1)
         var2 = date(1995, 10, 1)
@@ -722,10 +728,10 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q15(args: Any) -> pl.LazyFrame:
+    def q15(run_config: RunConfig) -> pl.LazyFrame:
         """Query 15."""
-        lineitem = get_data(args.path, "lineitem", args.suffix)
-        supplier = get_data(args.path, "supplier", args.suffix)
+        lineitem = get_data(run_config.dataset_path, "lineitem", run_config.suffix)
+        supplier = get_data(run_config.dataset_path, "supplier", run_config.suffix)
 
         var1 = date(1996, 1, 1)
         var2 = date(1996, 4, 1)
@@ -750,11 +756,11 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q16(args: Any) -> pl.LazyFrame:
+    def q16(run_config: RunConfig) -> pl.LazyFrame:
         """Query 16."""
-        part = get_data(args.path, "part", args.suffix)
-        partsupp = get_data(args.path, "partsupp", args.suffix)
-        supplier = get_data(args.path, "supplier", args.suffix)
+        part = get_data(run_config.dataset_path, "part", run_config.suffix)
+        partsupp = get_data(run_config.dataset_path, "partsupp", run_config.suffix)
+        supplier = get_data(run_config.dataset_path, "supplier", run_config.suffix)
 
         var1 = "Brand#45"
 
@@ -778,10 +784,10 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q17(args: Any) -> pl.LazyFrame:
+    def q17(run_config: RunConfig) -> pl.LazyFrame:
         """Query 17."""
-        lineitem = get_data(args.path, "lineitem", args.suffix)
-        part = get_data(args.path, "part", args.suffix)
+        lineitem = get_data(run_config.dataset_path, "lineitem", run_config.suffix)
+        part = get_data(run_config.dataset_path, "part", run_config.suffix)
 
         var1 = "Brand#23"
         var2 = "MED BOX"
@@ -804,10 +810,10 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q18(args: Any) -> pl.LazyFrame:
+    def q18(run_config: RunConfig) -> pl.LazyFrame:
         """Query 18."""
-        path = args.path
-        suffix = args.suffix
+        path = run_config.dataset_path
+        suffix = run_config.suffix
         customer = get_data(path, "customer", suffix)
         lineitem = get_data(path, "lineitem", suffix)
         orders = get_data(path, "orders", suffix)
@@ -841,10 +847,10 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q19(args: Any) -> pl.LazyFrame:
+    def q19(run_config: RunConfig) -> pl.LazyFrame:
         """Query 19."""
-        lineitem = get_data(args.path, "lineitem", args.suffix)
-        part = get_data(args.path, "part", args.suffix)
+        lineitem = get_data(run_config.dataset_path, "lineitem", run_config.suffix)
+        part = get_data(run_config.dataset_path, "part", run_config.suffix)
 
         return (
             part.join(lineitem, left_on="p_partkey", right_on="l_partkey")
@@ -885,13 +891,13 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q20(args: Any) -> pl.LazyFrame:
+    def q20(run_config: RunConfig) -> pl.LazyFrame:
         """Query 20."""
-        lineitem = get_data(args.path, "lineitem", args.suffix)
-        nation = get_data(args.path, "nation", args.suffix)
-        part = get_data(args.path, "part", args.suffix)
-        partsupp = get_data(args.path, "partsupp", args.suffix)
-        supplier = get_data(args.path, "supplier", args.suffix)
+        lineitem = get_data(run_config.dataset_path, "lineitem", run_config.suffix)
+        nation = get_data(run_config.dataset_path, "nation", run_config.suffix)
+        part = get_data(run_config.dataset_path, "part", run_config.suffix)
+        partsupp = get_data(run_config.dataset_path, "partsupp", run_config.suffix)
+        supplier = get_data(run_config.dataset_path, "supplier", run_config.suffix)
 
         var1 = date(1994, 1, 1)
         var2 = date(1995, 1, 1)
@@ -923,12 +929,12 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q21(args: Any) -> pl.LazyFrame:
+    def q21(run_config: RunConfig) -> pl.LazyFrame:
         """Query 21."""
-        lineitem = get_data(args.path, "lineitem", args.suffix)
-        nation = get_data(args.path, "nation", args.suffix)
-        orders = get_data(args.path, "orders", args.suffix)
-        supplier = get_data(args.path, "supplier", args.suffix)
+        lineitem = get_data(run_config.dataset_path, "lineitem", run_config.suffix)
+        nation = get_data(run_config.dataset_path, "nation", run_config.suffix)
+        orders = get_data(run_config.dataset_path, "orders", run_config.suffix)
+        supplier = get_data(run_config.dataset_path, "supplier", run_config.suffix)
 
         var1 = "SAUDI ARABIA"
 
@@ -959,10 +965,10 @@ class TPCHQueries:
         )
 
     @staticmethod
-    def q22(args: Any) -> pl.LazyFrame:
+    def q22(run_config: RunConfig) -> pl.LazyFrame:
         """Query 22."""
-        customer = get_data(args.path, "customer", args.suffix)
-        orders = get_data(args.path, "orders", args.suffix)
+        customer = get_data(run_config.dataset_path, "customer", run_config.suffix)
+        orders = get_data(run_config.dataset_path, "orders", run_config.suffix)
 
         q1 = (
             customer.with_columns(pl.col("c_phone").str.slice(0, 2).alias("cntrycode"))
@@ -1126,7 +1132,7 @@ parser.add_argument(
 args = parser.parse_args()
 
 
-def run(args: Any) -> None:
+def run(args: argparse.Namespace) -> None:
     """Run the benchmark once."""
     client = None
     run_config = RunConfig.from_args(args)
@@ -1140,21 +1146,21 @@ def run(args: Any) -> None:
             "dashboard_address": ":8585",
             "protocol": "ucx",
             "rmm_pool_size": args.rmm_pool_size,
-            "threads_per_worker": args.threads,
+            "threads_per_worker": run_config.threads,
         }
 
         # Avoid UVM in distributed cluster
         os.environ["POLARS_GPU_ENABLE_CUDA_MANAGED_MEMORY"] = "0"
         client = Client(LocalCUDACluster(**kwargs))
-        client.wait_for_workers(args.n_workers)
+        client.wait_for_workers(run_config.n_workers)
         if run_config.shuffle != "tasks" or run_config.rapidsmpf_spill:
             try:
                 from rapidsmpf.integrations.dask import bootstrap_dask_cluster
 
-                spill_device = 0.66 if args.rapidsmpf_spill else 0.5
+                spill_device = 0.66 if run_config.rapidsmpf_spill else 0.5
                 bootstrap_dask_cluster(client, spill_device=spill_device)
             except ImportError as err:
-                if args.shuffle == "rapidsmpf":
+                if run_config.shuffle == "rapidsmpf":
                     raise ImportError from err
         broadcast_join_limit = run_config.broadcast_join_limit
     else:
@@ -1162,12 +1168,12 @@ def run(args: Any) -> None:
         os.environ["POLARS_GPU_ENABLE_CUDA_MANAGED_MEMORY"] = "1"
         broadcast_join_limit = run_config.broadcast_join_limit
 
-    query_ids = args.query
+    query_ids = run_config.queries
     records: defaultdict[int, list[Record]] = defaultdict(list)
 
     for q_id in query_ids:
         try:
-            q = getattr(TPCHQueries, f"q{q_id}")(args)
+            q = getattr(TPCHQueries, f"q{q_id}")(run_config)
         except AttributeError as err:
             raise NotImplementedError(f"Query {q_id} not implemented.") from err
 
@@ -1183,19 +1189,19 @@ def run(args: Any) -> None:
                     executor_options = {}
                 else:
                     executor_options = {
-                        "parquet_blocksize": args.blocksize,
-                        "shuffle_method": args.shuffle,
-                        "rapidsmpf_spill": args.rapidsmpf_spill,
+                        "parquet_blocksize": run_config.blocksize,
+                        "shuffle_method": run_config.shuffle,
+                        "rapidsmpf_spill": run_config.rapidsmpf_spill,
                         "broadcast_join_limit": broadcast_join_limit,
                         "cardinality_factor": {
                             "c_custkey": 0.05,  # Q10
                             "l_orderkey": 1.0,  # Q18
                         },
                     }
-                    if run_config.scheduler == "synchronous" and args.threads > 1:
+                    if run_config.scheduler == "synchronous" and run_config.threads > 1:
                         executor_options["scheduler"] = "threads"
                         executor_options["scheduler_options"] = {
-                            "num_workers": args.threads,
+                            "num_workers": run_config.threads,
                         }
                     elif run_config.scheduler == "distributed":
                         executor_options["scheduler"] = "distributed"
