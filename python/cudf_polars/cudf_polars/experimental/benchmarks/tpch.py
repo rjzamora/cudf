@@ -42,21 +42,13 @@ class Record:
 
 
 @dataclasses.dataclass
-class VersionInfo:
-    """Information about the version of the software used to run the query."""
-
-    version: str
-    commit: str | None
-
-
-@dataclasses.dataclass
 class PackageVersions:
     """Information about the versions of the software used to run the query."""
 
-    cudf_polars: VersionInfo
-    polars: VersionInfo
-    python: VersionInfo
-    rapidsmpf: VersionInfo | None
+    cudf_polars: str
+    polars: str
+    python: str
+    rapidsmpf: str | None
 
     @classmethod
     def collect(cls) -> PackageVersions:
@@ -68,21 +60,12 @@ class PackageVersions:
         versions = {}
         for name in packages:
             package = importlib.import_module(name)
-            versions[name] = VersionInfo(
-                version=package.__version__,
-                commit=getattr(package, "__git_commit__", None),
-            )
-        versions["python"] = VersionInfo(
-            version=".".join(str(v) for v in sys.version_info[:3]),
-            commit=None,
-        )
+            versions[name] = package.__version__
+        versions["python"] = ".".join(str(v) for v in sys.version_info[:3])
         try:
             import rapidsmp
 
-            versions["rapidsmpf"] = VersionInfo(
-                version=rapidsmp.__version__,
-                commit=getattr(rapidsmp, "__git_commit__", None),
-            )
+            versions["rapidsmpf"] = rapidsmp.__version__
         except ImportError:
             versions["rapidsmpf"] = None
         return cls(**versions)
@@ -1249,7 +1232,6 @@ def run(args: Any) -> None:
     if client is not None:
         client.close(timeout=60)
 
-    # with run_config.output_path.open("at") as f:
     args.output.write(json.dumps(run_config.serialize()))
 
 
