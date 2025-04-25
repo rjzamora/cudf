@@ -53,11 +53,11 @@ __all__ = [
     "ConditionalJoin",
     "DataFrameScan",
     "Distinct",
+    "Empty",
     "ErrorNode",
     "Filter",
     "GroupBy",
     "HConcat",
-    "HConcatBcast",
     "HStack",
     "Join",
     "MapFunction",
@@ -580,7 +580,7 @@ class Scan(IR):
                 options.set_columns(with_columns)
             if filters is not None:
                 options.set_filter(filters)
-            if config_options.parquet_options.chunked:
+            if config_options.get("parquet_options.chunked", default=True):
                 # We handle skip_rows != 0 by reading from the
                 # up to n_rows + skip_rows and slicing off the
                 # first skip_rows entries.
@@ -592,8 +592,14 @@ class Scan(IR):
                     options.set_num_rows(nrows)
                 reader = plc.io.parquet.ChunkedParquetReader(
                     options,
-                    chunk_read_limit=config_options.parquet_options.chunk_read_limit,
-                    pass_read_limit=config_options.parquet_options.pass_read_limit,
+                    chunk_read_limit=config_options.get(
+                        "parquet_options.chunk_read_limit",
+                        default=cls.PARQUET_DEFAULT_CHUNK_SIZE,
+                    ),
+                    pass_read_limit=config_options.get(
+                        "parquet_options.pass_read_limit",
+                        default=cls.PARQUET_DEFAULT_PASS_LIMIT,
+                    ),
                 )
                 chunk = reader.read_chunk()
                 rows_left_to_skip = skip_rows
@@ -1954,12 +1960,18 @@ class Union(IR):
 class HConcat(IR):
     """Concatenate dataframes horizontally."""
 
-    __slots__ = ()
-    _non_child = ("schema",)
+    __slots__ = ("should_broadcast",)
+    _non_child = ("schema", "should_broadcast")
 
-    def __init__(self, schema: Schema, *children: IR):
+    def __init__(
+        self,
+        schema: Schema,
+        should_broadcast: bool,  # noqa: FBT001
+        *children: IR,
+    ):
         self.schema = schema
-        self._non_child_args = ()
+        self.should_broadcast = should_broadcast
+        self._non_child_args = (should_broadcast,)
         self.children = children
 
     @staticmethod
@@ -1991,8 +2003,19 @@ class HConcat(IR):
         )
 
     @classmethod
-    def do_evaluate(cls, *dfs: DataFrame) -> DataFrame:
+    def do_evaluate(
+        cls,
+        should_broadcast: bool,  # noqa: FBT001
+        *dfs: DataFrame,
+    ) -> DataFrame:
         """Evaluate and return a dataframe."""
+        # Special should_broadcast case.
+        # Used to recombine decomposed expressions
+        if should_broadcast:
+            return DataFrame(
+                broadcast(*itertools.chain.from_iterable(df.columns for df in dfs))
+            )
+
         max_rows = max(df.num_rows for df in dfs)
         # Horizontal concatenation extends shorter tables with nulls
         return DataFrame(
@@ -2011,20 +2034,18 @@ class HConcat(IR):
         )
 
 
-class HConcatBcast(IR):
-    """Concatenate dataframes horizontally with broadcasting."""
+class Empty(IR):
+    """Represents an empty DataFrame."""
 
     __slots__ = ()
-    _non_child = ("schema",)
+    _non_child = ()
 
-    def __init__(self, schema: Schema, *children: IR):
-        self.schema = schema
+    def __init__(self) -> None:
+        self.schema = {}
         self._non_child_args = ()
-        self.children = children
+        self.children = ()
 
     @classmethod
-    def do_evaluate(cls, *dfs: DataFrame) -> DataFrame:
+    def do_evaluate(cls) -> DataFrame:
         """Evaluate and return a dataframe."""
-        return DataFrame(
-            broadcast(*itertools.chain.from_iterable(df.columns for df in dfs))
-        )
+        return DataFrame([])

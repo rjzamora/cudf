@@ -96,7 +96,7 @@ def test_broadcast_join_limit(broadcast_join_limit):
         type(node)
         for node in lower_ir_graph(
             Translator(q._ldf.visit(), engine).translate_ir(),
-            ConfigOptions.from_polars_engine(engine),
+            ConfigOptions(engine.config),
         )[1]
         if isinstance(node, Shuffle)
     ]
