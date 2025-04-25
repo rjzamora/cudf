@@ -1198,12 +1198,7 @@ def run(args: argparse.Namespace) -> None:
                             "l_orderkey": 1.0,  # Q18
                         },
                     }
-                    if run_config.scheduler == "synchronous" and run_config.threads > 1:
-                        executor_options["scheduler"] = "threads"
-                        executor_options["scheduler_options"] = {
-                            "num_workers": run_config.threads,
-                        }
-                    elif run_config.scheduler == "distributed":
+                    if run_config.scheduler == "distributed":
                         executor_options["scheduler"] = "distributed"
 
                 engine = pl.GPUEngine(
