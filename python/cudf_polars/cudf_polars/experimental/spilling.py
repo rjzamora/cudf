@@ -99,6 +99,27 @@ def wrap_func_spillable(
     """
 
     def wrapper(*args: Any) -> T:
+        # Make headroom before unspilling and executing the task
+        try:
+            from dask.sizeof import sizeof
+            from distributed import get_worker
+            from rapidsmpf.integrations.dask.core import get_worker_context
+
+            leaf = True
+            headroom = 0
+            for arg in args:
+                if isinstance(arg, SpillableWrapper):
+                    headroom += sizeof(arg)
+                    leaf = False
+            if leaf:
+                # TODO: Use blocksize config for leaf/IO tasks
+                headroom = 1_000_000_000
+                ctx = get_worker_context(get_worker())
+                with ctx.lock:
+                    ctx.br.spill_manager.spill_to_make_headroom(headroom=headroom)
+        except (ImportError, ValueError):
+            pass
+
         ret: Any = func(*(unwrap_arg(arg) for arg in args))
         if make_func_output_spillable:
             ret = wrap_arg(ret)
