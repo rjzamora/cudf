@@ -480,6 +480,20 @@ class Scan(IR):
         predicate: expr.NamedExpr | None,
     ) -> DataFrame:
         """Evaluate and return a dataframe."""
+        # if config_options.executor.scheduler == "distributed":
+        #     try:
+        #         from distributed import get_worker
+        #         from rapidsmpf.integrations.dask.core import get_worker_context
+
+        #         ctx = get_worker_context(get_worker())
+        #         with ctx.lock:
+        #             headroom = int(
+        #                 config_options.executor.parquet_blocksize * 1.0
+        #             )
+        #             ctx.br.spill_manager.spill_to_make_headroom(headroom=headroom)
+        #     except ValueError:
+        #         pass
+
         if typ == "csv":
             parse_options = reader_options["parse_options"]
             sep = chr(parse_options["separator"])

@@ -225,7 +225,17 @@ def _explain(
     offset: str = "",
 ) -> str:
     """Print the physical plan for an IR node."""
-    from cudf_polars.dsl.ir import GroupBy, Join, Projection, Scan, Select, Sort, Union
+    from cudf_polars.dsl.ir import (
+        GroupBy,
+        HConcat,
+        HStack,
+        Join,
+        Projection,
+        Scan,
+        Select,
+        Sort,
+        Union,
+    )
     from cudf_polars.experimental.io import SplitScan
 
     val = offset
@@ -244,6 +254,15 @@ def _explain(
         if isinstance(ir, GroupBy):
             keys = tuple(ne.name for ne in ir.keys)
             val += f"GROUPBY {keys} [{count}]\n"
+        elif isinstance(ir, HConcat):
+            schema = tuple(ir.schema)
+            val += f"HCONCAT {schema} [{count}]\n"
+        elif isinstance(ir, HStack):
+            from cudf_polars.experimental.base import get_key_name
+
+            schema = tuple(ir.schema)
+            name = get_key_name(ir)
+            val += f"{name} {schema} [{count}]\n"
         elif isinstance(ir, Join):
             left_on = tuple(ne.name for ne in ir.left_on)
             right_on = tuple(ne.name for ne in ir.right_on)
@@ -1234,6 +1253,7 @@ def run(args: argparse.Namespace) -> None:
                         "cardinality_factor": {
                             "c_custkey": 0.05,  # Q10
                             "l_orderkey": 1.0,  # Q18
+                            "l_partkey": 0.1,  # Q20
                         },
                     }
                     if run_config.scheduler == "distributed":
