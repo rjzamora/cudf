@@ -222,6 +222,7 @@ def _explain(
     """Print the physical plan for an IR node."""
     from cudf_polars.dsl.ir import GroupBy, Join, Projection, Scan, Select, Sort, Union
     from cudf_polars.experimental.io import SplitScan
+    from cudf_polars.experimental.repartition import Repartition
 
     val = offset
     count = partition_info[ir].count
@@ -252,6 +253,10 @@ def _explain(
         elif isinstance(ir, Sort):
             by = tuple(ne.name for ne in ir.by)
             val += f"SORT {by} [{count}]\n"
+        elif isinstance(ir, Repartition):
+            from cudf_polars.experimental.base import get_key_name
+            name = get_key_name(ir)
+            val += f"REPARTITION {name} [{count}]\n"
         else:
             val += f"{type(ir).__name__.upper()} [{count}]\n"
         for child in ir.children:
@@ -1225,6 +1230,7 @@ def run(args: argparse.Namespace) -> None:
                             "c_custkey": 0.05,  # Q10
                             "l_orderkey": 1.0,  # Q18
                             "l_partkey": 0.1,  # Q20
+                            "o_custkey": 0.5,  # Q22
                         },
                     }
                     if run_config.blocksize:
@@ -1255,15 +1261,19 @@ def run(args: argparse.Namespace) -> None:
                             ir, translator.config_options
                         ).to_polars()
                 else:
+                    if args.explain and it == 0:
+                        print(f"\nQuery {q_id} - Physical plan\n")
+                        print(explain_query(q, engine))
+
                     result = q.collect(engine=engine)
 
             t1 = time.monotonic()
             record = Record(query=q_id, duration=t1 - t0)
             if args.print_results:
                 print(result)
-            if args.explain and it == 0:
-                print(f"\nQuery {q_id} - Physical plan\n")
-                print(explain_query(q, engine))
+            # if args.explain and it == 0:
+            #     print(f"\nQuery {q_id} - Physical plan\n")
+            #     print(explain_query(q, engine))
             print(f"Ran query={q_id} in {record.duration:0.4f}s", flush=True)
             records[q_id].append(record)
 
