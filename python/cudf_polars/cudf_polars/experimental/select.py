@@ -62,23 +62,62 @@ def decompose_select(
     --------
     decompose_expr_graph
     """
+    # from cudf_polars.typing import Schema
+    # from cudf_polars.experimental.utils import _leaf_column_names
+    # from cudf_polars.dsl.expr import NamedExpr, Col
+
+    pwise_named_exprs = []
+    # single_agg_named_exprs = []
+
     # Collect partial selections
     selections = []
     for ne in select_ir.exprs:
-        # Decompose this partial expression
-        new_ne, partial_input_ir, _partition_info = decompose_expr_graph(
-            ne, input_ir, partition_info, config_options
-        )
-        pi = _partition_info[partial_input_ir]
-        partial_input_ir = Select(
-            {ne.name: ne.value.dtype},
-            [new_ne],
+        nonpwise = [expr for expr in traversal([ne.value]) if not expr.is_pointwise]
+        if not nonpwise:
+            # Everything is pointwise
+            pwise_named_exprs.append(ne)
+        # elif len(nonpwise) == 1 and isinstance(nonpwise[0], Agg):
+        #     # Expr contains a single aggregation.
+        #     # We should try to fuse this with other single-aggregations.
+        #     # TODO: What about BinOp(Agg, Agg)?
+        #     single_agg_named_exprs.append(ne)
+        else:
+            # Decompose this partial expression
+            new_ne, partial_input_ir, _partition_info = decompose_expr_graph(
+                ne, input_ir, partition_info, config_options
+            )
+            pi = _partition_info[partial_input_ir]
+            partial_input_ir = Select(
+                {ne.name: ne.value.dtype},
+                [new_ne],
+                True,  # noqa: FBT003
+                partial_input_ir,
+            )
+            _partition_info[partial_input_ir] = pi
+            partition_info.update(_partition_info)
+            selections.append(partial_input_ir)
+
+    # Deal with pointwise selections
+    if pwise_named_exprs:
+        pwise = Select(
+            {ne.name: select_ir.schema[ne.name] for ne in pwise_named_exprs},
+            pwise_named_exprs,
             True,  # noqa: FBT003
-            partial_input_ir,
+            input_ir,
         )
-        _partition_info[partial_input_ir] = pi
-        partition_info.update(_partition_info)
-        selections.append(partial_input_ir)
+        partition_info[pwise] = partition_info[input_ir]
+        selections = [pwise, *selections]
+
+    # if single_agg_named_exprs:
+    #     pass
+    #     # pwise = Select(
+    #     #     pwise_schema,
+    #     #     [NamedExpr(k, Col(v, k)) for k, v in pwise_schema.items()],
+    #     #     True,
+    #     #     input_ir,
+    #     # )
+    #     # partition_info[pwise] = partition_info[input_ir]
+    #     # selections = [pwise] + selections
 
     # Concatenate partial selections
     new_ir: HConcat | Select
