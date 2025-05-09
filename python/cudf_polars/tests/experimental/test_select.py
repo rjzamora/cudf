@@ -77,6 +77,8 @@ def test_select_reduce_fallback(df, fallback_mode):
     "aggs",
     [
         (pl.col("a").sum(),),
+        (pl.col("a") + 1, pl.col("b").sum()),
+        (pl.col("a") + 1, pl.col("a").alias("aa").sum()),
         (
             (pl.col("a") + pl.col("b")).sum(),
             (pl.col("a") * 2 + pl.col("b")).alias("d").min(),

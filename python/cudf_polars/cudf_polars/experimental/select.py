@@ -63,39 +63,50 @@ def decompose_select(
     decompose_expr_graph
     """
     # from cudf_polars.typing import Schema
-    # from cudf_polars.experimental.utils import _leaf_column_names
-    # from cudf_polars.dsl.expr import NamedExpr, Col
+    from cudf_polars.dsl.expr import Agg, NamedExpr
+    from cudf_polars.dsl.utils.naming import unique_names
+    from cudf_polars.experimental.groupby import combine, decompose
+    from cudf_polars.experimental.repartition import Repartition
 
-    pwise_named_exprs = []
-    # single_agg_named_exprs = []
+    pwise_named_exprs: list[NamedExpr] = []
+    single_agg_decompositions = []
+    name_generator = unique_names(input_ir.schema.keys())
 
     # Collect partial selections
     selections = []
     for ne in select_ir.exprs:
-        nonpwise = [expr for expr in traversal([ne.value]) if not expr.is_pointwise]
-        if not nonpwise:
+        complex = [expr for expr in traversal([ne.value]) if not expr.is_pointwise]
+        if not complex:
             # Everything is pointwise
             pwise_named_exprs.append(ne)
-        # elif len(nonpwise) == 1 and isinstance(nonpwise[0], Agg):
-        #     # Expr contains a single aggregation.
-        #     # We should try to fuse this with other single-aggregations.
-        #     # TODO: What about BinOp(Agg, Agg)?
-        #     single_agg_named_exprs.append(ne)
-        else:
-            # Decompose this partial expression
-            new_ne, partial_input_ir, _partition_info = decompose_expr_graph(
-                ne, input_ir, partition_info, config_options
-            )
-            pi = _partition_info[partial_input_ir]
-            partial_input_ir = Select(
-                {ne.name: ne.value.dtype},
-                [new_ne],
-                True,  # noqa: FBT003
-                partial_input_ir,
-            )
-            _partition_info[partial_input_ir] = pi
-            partition_info.update(_partition_info)
-            selections.append(partial_input_ir)
+            continue
+        elif isinstance(ne.value, Agg) and complex == [ne.value]:
+            # Expr contains a single aggregation.
+            # We should try to fuse this with other single-aggregations.
+            # TODO: What about more-complex aggregations?
+            # single_agg_named_exprs.append(ne)
+            try:
+                single_agg_decompositions.append(
+                    decompose(ne.name, ne.value, names=name_generator)
+                )
+                continue
+            except NotImplementedError:
+                pass
+
+        # Decompose this partial expression
+        new_ne, partial_input_ir, _partition_info = decompose_expr_graph(
+            ne, input_ir, partition_info, config_options
+        )
+        pi = _partition_info[partial_input_ir]
+        partial_input_ir = Select(
+            {ne.name: ne.value.dtype},
+            [new_ne],
+            True,  # noqa: FBT003
+            partial_input_ir,
+        )
+        _partition_info[partial_input_ir] = pi
+        partition_info.update(_partition_info)
+        selections.append(partial_input_ir)
 
     # Deal with pointwise selections
     if pwise_named_exprs:
@@ -108,16 +119,36 @@ def decompose_select(
         partition_info[pwise] = partition_info[input_ir]
         selections = [pwise, *selections]
 
-    # if single_agg_named_exprs:
-    #     pass
-    #     # pwise = Select(
-    #     #     pwise_schema,
-    #     #     [NamedExpr(k, Col(v, k)) for k, v in pwise_schema.items()],
-    #     #     True,
-    #     #     input_ir,
-    #     # )
-    #     # partition_info[pwise] = partition_info[input_ir]
-    #     # selections = [pwise] + selections
+    if single_agg_decompositions:
+        selection_exprs, piecewise_exprs, reduction_exprs = combine(
+            *single_agg_decompositions
+        )
+        agg_pwise = Select(
+            {k.name: k.value.dtype for k in piecewise_exprs},
+            piecewise_exprs,
+            True,  # noqa: FBT003
+            input_ir,
+        )
+        child_count = partition_info[input_ir].count
+        partition_info[agg_pwise] = PartitionInfo(count=child_count)
+        agg_inter = Repartition(agg_pwise.schema, agg_pwise)
+        partition_info[agg_inter] = PartitionInfo(count=1)
+        agg_reduction = Select(
+            {k.name: k.value.dtype for k in reduction_exprs},
+            reduction_exprs,
+            True,  # noqa: FBT003
+            agg_inter,
+        )
+        partition_info[agg_reduction] = PartitionInfo(count=1)
+        final_exprs = {ne.name: ne for ne in selection_exprs}
+        fused_aggs = Select(
+            {ne.name: ne.value.dtype for ne in final_exprs.values()},
+            [final_exprs[name] for name in select_ir.schema if name in final_exprs],
+            True,  # noqa: FBT003
+            agg_reduction,
+        )
+        partition_info[fused_aggs] = PartitionInfo(count=1)
+        selections = [fused_aggs, *selections]
 
     # Concatenate partial selections
     new_ir: HConcat | Select
