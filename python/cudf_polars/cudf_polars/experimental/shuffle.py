@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import operator
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import pylibcudf as plc
@@ -30,6 +31,9 @@ if TYPE_CHECKING:
 
 # Supported shuffle methods
 _SHUFFLE_METHODS = ("rapidsmpf", "tasks")
+
+
+_LOCAL_SHUFFLES = {}
 
 
 class ShuffleOptions(TypedDict):
@@ -130,6 +134,60 @@ class Shuffle(IR):
         return df
 
 
+def _insert_dataframe(
+    df: DataFrame,
+    keys: tuple[NamedExpr, ...],
+    count: int,
+    shuffle_id: int,
+) -> None:
+    if shuffle_id not in _LOCAL_SHUFFLES:
+        _LOCAL_SHUFFLES[shuffle_id] = defaultdict(list)
+
+    if df.num_rows == 0:
+        # Fast path for empty DataFrame
+        for i in range(count):
+            _LOCAL_SHUFFLES[shuffle_id][i].append(df)
+
+    # Hash the specified keys to calculate the output
+    # partition for each row
+    partition_map = plc.binaryop.binary_operation(
+        plc.hashing.murmurhash3_x86_32(
+            DataFrame([expr.evaluate(df) for expr in keys]).table
+        ),
+        plc.Scalar.from_py(count, plc.DataType(plc.TypeId.UINT32)),
+        plc.binaryop.BinaryOperator.PYMOD,
+        plc.types.DataType(plc.types.TypeId.UINT32),
+    )
+
+    # Apply partitioning
+    t, offsets = plc.partitioning.partition(
+        df.table,
+        partition_map,
+        count,
+    )
+
+    # Split and return the partitioned result
+    for i, split in enumerate(plc.copying.split(t, offsets[1:-1])):
+        _LOCAL_SHUFFLES[shuffle_id][i].append(
+            DataFrame.from_table(
+                split,
+                df.column_names,
+            )
+        )
+
+
+def _barrier(*args):
+    pass
+
+
+def _extract_dataframe(pid: int, shuffle_id: int, barrier: Any) -> DataFrame:
+    # import polars as pl
+    # return DataFrame.from_polars(
+    #     pl.concat(_LOCAL_SHUFFLES[shuffle_id].pop(pid))
+    # )
+    return _concat(*_LOCAL_SHUFFLES[shuffle_id].pop(pid))
+
+
 def _partition_dataframe(
     df: DataFrame,
     keys: tuple[NamedExpr, ...],
@@ -198,10 +256,28 @@ def _simple_shuffle_graph(
     """Make a simple all-to-all shuffle graph."""
     split_name = f"split-{name_out}"
     inter_name = f"inter-{name_out}"
+    barrier_name = f"barrier-{name_out}"
 
     graph: MutableMapping[Any, Any] = {}
-    for part_out in range(count_out):
-        _concat_list = []
+    if True:
+        shuffle_id = hash(name_in)
+        for part_in in range(count_in):
+            graph[(split_name, part_in)] = (
+                _insert_dataframe,
+                (name_in, part_in),
+                keys,
+                count_out,
+                shuffle_id,
+            )
+        graph[barrier_name] = (_barrier, *graph.keys())
+        for part_out in range(count_out):
+            graph[(name_out, part_out)] = (
+                _extract_dataframe,
+                part_out,
+                shuffle_id,
+                barrier_name,
+            )
+    else:
         for part_in in range(count_in):
             graph[(split_name, part_in)] = (
                 _partition_dataframe,
@@ -209,13 +285,16 @@ def _simple_shuffle_graph(
                 keys,
                 count_out,
             )
-            _concat_list.append((inter_name, part_out, part_in))
-            graph[_concat_list[-1]] = (
-                operator.getitem,
-                (split_name, part_in),
-                part_out,
-            )
-        graph[(name_out, part_out)] = (_concat, *_concat_list)
+        for part_out in range(count_out):
+            _concat_list = []
+            for part_in in range(count_in):
+                _concat_list.append((inter_name, part_out, part_in))
+                graph[_concat_list[-1]] = (
+                    operator.getitem,
+                    (split_name, part_in),
+                    part_out,
+                )
+            graph[(name_out, part_out)] = (_concat, *_concat_list)
     return graph
 
 
