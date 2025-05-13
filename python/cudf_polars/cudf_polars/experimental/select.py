@@ -97,6 +97,55 @@ def decompose_select(
     return new_ir, partition_info
 
 
+from collections.abc import Sequence
+
+from cudf_polars.containers import DataFrame
+from cudf_polars.dsl.expr import NamedExpr
+from cudf_polars.dsl.ir import IR, broadcast
+from cudf_polars.typing import Schema
+
+
+class FusedSelect(IR):
+    """Fused selection."""
+
+    __slots__ = ("selections", "should_broadcast")
+    _non_child = ("schema", "selections", "should_broadcast")
+    selections: Sequence[Sequence[NamedExpr]]
+    """List of expressions to evaluate to form the new dataframe."""
+    should_broadcast: Sequence[bool]
+    """Should columns be broadcast?"""
+
+    def __init__(
+        self,
+        schema: Schema,
+        selections: Sequence[Sequence[NamedExpr]],
+        should_broadcast: Sequence[bool],
+        df: IR,
+    ):
+        self.schema = schema
+        self.selections = tuple(tuple(exprs) for exprs in selections)
+        self.should_broadcast = tuple(should_broadcast)
+        self.children = (df,)
+        self._non_child_args = (self.selections, should_broadcast)
+
+    @classmethod
+    def do_evaluate(
+        cls,
+        selections: tuple[tuple[NamedExpr, ...], ...],
+        should_broadcast: tuple[bool, ...],
+        df: DataFrame,
+    ) -> DataFrame:
+        """Evaluate and return a dataframe."""
+        # Handle any broadcasting
+        result = df
+        for exprs, bcast in zip(selections, should_broadcast, strict=False):
+            columns = [e.evaluate(result) for e in exprs]
+            if bcast:
+                columns = broadcast(*columns)
+            result = DataFrame(columns)
+        return result
+
+
 @lower_ir_node.register(Select)
 def _(
     ir: Select, rec: LowerIRTransformer
@@ -116,6 +165,38 @@ def _(
                 ir, rec, msg="This selection is not supported for multiple partitions."
             )
 
-    new_node = ir.reconstruct([child])
+    if False:  # isinstance(child, Select):
+        selections = (child.exprs, ir.exprs)
+        should_broadcast = (child.should_broadcast, ir.should_broadcast)
+        while True:
+            (grandchild,) = child.children
+            selections = (child.exprs, *selections)
+            should_broadcast = (child.should_broadcast, *should_broadcast)
+            if isinstance(grandchild, Select):
+                child = grandchild
+            else:
+                break
+        new_node = FusedSelect(
+            ir.schema,
+            selections,
+            should_broadcast,
+            grandchild,
+        )
+    elif False:  # isinstance(child, FusedSelect):
+        (grandchild,) = child.children
+        new_node = FusedSelect(
+            ir.schema,
+            (*child.selections, ir.exprs),
+            (*child.should_broadcast, ir.should_broadcast),
+            grandchild,
+        )
+    else:
+        # new_node = FusedSelect(
+        #     ir.schema,
+        #     (ir.exprs,),
+        #     (ir.should_broadcast,),
+        #     child,
+        # )
+        new_node = ir.reconstruct([child])
     partition_info[new_node] = pi
     return new_node, partition_info
