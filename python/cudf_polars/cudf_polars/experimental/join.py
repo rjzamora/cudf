@@ -8,6 +8,9 @@ import operator
 from functools import reduce
 from typing import TYPE_CHECKING, Any
 
+import polars as pl
+
+from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import ConditionalJoin, Join
 from cudf_polars.experimental.base import PartitionInfo, get_key_name
 from cudf_polars.experimental.dispatch import generate_ir_tasks, lower_ir_node
@@ -16,7 +19,7 @@ from cudf_polars.experimental.shuffle import Shuffle, _partition_dataframe
 from cudf_polars.experimental.utils import _concat, _fallback_inform, _lower_ir_fallback
 
 if TYPE_CHECKING:
-    from collections.abc import MutableMapping
+    from collections.abc import MutableMapping, Sequence
 
     from cudf_polars.dsl.expr import NamedExpr
     from cudf_polars.dsl.ir import IR
@@ -261,6 +264,37 @@ def _(
         )
 
 
+def _to_device(df: pl.DataFrame | DataFrame) -> DataFrame:
+    """Return DataFrame collection on device."""
+    if isinstance(df, pl.DataFrame):
+        return DataFrame.from_polars(df)
+    return df
+
+
+def _to_host(df: pl.DataFrame | DataFrame) -> pl.DataFrame:
+    """Return DataFrame collection on host."""
+    if isinstance(df, DataFrame):
+        return df.to_polars()
+    return df
+
+
+def _join_wrapper(
+    left_on: Sequence[NamedExpr],
+    right_on: Sequence[NamedExpr],
+    options: Any,
+    left: pl.DataFrame | DataFrame,
+    right: pl.DataFrame | DataFrame,
+) -> DataFrame:
+    """Join DataFrames in device memory."""
+    return Join.do_evaluate(
+        left_on,
+        right_on,
+        options,
+        _to_device(left),
+        _to_device(right),
+    )
+
+
 @generate_ir_tasks.register(Join)
 def _(
     ir: Join, partition_info: MutableMapping[IR, PartitionInfo]
@@ -315,8 +349,18 @@ def _(
         getit_name = f"getit-{out_name}"
         inter_name = f"inter-{out_name}"
 
+        # Split large partitions if necessary
+        split_large = ir.options[0] != "Inner" and small_size > 1
+        if small_size > 2:
+            # Move small partitions to host memory if we are
+            # broadcasting >2 partitions
+            old_small_name = small_name
+            small_name = f"host-{small_name}"
+            for j in range(small_size):
+                graph[(small_name, j)] = (_to_host, (old_small_name, j))
+
         for part_out in range(out_size):
-            if ir.options[0] != "Inner":
+            if split_large:
                 graph[(split_name, part_out)] = (
                     _partition_dataframe,
                     (large_name, part_out),
@@ -327,7 +371,7 @@ def _(
             _concat_list = []
             for j in range(small_size):
                 left_key: tuple[str, int] | tuple[str, int, int]
-                if ir.options[0] != "Inner":
+                if split_large:
                     left_key = (getit_name, part_out, j)
                     graph[left_key] = (operator.getitem, (split_name, part_out), j)
                 else:
@@ -338,7 +382,7 @@ def _(
 
                 inter_key = (inter_name, part_out, j)
                 graph[(inter_name, part_out, j)] = (
-                    ir.do_evaluate,
+                    _join_wrapper,
                     ir.left_on,
                     ir.right_on,
                     ir.options,
