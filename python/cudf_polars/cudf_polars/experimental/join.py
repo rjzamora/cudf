@@ -8,7 +8,9 @@ import operator
 from functools import reduce
 from typing import TYPE_CHECKING, Any
 
-import polars as pl
+import pyarrow as pa
+
+import pylibcudf as plc
 
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import ConditionalJoin, Join
@@ -264,35 +266,50 @@ def _(
         )
 
 
-def _to_device(df: pl.DataFrame | DataFrame) -> DataFrame:
+def _to_device(df: pa.Table | DataFrame) -> DataFrame:
     """Return DataFrame collection on device."""
-    if isinstance(df, pl.DataFrame):
-        return DataFrame.from_polars(df)
+    if isinstance(df, pa.Table):
+        plc_tbl = plc.Table(df)
+        return DataFrame.from_table(plc_tbl, names=df.column_names)
     return df
 
 
-def _to_host(df: pl.DataFrame | DataFrame) -> pl.DataFrame:
+def _to_host(df: pa.Table | DataFrame) -> pa.Table:
     """Return DataFrame collection on host."""
     if isinstance(df, DataFrame):
-        return df.to_polars()
+        return plc.interop.to_arrow(
+            df.table,
+            [plc.interop.ColumnMetadata(name=name) for name in df.column_map],
+        )
     return df
+
+
+def _concat_host(*dfs: pa.Table | DataFrame) -> DataFrame:
+    """Concatenate dataframe containers."""
+    if isinstance(dfs[0], DataFrame):
+        return _concat(*dfs)
+    return _to_device(pa.concat_tables(dfs))
 
 
 def _join_wrapper(
     left_on: Sequence[NamedExpr],
     right_on: Sequence[NamedExpr],
     options: Any,
-    left: pl.DataFrame | DataFrame,
-    right: pl.DataFrame | DataFrame,
+    left: pa.Table | DataFrame,
+    right: pa.Table | DataFrame,
+    on_host: bool,  # noqa: FBT001
 ) -> DataFrame:
     """Join DataFrames in device memory."""
-    return Join.do_evaluate(
+    df = Join.do_evaluate(
         left_on,
         right_on,
         options,
         _to_device(left),
         _to_device(right),
     )
+    if on_host:
+        return _to_host(df)
+    return df
 
 
 @generate_ir_tasks.register(Join)
@@ -351,7 +368,8 @@ def _(
 
         # Split large partitions if necessary
         split_large = ir.options[0] != "Inner" and small_size > 1
-        if small_size > 2:
+        use_host = small_size > 4
+        if use_host:
             # Move small partitions to host memory if we are
             # broadcasting >2 partitions
             old_small_name = small_name
@@ -387,11 +405,12 @@ def _(
                     ir.right_on,
                     ir.options,
                     *join_children,
+                    use_host,
                 )
                 _concat_list.append(inter_key)
             if len(_concat_list) == 1:
                 graph[(out_name, part_out)] = graph.pop(_concat_list[0])
             else:
-                graph[(out_name, part_out)] = (_concat, *_concat_list)
+                graph[(out_name, part_out)] = (_concat_host, *_concat_list)
 
         return graph
