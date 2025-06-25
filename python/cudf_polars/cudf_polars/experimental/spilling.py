@@ -13,11 +13,13 @@ from rapidsmpf.integrations.dask.core import get_worker_context
 from rapidsmpf.integrations.dask.spilling import SpillableWrapper
 
 from cudf_polars.containers import DataFrame
+from cudf_polars.dsl.ir import IR, nvtx_annotate_cudf_polars
 
 if TYPE_CHECKING:
     from collections.abc import Callable, MutableMapping
     from typing import Any
 
+    from cudf_polars.typing import Schema
     from cudf_polars.utils.config import ConfigOptions
 
 
@@ -149,3 +151,43 @@ def wrap_dataframe_in_spillable(
             for a in task
         )
     return ret
+
+
+class WrapSpillable(IR):
+    """Convert data from DataFrame to SpillableWrapper."""
+
+    __slots__ = ()
+    _non_child = ("schema",)
+
+    def __init__(self, schema: Schema, child: IR) -> None:
+        self.schema = schema
+        self._non_child_args = ()
+        self.children = (child,)
+
+    @classmethod
+    @nvtx_annotate_cudf_polars(message="WrapSpillable")
+    def do_evaluate(
+        cls, df: DataFrame | SpillableWrapper
+    ) -> SpillableWrapper:  # pragma: no cover
+        """Evaluate and return a dataframe."""
+        return wrap_arg(df)
+
+
+class UnwrapSpillable(IR):
+    """Convert data from SpillableWrapper to DataFrame."""
+
+    __slots__ = ()
+    _non_child = ("schema",)
+
+    def __init__(self, schema: Schema, child: IR) -> None:
+        self.schema = schema
+        self._non_child_args = ()
+        self.children = (child,)
+
+    @classmethod
+    @nvtx_annotate_cudf_polars(message="UnwrapSpillable")
+    def do_evaluate(
+        cls, df: DataFrame | SpillableWrapper
+    ) -> DataFrame:  # pragma: no cover
+        """Evaluate and return a dataframe."""
+        return unwrap_arg(df)

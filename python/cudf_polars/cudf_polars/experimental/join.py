@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import operator
-from functools import reduce
+from functools import partial, reduce
 from typing import TYPE_CHECKING, Any
 
 from cudf_polars.dsl.ir import ConditionalJoin, Join, Slice
@@ -137,6 +137,34 @@ def _should_bcast_join(
     )
 
 
+def _maybe_wrap_spillable(
+    ir: IR, partition_info: MutableMapping[IR, PartitionInfo]
+) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    try:
+        from cudf_polars.experimental.spilling import WrapSpillable
+
+        if not isinstance(ir, WrapSpillable):
+            new_node = WrapSpillable(ir.schema, ir)
+            partition_info[new_node] = partition_info[ir]
+    except ImportError:
+        pass
+    return ir, partition_info
+
+
+def _maybe_unwrap_spillable(
+    ir: IR, partition_info: MutableMapping[IR, PartitionInfo]
+) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    try:
+        from cudf_polars.experimental.spilling import UnwrapSpillable
+
+        if not isinstance(ir, UnwrapSpillable):
+            new_node = UnwrapSpillable(ir.schema, ir)
+            partition_info[new_node] = partition_info[ir]
+    except ImportError:
+        pass
+    return ir, partition_info
+
+
 def _make_bcast_join(
     ir: Join,
     output_count: int,
@@ -179,8 +207,14 @@ def _make_bcast_join(
                 left_count,
             )
 
-    new_node = ir.reconstruct([left, right])
+    left, partition_info = _maybe_wrap_spillable(left, partition_info)
+    right, partition_info = _maybe_wrap_spillable(right, partition_info)
+
+    new_node: IR = ir.reconstruct([left, right])
     partition_info[new_node] = PartitionInfo(count=output_count)
+
+    new_node, partition_info = _maybe_unwrap_spillable(new_node, partition_info)
+
     return new_node, partition_info
 
 
@@ -299,6 +333,26 @@ def _(
     left, right = ir.children
     output_count = partition_info[ir].count
 
+    try:
+        from cudf_polars.experimental.spilling import WrapSpillable, wrap_func_spillable
+
+        make_spillable = (
+            partial(
+                wrap_func_spillable,
+                make_func_output_spillable=True,
+                target_partition_size=1_000_000_000,
+            )
+            if (isinstance(left, WrapSpillable) or isinstance(right, WrapSpillable))
+            else lambda x: x
+        )
+        _concat_func = make_spillable(_concat)
+        _do_evaluate_func = make_spillable(ir.do_evaluate)
+        _partition_dataframe_func = make_spillable(_partition_dataframe)
+    except ImportError:
+        _concat_func = _concat
+        _do_evaluate_func = ir.do_evaluate
+        _partition_dataframe_func = _partition_dataframe
+
     left_partitioned = (
         partition_info[left].partitioned_on == ir.left_on
         and partition_info[left].count == output_count
@@ -314,7 +368,7 @@ def _(
         right_name = get_key_name(right)
         return {
             key: (
-                ir.do_evaluate,
+                _do_evaluate_func,
                 *ir._non_child_args,
                 (left_name, i),
                 (right_name, i),
@@ -354,7 +408,7 @@ def _(
         for part_out in range(out_size):
             if split_large:
                 graph[(split_name, part_out)] = (
-                    _partition_dataframe,
+                    _partition_dataframe_func,
                     (large_name, part_out),
                     large_on,
                     small_size,
@@ -374,7 +428,7 @@ def _(
 
                 inter_key = (inter_name, part_out, j)
                 graph[(inter_name, part_out, j)] = (
-                    ir.do_evaluate,
+                    _do_evaluate_func,
                     ir.left_on,
                     ir.right_on,
                     ir.options,
@@ -384,6 +438,6 @@ def _(
             if len(_concat_list) == 1:
                 graph[(out_name, part_out)] = graph.pop(_concat_list[0])
             else:
-                graph[(out_name, part_out)] = (_concat, *_concat_list)
+                graph[(out_name, part_out)] = (_concat_func, *_concat_list)
 
         return graph
