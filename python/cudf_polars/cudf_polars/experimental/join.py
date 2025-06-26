@@ -140,6 +140,7 @@ def _should_bcast_join(
 def _maybe_wrap_spillable(
     ir: IR, partition_info: MutableMapping[IR, PartitionInfo]
 ) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    new_node: IR
     try:
         from cudf_polars.experimental.spilling import WrapSpillable
 
@@ -147,13 +148,14 @@ def _maybe_wrap_spillable(
             new_node = WrapSpillable(ir.schema, ir)
             partition_info[new_node] = partition_info[ir]
     except ImportError:
-        pass
-    return ir, partition_info
+        new_node = ir
+    return new_node, partition_info
 
 
 def _maybe_unwrap_spillable(
     ir: IR, partition_info: MutableMapping[IR, PartitionInfo]
 ) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    new_node: IR
     try:
         from cudf_polars.experimental.spilling import UnwrapSpillable
 
@@ -161,8 +163,8 @@ def _maybe_unwrap_spillable(
             new_node = UnwrapSpillable(ir.schema, ir)
             partition_info[new_node] = partition_info[ir]
     except ImportError:
-        pass
-    return ir, partition_info
+        new_node = ir
+    return new_node, partition_info
 
 
 def _make_bcast_join(
