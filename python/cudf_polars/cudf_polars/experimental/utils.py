@@ -118,9 +118,9 @@ def _get_unique_fractions(
         if (
             c in column_names
             and c not in unique_fractions
-            and (source_stats := stats.source_stats) is not None
-            and source_stats.unique_fraction is not None
+            and (source_stats := stats.source) is not None
+            and source_stats.unique_stats(c).fraction is not None
         ):
-            unique_fractions[c] = source_stats.unique_fraction
+            unique_fractions[c] = source_stats.unique_stats(c).fraction
 
     return unique_fractions

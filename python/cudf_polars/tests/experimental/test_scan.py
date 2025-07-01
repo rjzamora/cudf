@@ -111,20 +111,20 @@ def test_column_source_statistics(
     q1 = q.select(pl.col("x"), pl.col("y"))
     qir1 = Translator(q1._ldf.visit(), engine).translate_ir()
     stats = collect_source_stats(qir1, ConfigOptions.from_polars_engine(engine))
-    source_stats_y = stats.column_stats[qir1]["y"].source_stats
-    y_unique_fraction = source_stats_y.unique_fraction
+    source_stats_y = stats.column_stats[qir1]["y"].source
+    y_unique_fraction = source_stats_y.unique_stats("y").fraction
     y_cardinality = source_stats_y.cardinality
     assert y_unique_fraction < 1.0
     assert y_unique_fraction > 0.0
-    assert source_stats_y.unique_count is None
+    assert source_stats_y.unique_stats("y").count is None
     if parquet_metadata_samples >= n_files:
         # We should have "exact" cardinality statistics
         assert y_cardinality == df.height
-        assert "cardinality" in source_stats_y.exact
+        assert source_stats_y.exact_cardinality
     else:
         # We should have "estimated" cardinality statistics
         assert y_cardinality > 0
-        assert "cardinality" not in source_stats_y.exact
+        assert not source_stats_y.exact_cardinality
     assert_gpu_result_equal(q1.sort(pl.col("x")).slice(0, 2), engine=engine)
 
     # Source statistics of "y" should match after GroupBy/Select/HStack/etc
@@ -143,7 +143,7 @@ def test_column_source_statistics(
     )
     qir2 = Translator(q2._ldf.visit(), engine).translate_ir()
     stats = collect_source_stats(qir2, ConfigOptions.from_polars_engine(engine))
-    source_stats_y = stats.column_stats[qir2]["y"].source_stats
-    assert source_stats_y.unique_fraction == y_unique_fraction
+    source_stats_y = stats.column_stats[qir2]["y"].source
+    assert source_stats_y.unique_stats("y").fraction == y_unique_fraction
     assert y_cardinality == source_stats_y.cardinality
     assert_gpu_result_equal(q2.sort(pl.col("y")).slice(0, 2), engine=engine)

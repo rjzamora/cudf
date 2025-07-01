@@ -12,25 +12,21 @@ from cudf_polars.dsl import expr
 from cudf_polars.dsl.ir import (
     IR,
     Cache,
-    DataFrameScan,
     GroupBy,
     HConcat,
     HStack,
     Join,
     Projection,
-    Scan,
     Select,
     Sort,
     Union,
 )
 from cudf_polars.dsl.traversal import post_traversal
 from cudf_polars.experimental.base import (
-    ColumnSourceStats,
     ColumnStats,
     StatsCollector,
 )
 from cudf_polars.experimental.dispatch import add_source_stats
-from cudf_polars.experimental.io import _sample_pq_stats
 
 if TYPE_CHECKING:
     from cudf_polars.utils.config import ConfigOptions
@@ -57,55 +53,6 @@ def _(ir: IR, stats: StatsCollector, config_options: ConfigOptions) -> None:
     else:
         # Multi-child nodes loose all information by default.
         stats.column_stats[ir] = {name: ColumnStats(name=name) for name in ir.schema}
-
-
-@add_source_stats.register(Scan)
-def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
-    if ir.typ == "parquet":
-        stats.column_stats[ir] = {
-            name: ColumnStats(
-                name=name,
-                source_stats=css,
-            )
-            for name, css in _sample_pq_stats(ir, config_options).items()
-        }
-        if (
-            stats.column_stats[ir]
-            and (
-                (
-                    source_stats := next(
-                        iter(stats.column_stats[ir].values())
-                    ).source_stats
-                )
-                is not None
-            )
-            and source_stats.cardinality
-        ):
-            stats.cardinality[ir] = source_stats.cardinality
-    else:
-        stats.column_stats[ir] = {
-            name: ColumnStats(
-                name=name,
-                source_stats=ColumnSourceStats(),
-            )
-            for name in ir.schema
-        }
-
-
-@add_source_stats.register(DataFrameScan)
-def _(ir: DataFrameScan, stats: StatsCollector, config_options: ConfigOptions) -> None:
-    nrows = ir.df.height()
-    stats.column_stats[ir] = {
-        name: ColumnStats(
-            name=name,
-            source_stats=ColumnSourceStats(
-                cardinality=nrows,
-                exact=("cardinality",),
-            ),
-        )
-        for name in ir.schema
-    }
-    stats.cardinality[ir] = nrows
 
 
 @add_source_stats.register(Join)

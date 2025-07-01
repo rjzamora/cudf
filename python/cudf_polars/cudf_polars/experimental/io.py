@@ -19,20 +19,24 @@ import pylibcudf as plc
 
 from cudf_polars.dsl.ir import IR, DataFrameScan, Scan, Sink, Union
 from cudf_polars.experimental.base import (
-    ColumnSourceStats,
+    ColumnStats,
+    DataSourceStats,
     PartitionInfo,
     StatsCollector,
-    UniqueSourceStats,
+    UniqueStats,
     get_key_name,
 )
-from cudf_polars.experimental.dispatch import generate_ir_tasks, lower_ir_node
+from cudf_polars.experimental.dispatch import (
+    add_source_stats,
+    generate_ir_tasks,
+    lower_ir_node,
+)
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping, Sequence
 
     from cudf_polars.containers import DataFrame
     from cudf_polars.dsl.expr import NamedExpr
-    from cudf_polars.experimental.base import ColumnStats
     from cudf_polars.experimental.dispatch import LowerIRTransformer
     from cudf_polars.typing import Schema
     from cudf_polars.utils.config import ConfigOptions, ParquetOptions
@@ -120,10 +124,10 @@ class ScanPartitionPlan:
             for name, cs in column_stats.items():
                 if (
                     name in ir.schema
-                    and cs.source_stats is not None
-                    and cs.source_stats.storage_size_per_file is not None
+                    and cs.source is not None
+                    and cs.source.file_storage_size(cs.name) is not None
                 ):
-                    column_sizes.append(cs.source_stats.storage_size_per_file)
+                    column_sizes.append(cs.source.file_storage_size(cs.name))
 
             if (file_size := sum(column_sizes)) > 0:
                 if file_size > blocksize:
@@ -279,41 +283,89 @@ class SplitScan(IR):
         )
 
 
-class UniqueSamplerPq:
-    """
-    Unique-value Parquet sampler.
+class DataFrameDataSourceStats(DataSourceStats):
+    """In-memory DataFrame statistics sampler."""
 
-    Parameters
-    ----------
-    paths
-        Sample paths.
-    cardinality
-        Full dataset cardinality.
-    num_row_groups_per_file
-        Number of row-groups in each sampled file.
-    max_rg_samples
-        Maximum number of row-groups to read.
-    """
+    def __init__(self, df: DataFrame):
+        self._cardinality = cardinality
+
+    @property
+    def cardinality(self) -> int:
+        return self._cardinality
+
+
+class PqDataSourceStats(DataSourceStats):
+    """Lazy Parquet datasource sampler."""
 
     def __init__(
         self,
         paths: tuple[str, ...],
-        cardinality: int,
-        num_row_groups_per_file: Sequence[int],
+        max_file_samples: int,
         max_rg_samples: int,
     ):
         self.paths = paths
-        self.cardinality = cardinality
-        self.num_row_groups_per_file = num_row_groups_per_file
+        self.max_file_samples = max_file_samples
         self.max_rg_samples = max_rg_samples
-        self.missing_columns: set[str] = set()
-        self.stats: dict[str, UniqueSourceStats] = {}
 
-    def _collect(self) -> None:
-        """Collect unique-value statistics."""
+        self._key_columns: set[str] = set()
+        self._unique_stats: dict[str, UniqueStats] = {}
+        self._exact_cardinality: bool = False
+        self._cardinality: int | None = None
+        self._num_row_groups_per_file: Sequence[int] | None = None
+        self._mean_size_per_file: dict[str, int] | None = None
+
+    def _sample_metadata(self) -> None:
+        total_file_count = len(self.paths)
+        stride = max(1, int(total_file_count / self.max_file_samples))
+        sample_paths = self.paths[: stride * self.max_file_samples : stride]
+        sampled_file_count = len(sample_paths)
+        exact_cardinality: bool = False
+
+        sample_metadata = plc.io.parquet_metadata.read_parquet_metadata(
+            plc.io.SourceInfo(list(sample_paths))
+        )
+
+        if total_file_count == sampled_file_count:
+            # We know the "exact" cardinality from our sample
+            cardinality = sample_metadata.num_rows()
+            exact_cardinality = True
+        else:
+            # We must estimate/extrapolate the cardinality from our sample
+            num_rows_per_sampled_file = int(
+                sample_metadata.num_rows() / sampled_file_count
+            )
+            cardinality = num_rows_per_sampled_file * total_file_count
+
+        num_row_groups_per_sampled_file = sample_metadata.num_rowgroups_per_file()
+        rowgroup_offsets_per_file = list(
+            itertools.accumulate(num_row_groups_per_sampled_file, initial=0)
+        )
+
+        column_sizes_per_file = {
+            name: [
+                sum(uncompressed_sizes[start:end])
+                for (start, end) in itertools.pairwise(rowgroup_offsets_per_file)
+            ]
+            for name, uncompressed_sizes in sample_metadata.columnchunk_metadata().items()
+        }
+
+        self._mean_size_per_file = {
+            name: statistics.mean(sizes)
+            for name, sizes in column_sizes_per_file.items()
+        }
+        self._num_row_groups_per_file = num_row_groups_per_sampled_file
+        self._cardinality = cardinality
+        self._exact_cardinality = exact_cardinality
+
+    def _sample_row_groups(self):
+        if self._cardinality is None:
+            self._sample_metadata()
+
         n = 0
         samples: defaultdict[str, list[int]] = defaultdict(list)
-        for path, num_rgs in zip(self.paths, self.num_row_groups_per_file, strict=True):
+        for path, num_rgs in zip(
+            self.paths, self._num_row_groups_per_file, strict=True
+        ):
             for rg_id in range(num_rgs):
                 n += 1
                 samples[path].append(rg_id)
@@ -325,7 +377,7 @@ class UniqueSamplerPq:
         options = plc.io.parquet.ParquetReaderOptions.builder(
             plc.io.SourceInfo(list(samples))
         ).build()
-        options.set_columns(list(self.missing_columns))
+        options.set_columns(list(self._key_columns))
         options.set_row_groups(list(samples.values()))
         tbl_w_meta = plc.io.parquet.read_parquet(options)
         row_group_num_rows = tbl_w_meta.tbl.num_rows()
@@ -354,39 +406,149 @@ class UniqueSamplerPq:
             if row_group_unique_count == row_group_num_rows:
                 result["count"] = self.cardinality
 
-            self.stats[name] = UniqueSourceStats(**result)
+            self._unique_stats[name] = UniqueStats(**result)
 
-    def add_columns(self, names: Sequence[str]) -> None:
-        """
-        Lazily add columns needing unique-value statistics.
+    def file_storage_size(self, column: str) -> int:
+        if self._mean_size_per_file is None:
+            self._sample_metadata()
+        return self._mean_size_per_file[column]
 
-        Parameters
-        ----------
-        names
-            Column names to add.
-        """
-        for name in names:
-            if name not in self.missing_columns and name not in self.stats:
-                self.missing_columns.add(name)
+    @property
+    def cardinality(self) -> int:
+        if self._cardinality is None:
+            self._sample_metadata()
+        return self._cardinality
 
-    def __call__(self, name: str) -> UniqueSourceStats | None:
-        """
-        Get unique-value statistics.
+    @property
+    def exact_cardinality(self) -> bool:
+        return self._exact_cardinality
 
-        Parameters
-        ----------
-        name
-            Column name to extract statistics for.
-        """
+    def unique_stats(self, column: str) -> UniqueStats:
         if self.max_rg_samples < 1:
-            return None  # pragma: no cover
+            return UniqueStats()  # pragma: no cover
 
-        if name not in self.stats:
-            self.add_columns([name])
-            self._collect()
-            self.missing_columns = set()
-        assert name in self.stats, f"Failed to sample column {name}"
-        return self.stats[name]
+        if column not in self._unique_stats:
+            self.add_keys([column])
+            self._sample_row_groups()
+            self._key_columns = set()
+
+        assert column in self._unique_stats, f"Failed to sample column {column}"
+        return self._unique_stats[column]
+
+    def add_keys(self, columns: Sequence[str]) -> None:
+        for name in columns:
+            if name not in self._key_columns and name not in self._unique_stats:
+                self._key_columns.add(name)
+
+
+# class UniqueSamplerPq:
+#     """
+#     Unique-value Parquet sampler.
+
+#     Parameters
+#     ----------
+#     paths
+#         Sample paths.
+#     cardinality
+#         Full dataset cardinality.
+#     num_row_groups_per_file
+#         Number of row-groups in each sampled file.
+#     max_rg_samples
+#         Maximum number of row-groups to read.
+#     """
+
+#     def __init__(
+#         self,
+#         paths: tuple[str, ...],
+#         cardinality: int,
+#         num_row_groups_per_file: Sequence[int],
+#         max_rg_samples: int,
+#     ):
+#         self.paths = paths
+#         self.cardinality = cardinality
+#         self.num_row_groups_per_file = num_row_groups_per_file
+#         self.max_rg_samples = max_rg_samples
+#         self.missing_columns: set[str] = set()
+#         self.stats: dict[str, UniqueSourceStats] = {}
+
+#     def _collect(self) -> None:
+#         """Collect unique-value statistics."""
+#         n = 0
+#         samples: defaultdict[str, list[int]] = defaultdict(list)
+#         for path, num_rgs in zip(self.paths, self.num_row_groups_per_file, strict=True):
+#             for rg_id in range(num_rgs):
+#                 n += 1
+#                 samples[path].append(rg_id)
+#                 if n == self.max_rg_samples:
+#                     break
+#             if n == self.max_rg_samples:
+#                 break
+
+#         options = plc.io.parquet.ParquetReaderOptions.builder(
+#             plc.io.SourceInfo(list(samples))
+#         ).build()
+#         options.set_columns(list(self.missing_columns))
+#         options.set_row_groups(list(samples.values()))
+#         tbl_w_meta = plc.io.parquet.read_parquet(options)
+#         row_group_num_rows = tbl_w_meta.tbl.num_rows()
+#         for name, column in zip(
+#             tbl_w_meta.column_names(), tbl_w_meta.columns, strict=True
+#         ):
+#             row_group_unique_count = plc.stream_compaction.distinct_count(
+#                 column,
+#                 plc.types.NullPolicy.INCLUDE,
+#                 plc.types.NanPolicy.NAN_IS_NULL,
+#             )
+#             result = {
+#                 "fraction": max(
+#                     min(1.0, row_group_unique_count / row_group_num_rows),
+#                     0.00001,
+#                 )
+#             }
+#             # Assume that if every row is unique then this is a
+#             # primary key otherwise it's a foreign key and we
+#             # can't use the single row group count estimate
+#             # Example, consider a "foreign" key that has 100
+#             # unique values. If we sample from a single row group,
+#             # we likely obtain a unique count of 100. But we can't
+#             # necessarily deduce that that means that the unique
+#             # count is 100 / num_rows_in_group * num_rows_in_file
+#             if row_group_unique_count == row_group_num_rows:
+#                 result["count"] = self.cardinality
+
+#             self.stats[name] = UniqueSourceStats(**result)
+
+#     def add_columns(self, names: Sequence[str]) -> None:
+#         """
+#         Lazily add columns needing unique-value statistics.
+
+#         Parameters
+#         ----------
+#         names
+#             Column names to add.
+#         """
+#         for name in names:
+#             if name not in self.missing_columns and name not in self.stats:
+#                 self.missing_columns.add(name)
+
+#     def __call__(self, name: str) -> UniqueSourceStats | None:
+#         """
+#         Get unique-value statistics.
+
+#         Parameters
+#         ----------
+#         name
+#             Column name to extract statistics for.
+#         """
+#         if self.max_rg_samples < 1:
+#             return None  # pragma: no cover
+
+#         if name not in self.stats:
+#             self.add_columns([name])
+#             self._collect()
+#             self.missing_columns = set()
+#         assert name in self.stats, f"Failed to sample column {name}"
+#         return self.stats[name]
 
 
 @functools.lru_cache(maxsize=10)
@@ -394,7 +556,9 @@ def _sample_pq_stats_impl(
     paths: tuple[str, ...],
     max_file_samples: int,
     max_rg_samples: int,
-) -> tuple[UniqueSamplerPq, dict[str, ColumnSourceStats]]:
+) -> PqDataSourceStats:
+    return PqDataSourceStats(paths, max_file_samples, max_rg_samples)
+
     total_file_count = len(paths)
     stride = max(1, int(total_file_count / max_file_samples))
     sample_paths = paths[: stride * max_file_samples : stride]
@@ -453,14 +617,12 @@ def _sample_pq_stats_impl(
     }
 
 
-def _sample_pq_stats(
-    ir: Scan, config_options: ConfigOptions
-) -> dict[str, ColumnSourceStats]:
+def _sample_pq_stats(ir: Scan, config_options: ConfigOptions) -> PqDataSourceStats:
     assert config_options.executor.name == "streaming", (
         "'in-memory' executor not supported in '_sample_pq_stats"
     )
 
-    unique_sampler, stats = _sample_pq_stats_impl(
+    sampler = _sample_pq_stats_impl(
         tuple(ir.paths),
         config_options.executor.parquet_metadata_samples,
         config_options.executor.parquet_rowgroup_samples,
@@ -468,9 +630,9 @@ def _sample_pq_stats(
 
     # For now, just sample all columns if/when we are
     # reading the data anyway.
-    unique_sampler.add_columns(list(ir.schema))
+    sampler.add_keys(list(ir.schema))
 
-    return stats
+    return sampler
 
 
 @lower_ir_node.register(Scan)
@@ -548,6 +710,37 @@ def _(
         return new_node, partition_info
 
     return ir, {ir: PartitionInfo(count=1)}  # pragma: no cover
+
+
+@add_source_stats.register(Scan)
+def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
+    if ir.typ == "parquet":
+        sampler = _sample_pq_stats(ir, config_options)
+        stats.column_stats[ir] = {
+            name: ColumnStats(
+                name=name,
+                source=sampler,
+                source_name=name,
+            )
+            for name in ir.schema
+        }
+        stats.cardinality[ir] = sampler.cardinality
+    else:
+        stats.column_stats[ir] = {name: ColumnStats(name=name) for name in ir.schema}
+
+
+@add_source_stats.register(DataFrameScan)
+def _(ir: DataFrameScan, stats: StatsCollector, config_options: ConfigOptions) -> None:
+    sampler = DataFrameDataSourceStats(ir.df)
+    stats.column_stats[ir] = {
+        name: ColumnStats(
+            name=name,
+            source=sampler,
+            source_name=name,
+        )
+        for name in ir.schema
+    }
+    stats.cardinality[ir] = sampler.cardinality
 
 
 @lower_ir_node.register(Sink)
