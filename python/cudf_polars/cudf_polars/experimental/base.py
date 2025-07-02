@@ -76,88 +76,25 @@ class DataSourceStats:
 
     @property
     def cardinality(self) -> int | None:
+        """Datasource cardinality estimate."""
         return None
 
     @property
     def exact_cardinality(self) -> bool:
+        """Whether the cardinality estimate is exact."""
         return False
 
-    def file_storage_size(self, column: str) -> int | None:
+    def mean_storage_size(self, column: str) -> int | None:
+        """Return the average column size across all files."""
         return None
 
     def unique_stats(self, column: str) -> UniqueStats | None:
+        """Return unique-value statistics for a column."""
         return None
 
     def add_keys(self, columns: Sequence[str]) -> None:
+        """Specify column names needing unique-value statistics."""
         raise NotImplementedError()
-
-
-# class ColumnSourceStats:
-#     """
-#     Column source statistics.
-
-#     Parameters
-#     ----------
-#     cardinality
-#         Cardinality (row count).
-#     unique_stats
-#         Unique-value statistics.
-#     storage_size_per_file
-#         Average un-compressed storage size for this
-#         column in a single file. This value is used to
-#         calculate the partition count for an IR node.
-#     exact
-#         Tuple of attributes that have not been estimated
-#         by partial sampling, and are known exactly,
-
-#     Notes
-#     -----
-#     Source statistics are statistics coming from "source"
-#     nodes like ``Scan` and ``DataFrameScan``.
-#     """
-
-#     __slots__ = (
-#         "_unique_stats",
-#         "cardinality",
-#         "exact",
-#         "storage_size_per_file",
-#     )
-
-#     def __init__(
-#         self,
-#         *,
-#         cardinality: int | None = None,
-#         storage_size_per_file: int | None = None,
-#         exact: tuple[str, ...] = (),
-#         unique_stats: Any = None,
-#     ):
-#         self.cardinality = cardinality
-#         self.storage_size_per_file = storage_size_per_file
-#         self.exact = exact
-#         self._unique_stats: Callable[..., UniqueSourceStats] | UniqueSourceStats
-#         if unique_stats is None:
-#             self._unique_stats = UniqueSourceStats()
-#         elif isinstance(unique_stats, UniqueSourceStats) or callable(unique_stats):
-#             self._unique_stats = unique_stats
-#         else:  # pragma: no cover
-#             raise TypeError(f"Unexpected unique_stats argument, got {unique_stats}")
-
-#     @property
-#     def unique_stats(self) -> UniqueSourceStats:
-#         """Get unique-value statistics."""
-#         if callable(self._unique_stats):
-#             return self._unique_stats()
-#         return self._unique_stats
-
-#     @property
-#     def unique_count(self) -> int | None:
-#         """Get unique count."""
-#         return self.unique_stats.count
-
-#     @property
-#     def unique_fraction(self) -> float | None:
-#         """Get unique fraction."""
-#         return self.unique_stats.fraction
 
 
 class ColumnStats:
@@ -168,13 +105,14 @@ class ColumnStats:
     ----------
     name
         Column name.
+    source
+        Datasource statistics.
+    source_name
+        Source-column name.
     unique_count
         Unique-count estimate.
-    source_stats
-        Column-source statistics.
     """
 
-    # __slots__ = ("name", "source_stats", "unique_count")
     __slots__ = ("name", "source", "source_name", "unique_count")
 
     def __init__(
@@ -184,13 +122,11 @@ class ColumnStats:
         source: DataSourceStats | None = None,
         source_name: str | None = None,
         unique_count: int | None = None,
-        # source_stats: ColumnSourceStats | None = None,
     ) -> None:
         self.name = name
         self.source = source
         self.source_name = source_name
         self.unique_count = unique_count
-        # self.source_stats = source_stats
 
 
 class StatsCollector:

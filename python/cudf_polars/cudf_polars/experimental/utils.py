@@ -115,12 +115,18 @@ def _get_unique_fractions(
 
     # Update with table statistics
     for c, stats in column_stats.items():
+        if c in column_names and c not in unique_fractions and stats.source is not None:
+            stats.source.add_keys([stats.source_name or c])
+
+    for c, stats in column_stats.items():
         if (
             c in column_names
             and c not in unique_fractions
             and (source_stats := stats.source) is not None
-            and source_stats.unique_stats(c).fraction is not None
+            and source_stats.unique_stats(stats.source_name or c).fraction is not None
         ):
-            unique_fractions[c] = source_stats.unique_stats(c).fraction
+            unique_fractions[c] = source_stats.unique_stats(
+                stats.source_name or c
+            ).fraction
 
     return unique_fractions
