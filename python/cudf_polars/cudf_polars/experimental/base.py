@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterator, Sequence
+    from collections.abc import Generator, Iterator
 
     from cudf_polars.dsl.expr import NamedExpr
     from cudf_polars.dsl.ir import IR
@@ -92,8 +92,8 @@ class DataSourceStats:
         """Return unique-value statistics for a column."""
         return None
 
-    def add_keys(self, columns: Sequence[str]) -> None:
-        """Specify column names needing unique-value statistics."""
+    def add_key(self, column: str) -> None:
+        """Add a column needing unique-value statistics."""
         raise NotImplementedError()
 
 

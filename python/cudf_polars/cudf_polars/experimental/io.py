@@ -122,14 +122,12 @@ class ScanPartitionPlan:
             )
 
             blocksize: int = config_options.executor.target_partition_size
-            column_sizes = []
+            column_sizes: list[int] = []
             for name, cs in column_stats.items():
-                if (
-                    name in ir.schema
-                    and cs.source is not None
-                    and cs.source.mean_storage_size(cs.name) is not None
-                ):
-                    column_sizes.append(cs.source.mean_storage_size(cs.name))
+                if name in ir.schema and cs.source is not None:
+                    storage_size = cs.source.mean_storage_size(name)
+                    if storage_size is not None:
+                        column_sizes.append(storage_size)
 
             if (file_size := sum(column_sizes)) > 0:
                 if file_size > blocksize:
@@ -296,7 +294,7 @@ class DataFrameDataSourceStats(DataSourceStats):
     """
 
     def __init__(self, df: Any):
-        self.df = pl.DataFrame._from_pydf(df)
+        self.df = df
         self._unique_stats: dict[str, UniqueStats] = {}
 
     @functools.cached_property
@@ -309,16 +307,17 @@ class DataFrameDataSourceStats(DataSourceStats):
         """Whether the cardinality estimate is exact."""
         return True
 
-    def unique_stats(self, column: str) -> UniqueStats:
+    def unique_stats(self, column: str) -> UniqueStats | None:
         """Return unique-value statistics for a column."""
         if column not in self._unique_stats:
-            count = self.df.n_unique(subset=[column])
+            count = pl.DataFrame._from_pydf(self.df).n_unique(subset=[column])
             fraction = max(min(count / self.cardinality, 1.0), 0.00001)
             self._unique_stats[column] = UniqueStats(count=count, fraction=fraction)
-        return self._unique_stats[column]
+        return self._unique_stats.get(column)
 
-    def add_keys(self, columns: Sequence[str]) -> None:
-        """Specify column names needing unique-value statistics."""
+    def add_key(self, column: str) -> None:
+        """Add a column needing unique-value statistics."""
+        # Nothing to do for an in-memory DataFrame
 
 
 class PqDataSourceStats(DataSourceStats):
@@ -396,10 +395,11 @@ class PqDataSourceStats(DataSourceStats):
         self._cardinality = cardinality
         self._exact_cardinality = exact_cardinality
 
-    def _sample_row_groups(self):
+    def _sample_row_groups(self) -> None:
         """Estimate unique-value statistics from a row-group sample."""
         if self._cardinality is None:
             self._sample_metadata()
+        assert self._num_row_groups_per_file is not None, "metadata sampling failed."
 
         n = 0
         samples: defaultdict[str, list[int]] = defaultdict(list)
@@ -449,7 +449,7 @@ class PqDataSourceStats(DataSourceStats):
             self._unique_stats[name] = UniqueStats(**result)
 
     @property
-    def cardinality(self) -> int:
+    def cardinality(self) -> int | None:
         """Datasource cardinality estimate."""
         if self._cardinality is None:
             self._sample_metadata()
@@ -460,30 +460,29 @@ class PqDataSourceStats(DataSourceStats):
         """Whether the cardinality estimate is exact."""
         return self._exact_cardinality
 
-    def mean_storage_size(self, column: str) -> int:
+    def mean_storage_size(self, column: str) -> int | None:
         """Return the average column size across all files."""
         if self._mean_size_per_file is None:
             self._sample_metadata()
-        return self._mean_size_per_file[column]
+        assert self._mean_size_per_file is not None
+        return self._mean_size_per_file.get(column)
 
-    def unique_stats(self, column: str) -> UniqueStats:
+    def unique_stats(self, column: str) -> UniqueStats | None:
         """Return unique-value statistics for a column."""
         if self.max_rg_samples < 1:
             return UniqueStats()  # pragma: no cover
 
         if column not in self._unique_stats:
-            self.add_keys([column])
+            self.add_key(column)
             self._sample_row_groups()
             self._key_columns = set()
 
-        assert column in self._unique_stats, f"Failed to sample column {column}"
-        return self._unique_stats[column]
+        return self._unique_stats.get(column)
 
-    def add_keys(self, columns: Sequence[str]) -> None:
-        """Specify column names needing unique-value statistics."""
-        for name in columns:
-            if name not in self._key_columns and name not in self._unique_stats:
-                self._key_columns.add(name)
+    def add_key(self, column: str) -> None:
+        """Add a column needing unique-value statistics."""
+        if column not in self._key_columns and column not in self._unique_stats:
+            self._key_columns.add(column)
 
 
 @functools.lru_cache(maxsize=10)
@@ -592,7 +591,8 @@ def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
             )
             for name in ir.schema
         }
-        stats.cardinality[ir] = sampler.cardinality
+        if sampler.cardinality is not None:
+            stats.cardinality[ir] = sampler.cardinality
     else:
         stats.column_stats[ir] = {name: ColumnStats(name=name) for name in ir.schema}
 

@@ -101,6 +101,24 @@ def _leaf_column_names(expr: Expr) -> tuple[str, ...]:
         return ()
 
 
+def _update_source_keys(
+    child_column_stats: dict[str, ColumnStats],
+    key_names: Sequence[str],
+    config_options: ConfigOptions,
+) -> None:
+    assert config_options.executor.name == "streaming", (
+        "'in-memory' executor not supported in 'add_source_stats'"
+    )
+    unique_fraction = config_options.executor.unique_fraction
+    for name in key_names:
+        if (
+            name not in unique_fraction
+            and (column_stats := child_column_stats.get(name)) is not None
+            and (source_stats := column_stats.source) is not None
+        ):
+            source_stats.add_key(column_stats.source_name or name)
+
+
 def _get_unique_fractions(
     column_names: Sequence[str],
     user_unique_fractions: dict[str, float],
@@ -115,18 +133,11 @@ def _get_unique_fractions(
 
     # Update with table statistics
     for c, stats in column_stats.items():
-        if c in column_names and c not in unique_fractions and stats.source is not None:
-            stats.source.add_keys([stats.source_name or c])
-
-    for c, stats in column_stats.items():
-        if (
-            c in column_names
-            and c not in unique_fractions
-            and (source_stats := stats.source) is not None
-            and source_stats.unique_stats(stats.source_name or c).fraction is not None
-        ):
-            unique_fractions[c] = source_stats.unique_stats(
-                stats.source_name or c
-            ).fraction
+        source_stats = stats.source
+        name = stats.source_name or c
+        if c in column_names and c not in unique_fractions and source_stats is not None:
+            unique_stats = source_stats.unique_stats(name)
+            if unique_stats is not None and unique_stats.fraction is not None:
+                unique_fractions[c] = unique_stats.fraction
 
     return unique_fractions

@@ -12,6 +12,7 @@ from cudf_polars.dsl import expr
 from cudf_polars.dsl.ir import (
     IR,
     Cache,
+    Distinct,
     GroupBy,
     HConcat,
     HStack,
@@ -27,6 +28,7 @@ from cudf_polars.experimental.base import (
     StatsCollector,
 )
 from cudf_polars.experimental.dispatch import add_source_stats
+from cudf_polars.experimental.utils import _update_source_keys
 
 if TYPE_CHECKING:
     from cudf_polars.utils.config import ConfigOptions
@@ -40,8 +42,9 @@ def collect_source_stats(root: IR, config_options: ConfigOptions) -> StatsCollec
     return stats
 
 
-@add_source_stats.register(IR)
-def _(ir: IR, stats: StatsCollector, config_options: ConfigOptions) -> None:
+def _default_add_source_stats(
+    ir: IR, stats: StatsCollector, config_options: ConfigOptions
+) -> None:
     # Default `add_source_stats` implementation.
     if len(ir.children) == 1:
         (child,) = ir.children
@@ -53,6 +56,18 @@ def _(ir: IR, stats: StatsCollector, config_options: ConfigOptions) -> None:
     else:
         # Multi-child nodes loose all information by default.
         stats.column_stats[ir] = {name: ColumnStats(name=name) for name in ir.schema}
+
+
+add_source_stats.register(IR, _default_add_source_stats)
+
+
+@add_source_stats.register(Distinct)
+def _(ir: Distinct, stats: StatsCollector, config_options: ConfigOptions) -> None:
+    (child,) = ir.children
+    child_column_stats = stats.column_stats.get(child, {})
+    key_names = ir.subset or ir.schema
+    _update_source_keys(child_column_stats, list(key_names), config_options)
+    _default_add_source_stats(ir, stats, config_options)
 
 
 @add_source_stats.register(Join)
@@ -84,6 +99,10 @@ def _(ir: Join, stats: StatsCollector, config_options: ConfigOptions) -> None:
 def _(ir: GroupBy, stats: StatsCollector, config_options: ConfigOptions) -> None:
     (child,) = ir.children
     child_column_stats = stats.column_stats.get(child, {})
+
+    # Update set of source columns we may lazily sample
+    _update_source_keys(child_column_stats, [n.name for n in ir.keys], config_options)
+
     stats.column_stats[ir] = {
         n.name: child_column_stats.get(n.name, ColumnStats(name=n.name))
         for n in ir.keys
