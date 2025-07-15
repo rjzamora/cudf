@@ -263,34 +263,36 @@ def _(
     # Try using rapidsmpf shuffler if we have "simple" shuffle
     # keys, and the "shuffle_method" config is set to "rapidsmpf"
     _keys: list[Col]
-    if shuffle_method == "rapidsmpf" and len(
+    if shuffle_method.startswith("rapidsmpf") and len(
         _keys := [ne.value for ne in ir.keys if isinstance(ne.value, Col)]
     ) == len(ir.keys):  # pragma: no cover
-        from rapidsmpf.integrations.dask import rapidsmpf_shuffle_graph
-
         shuffle_on = [k.name for k in _keys]
+        if shuffle_method == "rapidsmpf-local":
+            raise NotImplementedError()
+        else:
+            from rapidsmpf.integrations.dask import rapidsmpf_shuffle_graph
 
-        try:
-            return rapidsmpf_shuffle_graph(
-                get_key_name(ir.children[0]),
-                get_key_name(ir),
-                partition_info[ir.children[0]].count,
-                partition_info[ir].count,
-                RMPFIntegration,
-                {
-                    "on": shuffle_on,
-                    "column_names": list(ir.schema.keys()),
-                    "dtypes": list(ir.schema.values()),
-                },
-            )
-        except ValueError as err:
-            # ValueError: rapidsmpf couldn't find a distributed client
-            if shuffle_method == "rapidsmpf":
-                # Only raise an error if the user specifically
-                # set the shuffle method to "rapidsmpf"
-                raise ValueError(
-                    "The current Dask cluster does not support rapidsmpf shuffling."
-                ) from err
+            try:
+                return rapidsmpf_shuffle_graph(
+                    get_key_name(ir.children[0]),
+                    get_key_name(ir),
+                    partition_info[ir.children[0]].count,
+                    partition_info[ir].count,
+                    RMPFIntegration,
+                    {
+                        "on": shuffle_on,
+                        "column_names": list(ir.schema.keys()),
+                        "dtypes": list(ir.schema.values()),
+                    },
+                )
+            except ValueError as err:
+                # ValueError: rapidsmpf couldn't find a distributed client
+                if shuffle_method == "rapidsmpf":
+                    # Only raise an error if the user specifically
+                    # set the shuffle method to "rapidsmpf"
+                    raise ValueError(
+                        "The current Dask cluster does not support rapidsmpf shuffling."
+                    ) from err
 
     # Simple task-based fall-back
     return _simple_shuffle_graph(

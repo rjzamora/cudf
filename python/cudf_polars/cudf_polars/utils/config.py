@@ -53,7 +53,7 @@ __all__ = [
 def rapidsmpf_available() -> bool:  # pragma: no cover
     """Query whether rapidsmpf is available as a shuffle method."""
     try:
-        return importlib.util.find_spec("rapidsmpf.integrations.dask") is not None
+        return importlib.util.find_spec("rapidsmpf") is not None
     except (ImportError, ValueError):
         return False
 
@@ -97,7 +97,8 @@ class ShuffleMethod(str, enum.Enum):
     The method to use for shuffling data between workers with the streaming executor.
 
     * ``ShuffleMethod.TASKS`` : Use the task-based shuffler.
-    * ``ShuffleMethod.RAPIDSMPF`` : Use the rapidsmpf scheduler.
+    * ``ShuffleMethod.RAPIDSMPF`` : Use the rapidsmpf shuffler.
+    * ``ShuffleMethod.RAPIDSMPF_LOCAL`` : Use the local (single-GPU) rapidsmpf shuffler.
 
     With :class:`cudf_polars.utils.config.StreamingExecutor`, the default of ``None`` will attempt to use
     ``ShuffleMethod.RAPIDSMPF``, but will fall back to ``ShuffleMethod.TASKS``
@@ -106,6 +107,7 @@ class ShuffleMethod(str, enum.Enum):
 
     TASKS = "tasks"
     RAPIDSMPF = "rapidsmpf"
+    RAPIDSMPF_LOCAL = "rapidsmpf-local"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -344,17 +346,18 @@ class StreamingExecutor:
                 object.__setattr__(self, "shuffle_method", "tasks")
         else:
             if (
-                self.scheduler == "distributed"
-                and self.shuffle_method == "rapidsmpf"
+                self.shuffle_method in ("rapidsmpf", "rapidsmpf-local")
                 and not rapidsmpf_available()
             ):
                 raise ValueError(
                     "rapidsmpf shuffle method requested, but rapidsmpf is not installed"
                 )
-        if self.scheduler == "synchronous" and self.shuffle_method == "rapidsmpf":
+        if self.scheduler == "distributed" and self.shuffle_method == "rapidsmpf-local":
             raise ValueError(
-                "rapidsmpf shuffle method is not supported for synchronous scheduler"
+                "rapidsmpf-local shuffle method is not supported for the distributed scheduler"
             )
+        if self.scheduler == "synchronous" and self.shuffle_method == "rapidsmpf":
+            object.__setattr__(self, "shuffle_method", "rapidsmpf-local")
 
         # frozen dataclass, so use object.__setattr__
         object.__setattr__(
