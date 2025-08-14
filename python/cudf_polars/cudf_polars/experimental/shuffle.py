@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import operator
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 import pylibcudf as plc
 from rmm.pylibrmm.stream import DEFAULT_STREAM
@@ -45,9 +45,12 @@ class ShuffleOptions(TypedDict):
 class RMPFIntegration:  # pragma: no cover
     """cuDF-Polars protocol for rapidsmpf shuffler."""
 
-    @staticmethod
+    cluster_type: Literal["dask", "single"] = "dask"
+
+    @classmethod
     @nvtx_annotate_cudf_polars(message="RMPFIntegration.insert_partition")
     def insert_partition(
+        cls,
         df: DataFrame,
         partition_id: int,  # Not currently used
         partition_count: int,
@@ -57,7 +60,11 @@ class RMPFIntegration:  # pragma: no cover
     ) -> None:
         """Add cudf-polars DataFrame chunks to an RMP shuffler."""
         from rapidsmpf.integrations.cudf.partition import partition_and_pack
-        from rapidsmpf.integrations.dask.core import get_worker_context
+
+        if cls.cluster_type == "dask":
+            from rapidsmpf.integrations.dask.core import get_worker_context
+        else:
+            from rapidsmpf.integrations.single import get_worker_context
 
         context = get_worker_context()
 
@@ -78,9 +85,10 @@ class RMPFIntegration:  # pragma: no cover
         )
         shuffler.insert_chunks(packed_inputs)
 
-    @staticmethod
+    @classmethod
     @nvtx_annotate_cudf_polars(message="RMPFIntegration.extract_partition")
     def extract_partition(
+        cls,
         partition_id: int,
         shuffler: Any,
         options: ShuffleOptions,
@@ -90,7 +98,11 @@ class RMPFIntegration:  # pragma: no cover
             unpack_and_concat,
             unspill_partitions,
         )
-        from rapidsmpf.integrations.dask.core import get_worker_context
+
+        if cls.cluster_type == "dask":
+            from rapidsmpf.integrations.dask.core import get_worker_context
+        else:
+            from rapidsmpf.integrations.single import get_worker_context
 
         context = get_worker_context()
         if context.br is None:  # pragma: no cover
@@ -116,6 +128,12 @@ class RMPFIntegration:  # pragma: no cover
             column_names,
             dtypes,
         )
+
+
+class RMPFIntegrationSingle(RMPFIntegration):  # pragma: no cover
+    """cuDF-Polars protocol for single-worker rapidsmpf shuffler."""
+
+    cluster_type: Literal["dask", "single"] = "single"
 
 
 class Shuffle(IR):
@@ -289,10 +307,15 @@ def _(
     if shuffle_method in ("rapidsmpf", "rapidsmpf-single") and len(
         _keys := [ne.value for ne in ir.keys if isinstance(ne.value, Col)]
     ) == len(ir.keys):  # pragma: no cover
+        integration: type[RMPFIntegration | RMPFIntegrationSingle]
         if shuffle_method == "rapidsmpf-single":
             from rapidsmpf.integrations.single import rapidsmpf_shuffle_graph
+
+            integration = RMPFIntegrationSingle
         else:
             from rapidsmpf.integrations.dask import rapidsmpf_shuffle_graph
+
+            integration = RMPFIntegration
 
         shuffle_on = [k.name for k in _keys]
 
@@ -302,7 +325,7 @@ def _(
                 get_key_name(ir),
                 partition_info[ir.children[0]].count,
                 partition_info[ir].count,
-                RMPFIntegration,
+                integration,
                 {
                     "on": shuffle_on,
                     "column_names": list(ir.schema.keys()),
