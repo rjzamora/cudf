@@ -50,7 +50,7 @@ def get_key_name(node: Node) -> str:
     return f"{type(node).__name__.lower()}-{hash(node)}"
 
 
-T = TypeVar("T")
+T = TypeVar("T", int, float, str)
 
 
 @dataclasses.dataclass
@@ -69,6 +69,26 @@ class ColumnStat(Generic[T]):
 
     value: T | None = None
     exact: bool = False
+
+    def __eq__(self, other: Any) -> bool:
+        """Compare two ColumnStat objects."""
+        return (
+            isinstance(other, ColumnStat)
+            and self.value == other.value
+            and self.exact == other.exact
+        )
+
+    def __lt__(self, other: Any) -> bool:
+        """Compare two ColumnStat objects."""
+        return (
+            self.value < other.value
+            if (
+                isinstance(other, ColumnStat)
+                and self.value is not None
+                and other.value is not None
+            )
+            else False
+        )
 
 
 @dataclasses.dataclass
@@ -136,13 +156,15 @@ class ColumnSourceInfo:
     direct access to column-specific information.
     """
 
-    __slots__ = ("column_name", "table_source_info")
+    __slots__ = ("_allow_unique", "column_name", "table_source_info")
     table_source_info: DataSourceInfo
     column_name: str
+    _allow_unique: bool
 
     def __init__(self, table_source_info: DataSourceInfo, column_name: str) -> None:
         self.table_source_info = table_source_info
         self.column_name = column_name
+        self._allow_unique = False
 
     @property
     def row_count(self) -> ColumnStat[int]:
@@ -152,7 +174,13 @@ class ColumnSourceInfo:
     @property
     def unique_stats(self) -> UniqueStats:
         """Return unique-value statistics for a column."""
-        return self.table_source_info.unique_stats(self.column_name)
+        return (
+            self.table_source_info.unique_stats(self.column_name)
+            # Avoid sampling unique-stats if this column
+            # wasn't marked as needing unique-stats.
+            if True  # TODO: Use self._allow_unique
+            else UniqueStats()
+        )
 
     @property
     def storage_size(self) -> ColumnStat[int]:
@@ -161,6 +189,8 @@ class ColumnSourceInfo:
 
     def add_unique_stats_column(self, column: str | None = None) -> None:
         """Add a column needing unique-value information."""
+        if column in (None, self.column_name):
+            self._allow_unique = True
         return self.table_source_info.add_unique_stats_column(
             column or self.column_name
         )

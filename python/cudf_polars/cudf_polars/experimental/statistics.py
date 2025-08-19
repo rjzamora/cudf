@@ -20,16 +20,45 @@ from cudf_polars.dsl.ir import (
 )
 from cudf_polars.dsl.traversal import post_traversal
 from cudf_polars.experimental.base import (
+    ColumnStat,
     ColumnStats,
     JoinKey,
     StatsCollector,
 )
-from cudf_polars.experimental.dispatch import initialize_column_stats
+from cudf_polars.experimental.dispatch import (
+    finalize_column_stats,
+    initialize_column_stats,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     from cudf_polars.utils.config import ConfigOptions
+
+
+def collect_column_stats(root: IR, config_options: ConfigOptions) -> StatsCollector:
+    """
+    Collect column statistics for a query.
+
+    Parameters
+    ----------
+    root
+        Root IR node for collecting column statistics.
+    config_options
+        GPUEngine configuration options.
+
+    Returns
+    -------
+    A StatsCollector object with populated column statistics.
+    """
+    # Start with base statistics
+    stats = apply_pkfk_heuristics(collect_base_stats(root, config_options))
+
+    # Update column statistics for each node in the query
+    for node in post_traversal([root]):
+        finalize_column_stats(node, stats, config_options)
+
+    return stats
 
 
 def collect_base_stats(root: IR, config_options: ConfigOptions) -> StatsCollector:
@@ -126,10 +155,7 @@ def find_equivalence_sets(
     return components
 
 
-def apply_pkfk_heuristics(
-    stats: StatsCollector,
-    config_options: ConfigOptions,
-) -> StatsCollector:
+def apply_pkfk_heuristics(stats: StatsCollector) -> StatsCollector:
     """
     Apply PK-FK join heuristics to the given stats.
 
@@ -137,8 +163,6 @@ def apply_pkfk_heuristics(
     ----------
     stats
         StatsCollector object to update.
-    config_options
-        GPUEngine configuration options.
 
     Returns
     -------
@@ -324,3 +348,66 @@ def _(
     from cudf_polars.experimental.io import _extract_dataframescan_stats
 
     return _extract_dataframescan_stats(ir)
+
+
+def _missing_child_rows(ir: IR, stats: StatsCollector) -> bool:
+    return len(ir.children) == 0 or any(
+        stats.row_count[child].value is None for child in ir.children
+    )
+
+
+def _default_row_count() -> ColumnStat[int]:
+    return ColumnStat[int](None)
+
+
+@finalize_column_stats.register(IR)
+def _(ir: IR, stats: StatsCollector, config_options: ConfigOptions) -> None:
+    # Default `finalize_column_stats` implementation.
+    if _missing_child_rows(ir, stats):
+        stats.row_count[ir] = _default_row_count()
+    else:
+        # Propagate largest child row-count estimate
+        stats.row_count[ir] = max(stats.row_count[child] for child in ir.children)
+
+
+@finalize_column_stats.register(DataFrameScan)
+def _(ir: DataFrameScan, stats: StatsCollector, config_options: ConfigOptions) -> None:
+    stats.row_count[ir] = next(
+        iter(stats.column_stats[ir].values())
+    ).source_info.row_count
+
+
+@finalize_column_stats.register(Scan)
+def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
+    # Set row-count estimate
+    if ir.n_rows != -1:
+        stats.row_count[ir] = ColumnStat[int](ir.n_rows)
+    else:
+        # TODO: Apply predicate selectivity
+        stats.row_count[ir] = next(
+            iter(stats.column_stats[ir].values())
+        ).source_info.row_count
+
+
+@finalize_column_stats.register(Join)
+def _(ir: Join, stats: StatsCollector, config_options: ConfigOptions) -> None:
+    if _missing_child_rows(ir, stats):
+        stats.row_count[ir] = _default_row_count()
+    else:
+        # Add up child row-count estimates
+        left, right = ir.children
+        left_rows = stats.row_count[left]
+        right_rows = stats.row_count[right]
+        unique_estimate = max(
+            u.unique_count_estimate
+            for u in stats.joins[ir]
+            if u.unique_count_estimate is not None
+        )
+        if unique_estimate is not None:
+            stats.row_count[ir] = ColumnStat[int](
+                max(1, (left_rows.value * right_rows.value) // unique_estimate)
+            )
+        else:
+            stats.row_count[ir] = ColumnStat[int](
+                max((1, left_rows.value, right_rows.value))
+            )

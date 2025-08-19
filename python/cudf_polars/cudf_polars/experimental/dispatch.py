@@ -132,3 +132,22 @@ def initialize_column_stats(
     attributes for each column of each IR node.
     """
     raise AssertionError(f"Unhandled type {type(ir)}")  # pragma: no cover
+
+
+@singledispatch
+def finalize_column_stats(
+    ir: IR, stats: StatsCollector, config_options: ConfigOptions
+) -> None:
+    """
+    Finalize column statistics for an IR node.
+
+    Parameters
+    ----------
+    ir
+        The IR node to finalize columnstatistics for.
+    stats
+        The `StatsCollector` object containing known statistics.
+    config_options
+        GPUEngine configuration options.
+    """
+    raise AssertionError(f"Unhandled type {type(ir)}")  # pragma: no cover
