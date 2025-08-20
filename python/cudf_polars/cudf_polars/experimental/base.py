@@ -169,15 +169,15 @@ class ColumnSourceInfo:
     direct access to column-specific information.
     """
 
-    __slots__ = ("_allow_unique", "column_name", "table_source_info")
+    __slots__ = ("_allow_unique_sampling", "column_name", "table_source_info")
     table_source_info: DataSourceInfo
     column_name: str
-    _allow_unique: bool
+    _allow_unique_sampling: bool
 
     def __init__(self, table_source_info: DataSourceInfo, column_name: str) -> None:
         self.table_source_info = table_source_info
         self.column_name = column_name
-        self._allow_unique = False
+        self._allow_unique_sampling = False
 
     @property
     def row_count(self) -> ColumnStat[int]:
@@ -198,7 +198,7 @@ class ColumnSourceInfo:
             self.table_source_info.unique_stats(self.column_name)
             # Avoid sampling unique-stats if this column
             # wasn't marked as needing unique-stats.
-            if force or self._allow_unique
+            if force or self._allow_unique_sampling
             else UniqueStats()
         )
 
@@ -210,7 +210,7 @@ class ColumnSourceInfo:
     def add_unique_stats_column(self, column: str | None = None) -> None:
         """Add a column needing unique-value information."""
         if column in (None, self.column_name):
-            self._allow_unique = True
+            self._allow_unique_sampling = True
         return self.table_source_info.add_unique_stats_column(
             column or self.column_name
         )

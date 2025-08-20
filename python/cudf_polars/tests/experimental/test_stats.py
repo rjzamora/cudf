@@ -61,7 +61,9 @@ def test_base_stats_dataframescan(df):
     # Storage stats should not be available
     assert source_info_x.storage_size.value is None
 
-    # Check unique stats
+    # Check unique stats.
+    # We need to use force=True to sample unique-value statistics,
+    # because nothing in the query requires unique-value statistics.
     assert math.isclose(
         source_info_x.unique_stats(force=True).count.value, row_count, rel_tol=5e-2
     )
