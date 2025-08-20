@@ -135,7 +135,7 @@ def initialize_column_stats(
 
 
 @singledispatch
-def finalize_column_stats(
+def update_column_stats(
     ir: IR, stats: StatsCollector, config_options: ConfigOptions
 ) -> None:
     """

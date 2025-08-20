@@ -26,8 +26,8 @@ from cudf_polars.experimental.base import (
     StatsCollector,
 )
 from cudf_polars.experimental.dispatch import (
-    finalize_column_stats,
     initialize_column_stats,
+    update_column_stats,
 )
 
 if TYPE_CHECKING:
@@ -56,7 +56,7 @@ def collect_column_stats(root: IR, config_options: ConfigOptions) -> StatsCollec
 
     # Update column statistics for each node in the query
     for node in post_traversal([root]):
-        finalize_column_stats(node, stats, config_options)
+        update_column_stats(node, stats, config_options)
 
     return stats
 
@@ -381,16 +381,16 @@ def child_row_counts(
     return child_row_counts
 
 
-@finalize_column_stats.register(IR)
+@update_column_stats.register(IR)
 def _(ir: IR, stats: StatsCollector, config_options: ConfigOptions) -> None:
-    # Default `finalize_column_stats` implementation.
+    # Default `update_column_stats` implementation.
     # Propagate largest child row-count estimate.
     stats.row_count[ir] = ColumnStat[int](
         max(child_row_counts(ir, stats), default=None)
     )
 
 
-@finalize_column_stats.register(DataFrameScan)
+@update_column_stats.register(DataFrameScan)
 def _(ir: DataFrameScan, stats: StatsCollector, config_options: ConfigOptions) -> None:
     # Use datasource row-count estimate.
     stats.row_count[ir] = next(
@@ -398,7 +398,7 @@ def _(ir: DataFrameScan, stats: StatsCollector, config_options: ConfigOptions) -
     ).source_info.row_count
 
 
-@finalize_column_stats.register(Scan)
+@update_column_stats.register(Scan)
 def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
     # Use datasource row-count estimate.
     if ir.n_rows != -1:
@@ -410,7 +410,7 @@ def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
         ).source_info.row_count
 
 
-@finalize_column_stats.register(Join)
+@update_column_stats.register(Join)
 def _(ir: Join, stats: StatsCollector, config_options: ConfigOptions) -> None:
     # Apply basic join-cardinality estimation.
     try:
@@ -433,7 +433,7 @@ def _(ir: Join, stats: StatsCollector, config_options: ConfigOptions) -> None:
             stats.row_count[ir] = ColumnStat[int](max((1, left_rows, right_rows)))
 
 
-@finalize_column_stats.register(Union)
+@update_column_stats.register(Union)
 def _(ir: Union, stats: StatsCollector, config_options: ConfigOptions) -> None:
     # Sum child row-count estimates.
     row_counts = child_row_counts(ir, stats)

@@ -171,14 +171,21 @@ class ColumnSourceInfo:
         """Data source row-count estimate."""
         return self.table_source_info.row_count
 
-    @property
-    def unique_stats(self) -> UniqueStats:
-        """Return unique-value statistics for a column."""
+    def unique_stats(self, *, force: bool = False) -> UniqueStats:
+        """
+        Return unique-value statistics for a column.
+
+        Parameters
+        ----------
+        force
+            If True, return unique-value statistics even if the column
+            wasn't marked as needing unique-value information.
+        """
         return (
             self.table_source_info.unique_stats(self.column_name)
             # Avoid sampling unique-stats if this column
             # wasn't marked as needing unique-stats.
-            if True  # TODO: Use self._allow_unique
+            if force or self._allow_unique
             else UniqueStats()
         )
 
