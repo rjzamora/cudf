@@ -109,6 +109,19 @@ class UniqueStats:
     count: ColumnStat[int] = dataclasses.field(default_factory=ColumnStat[int])
     fraction: ColumnStat[float] = dataclasses.field(default_factory=ColumnStat[float])
 
+    @classmethod
+    def combine(cls, *stats: UniqueStats) -> UniqueStats:
+        """Combine multiple UniqueStats objects."""
+        if not stats or any(stat.count.value is None for stat in stats):
+            return cls()
+        if len(stats) == 1:
+            return stats[0]
+        count = max(
+            (stat.count.value for stat in stats if stat.count.value is not None),
+            default=None,
+        )
+        return cls(count=ColumnStat[int](count))
+
 
 class DataSourceInfo:
     """

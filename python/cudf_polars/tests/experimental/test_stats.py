@@ -14,7 +14,7 @@ from cudf_polars.experimental.io import _clear_source_info_cache
 from cudf_polars.experimental.statistics import (
     apply_pkfk_heuristics,
     collect_base_stats,
-    collect_column_stats,
+    collect_statistics,
     find_equivalence_sets,
 )
 from cudf_polars.testing.asserts import DEFAULT_SCHEDULER, assert_gpu_result_equal
@@ -438,5 +438,10 @@ def test_base_stats_join_key_info():
         q.select(pl.col("cust_id").n_unique()).collect().item() == unique_count_estimate
     )
 
-    stats = collect_column_stats(ir, config_options)
-    # TODO: Check the result of collect_column_stats
+    stats = collect_statistics(ir, config_options)
+
+    # import pdb; pdb.set_trace()
+    # pass
+    # stats.column_stats[ir]['cust_id'].unique_stats
+    # stats.column_stats[ir]['cust_id'].source_info.unique_stats()
+    # TODO: Check the result of collect_statistics

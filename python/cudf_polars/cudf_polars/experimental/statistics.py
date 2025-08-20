@@ -24,6 +24,7 @@ from cudf_polars.experimental.base import (
     ColumnStats,
     JoinKey,
     StatsCollector,
+    UniqueStats,
 )
 from cudf_polars.experimental.dispatch import (
     initialize_column_stats,
@@ -36,7 +37,7 @@ if TYPE_CHECKING:
     from cudf_polars.utils.config import ConfigOptions
 
 
-def collect_column_stats(root: IR, config_options: ConfigOptions) -> StatsCollector:
+def collect_statistics(root: IR, config_options: ConfigOptions) -> StatsCollector:
     """
     Collect column statistics for a query.
 
@@ -52,9 +53,12 @@ def collect_column_stats(root: IR, config_options: ConfigOptions) -> StatsCollec
     A StatsCollector object with populated column statistics.
     """
     # Start with base statistics
-    stats = apply_pkfk_heuristics(collect_base_stats(root, config_options))
+    stats = collect_base_stats(root, config_options)
 
-    # Update column statistics for each node in the query
+    # Apply PK-FK heuristics
+    stats = apply_pkfk_heuristics(stats)
+
+    # Update statistics for each node
     for node in post_traversal([root]):
         update_column_stats(node, stats, config_options)
 
@@ -285,6 +289,9 @@ def _(
             primary_child_stats[p_key.name],
             other_child_stats[o_key.name],
         )
+        # Add key columns to set of unique-stats columns.
+        primary_child_stats[p_key.name].source_info.add_unique_stats_column()
+        other_child_stats[o_key.name].source_info.add_unique_stats_column()
 
     return column_stats
 
@@ -381,6 +388,27 @@ def child_row_counts(
     return child_row_counts
 
 
+def copy_child_unique_count(ir: IR, stats: StatsCollector) -> None:
+    """
+    Copy unique-value count information from child statistics.
+
+    Parameters
+    ----------
+    ir
+        IR node to copy unique-stats information from.
+    stats
+        StatsCollector object to update.
+    """
+    for column_stats in stats.column_stats[ir].values():
+        if column_stats.children:
+            column_stats.unique_stats = UniqueStats.combine(
+                *(
+                    child_column_stats.unique_stats
+                    for child_column_stats in column_stats.children
+                )
+            )
+
+
 @update_column_stats.register(IR)
 def _(ir: IR, stats: StatsCollector, config_options: ConfigOptions) -> None:
     # Default `update_column_stats` implementation.
@@ -388,6 +416,8 @@ def _(ir: IR, stats: StatsCollector, config_options: ConfigOptions) -> None:
     stats.row_count[ir] = ColumnStat[int](
         max(child_row_counts(ir, stats), default=None)
     )
+    # Copy unique-value count from children.
+    copy_child_unique_count(ir, stats)
 
 
 @update_column_stats.register(DataFrameScan)
@@ -396,6 +426,11 @@ def _(ir: DataFrameScan, stats: StatsCollector, config_options: ConfigOptions) -
     stats.row_count[ir] = next(
         iter(stats.column_stats[ir].values())
     ).source_info.row_count
+
+    # Use datasource unique-stats information.
+    for column_stats in stats.column_stats[ir].values():
+        # We use force=False to avoid sampling unnecessary unique-stats.
+        column_stats.unique_stats = column_stats.source_info.unique_stats(force=False)
 
 
 @update_column_stats.register(Scan)
@@ -409,9 +444,17 @@ def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
             iter(stats.column_stats[ir].values())
         ).source_info.row_count
 
+    # Use datasource unique-stats information.
+    for column_stats in stats.column_stats[ir].values():
+        # We use force=False to avoid sampling unnecessary unique-stats.
+        column_stats.unique_stats = column_stats.source_info.unique_stats(force=False)
+
 
 @update_column_stats.register(Join)
 def _(ir: Join, stats: StatsCollector, config_options: ConfigOptions) -> None:
+    # Copy unique-value count from children.
+    copy_child_unique_count(ir, stats)
+
     # Apply basic join-cardinality estimation.
     try:
         left_rows, right_rows = child_row_counts(ir, stats)
@@ -420,10 +463,31 @@ def _(ir: Join, stats: StatsCollector, config_options: ConfigOptions) -> None:
         stats.row_count[ir] = ColumnStat[int](None)
     else:
         # Both children have row-count estimates.
+        # Account for sampled unique-count estimates.
+        sampled_unique_count_estimates: list[int] = []
+        for key in ir.left_on:
+            value = stats.column_stats[ir.children[0]][
+                key.name
+            ].unique_stats.count.value
+            if value is not None:
+                sampled_unique_count_estimates.append(value)
+        for key in ir.right_on:
+            value = stats.column_stats[ir.children[1]][
+                key.name
+            ].unique_stats.count.value
+            if value is not None:
+                sampled_unique_count_estimates.append(value)
+
         unique_estimate = max(
-            u.unique_count_estimate
-            for u in stats.joins[ir]
-            if u.unique_count_estimate is not None
+            # Use PK-FK join unique-count estimates in case
+            # directly-sampled statistics are missing.
+            [
+                u.unique_count_estimate
+                for u in stats.joins[ir]
+                if u.unique_count_estimate is not None
+            ]
+            + sampled_unique_count_estimates,
+            default=None,
         )
         if unique_estimate is not None:
             stats.row_count[ir] = ColumnStat[int](
@@ -436,5 +500,6 @@ def _(ir: Join, stats: StatsCollector, config_options: ConfigOptions) -> None:
 @update_column_stats.register(Union)
 def _(ir: Union, stats: StatsCollector, config_options: ConfigOptions) -> None:
     # Sum child row-count estimates.
+    # Note: We cannot inherit unique-stats information from children.
     row_counts = child_row_counts(ir, stats)
     stats.row_count[ir] = ColumnStat[int](sum(row_counts) if row_counts else None)
