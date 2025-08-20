@@ -350,28 +350,49 @@ def _(
     return _extract_dataframescan_stats(ir)
 
 
-def _missing_child_rows(ir: IR, stats: StatsCollector) -> bool:
-    return len(ir.children) == 0 or any(
-        stats.row_count[child].value is None for child in ir.children
-    )
+def child_row_counts(
+    ir: IR, stats: StatsCollector, *, strict: bool = True
+) -> list[int]:
+    """
+    Get row-count estimates for all children of the given IR node.
 
+    Parameters
+    ----------
+    ir
+        IR node to get row-count estimates for.
+    stats
+        StatsCollector object to get row-count estimates from.
+    strict
+        If True, returns an empty list if any child has an unknown row-count estimate.
 
-def _default_row_count() -> ColumnStat[int]:
-    return ColumnStat[int](None)
+    Returns
+    -------
+    List of non-null row-count estimates for all children.
+    """
+    child_row_counts: list[int] = []
+    for child in ir.children:
+        if (value := stats.row_count[child].value) is None:
+            if strict:
+                # If strict, return an empty list if any
+                # child has an unknown row-count estimate.
+                return []
+        else:
+            child_row_counts.append(value)
+    return child_row_counts
 
 
 @finalize_column_stats.register(IR)
 def _(ir: IR, stats: StatsCollector, config_options: ConfigOptions) -> None:
     # Default `finalize_column_stats` implementation.
-    if _missing_child_rows(ir, stats):
-        stats.row_count[ir] = _default_row_count()
-    else:
-        # Propagate largest child row-count estimate
-        stats.row_count[ir] = max(stats.row_count[child] for child in ir.children)
+    # Propagate largest child row-count estimate.
+    stats.row_count[ir] = ColumnStat[int](
+        max(child_row_counts(ir, stats), default=None)
+    )
 
 
 @finalize_column_stats.register(DataFrameScan)
 def _(ir: DataFrameScan, stats: StatsCollector, config_options: ConfigOptions) -> None:
+    # Use datasource row-count estimate.
     stats.row_count[ir] = next(
         iter(stats.column_stats[ir].values())
     ).source_info.row_count
@@ -379,7 +400,7 @@ def _(ir: DataFrameScan, stats: StatsCollector, config_options: ConfigOptions) -
 
 @finalize_column_stats.register(Scan)
 def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
-    # Set row-count estimate
+    # Use datasource row-count estimate.
     if ir.n_rows != -1:
         stats.row_count[ir] = ColumnStat[int](ir.n_rows)
     else:
@@ -391,15 +412,14 @@ def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
 
 @finalize_column_stats.register(Join)
 def _(ir: Join, stats: StatsCollector, config_options: ConfigOptions) -> None:
-    if _missing_child_rows(ir, stats):
-        stats.row_count[ir] = _default_row_count()
+    # Apply basic join-cardinality estimation.
+    try:
+        left_rows, right_rows = child_row_counts(ir, stats)
+    except ValueError:
+        # One or more children have an unknown row-count estimate.
+        stats.row_count[ir] = ColumnStat[int](None)
     else:
-        # Add up child row-count estimates
-        left, right = ir.children
-        left_rows = stats.row_count[left]
-        right_rows = stats.row_count[right]
-        assert left_rows.value is not None
-        assert right_rows.value is not None
+        # Both children have row-count estimates.
         unique_estimate = max(
             u.unique_count_estimate
             for u in stats.joins[ir]
@@ -407,9 +427,14 @@ def _(ir: Join, stats: StatsCollector, config_options: ConfigOptions) -> None:
         )
         if unique_estimate is not None:
             stats.row_count[ir] = ColumnStat[int](
-                max(1, (left_rows.value * right_rows.value) // unique_estimate)
+                max(1, (left_rows * right_rows) // unique_estimate)
             )
         else:
-            stats.row_count[ir] = ColumnStat[int](
-                max((1, left_rows.value, right_rows.value))
-            )
+            stats.row_count[ir] = ColumnStat[int](max((1, left_rows, right_rows)))
+
+
+@finalize_column_stats.register(Union)
+def _(ir: Union, stats: StatsCollector, config_options: ConfigOptions) -> None:
+    # Sum child row-count estimates.
+    row_counts = child_row_counts(ir, stats)
+    stats.row_count[ir] = ColumnStat[int](sum(row_counts) if row_counts else None)
