@@ -438,10 +438,11 @@ def test_base_stats_join_key_info():
         q.select(pl.col("cust_id").n_unique()).collect().item() == unique_count_estimate
     )
 
+    # Check basic collect_statistics behavior
     stats = collect_statistics(ir, config_options)
-
-    # import pdb; pdb.set_trace()
-    # pass
-    # stats.column_stats[ir]['cust_id'].unique_stats
-    # stats.column_stats[ir]['cust_id'].source_info.unique_stats()
-    # TODO: Check the result of collect_statistics
+    local_unique_count = stats.column_stats[ir]["cust_id"].unique_stats.count.value
+    source_unique_count = (
+        stats.column_stats[ir]["cust_id"].source_info.unique_stats().count.value
+    )
+    assert local_unique_count == source_unique_count
+    assert stats.row_count[ir].value == q.collect().height
