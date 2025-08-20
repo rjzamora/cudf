@@ -398,6 +398,8 @@ def _(ir: Join, stats: StatsCollector, config_options: ConfigOptions) -> None:
         left, right = ir.children
         left_rows = stats.row_count[left]
         right_rows = stats.row_count[right]
+        assert left_rows.value is not None
+        assert right_rows.value is not None
         unique_estimate = max(
             u.unique_count_estimate
             for u in stats.joins[ir]
