@@ -70,26 +70,6 @@ class ColumnStat(Generic[T]):
     value: T | None = None
     exact: bool = False
 
-    def __eq__(self, other: Any) -> bool:
-        """Compare two ColumnStat objects."""
-        return (
-            isinstance(other, ColumnStat)
-            and self.value == other.value
-            and self.exact == other.exact
-        )
-
-    def __lt__(self, other: Any) -> bool:
-        """Compare two ColumnStat objects."""
-        return (
-            self.value < other.value
-            if (
-                isinstance(other, ColumnStat)
-                and self.value is not None
-                and other.value is not None
-            )
-            else False
-        )
-
 
 @dataclasses.dataclass
 class UniqueStats:
@@ -108,19 +88,6 @@ class UniqueStats:
 
     count: ColumnStat[int] = dataclasses.field(default_factory=ColumnStat[int])
     fraction: ColumnStat[float] = dataclasses.field(default_factory=ColumnStat[float])
-
-    @classmethod
-    def combine(cls, *stats: UniqueStats) -> UniqueStats:
-        """Combine multiple UniqueStats objects."""
-        if not stats or any(stat.count.value is None for stat in stats):
-            return cls()
-        if len(stats) == 1:
-            return stats[0]
-        count = max(
-            (stat.count.value for stat in stats if stat.count.value is not None),
-            default=None,
-        )
-        return cls(count=ColumnStat[int](count))
 
 
 class DataSourceInfo:

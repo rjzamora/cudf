@@ -400,13 +400,24 @@ def copy_child_unique_count(ir: IR, stats: StatsCollector) -> None:
         StatsCollector object to update.
     """
     for column_stats in stats.column_stats[ir].values():
-        if column_stats.children:
-            column_stats.unique_stats = UniqueStats.combine(
-                *(
-                    child_column_stats.unique_stats
-                    for child_column_stats in column_stats.children
+        child_unique_counts = [
+            child_column_stats.unique_stats.count.value
+            for child_column_stats in column_stats.children
+        ]
+
+        if child_unique_counts and None not in child_unique_counts:
+            # We only need to update the unique-count if there are
+            # children with known unique-counts.
+            if len(column_stats.children) == 1:
+                # If there is only one child, we can use the child's unique-stats.
+                column_stats.unique_stats = column_stats.children[0].unique_stats
+            else:
+                # Take the maximum unique-count for multiple children.
+                column_stats.unique_stats = UniqueStats(
+                    count=ColumnStat[int](
+                        max(c for c in child_unique_counts if c is not None)
+                    )
                 )
-            )
 
 
 @update_column_stats.register(IR)
