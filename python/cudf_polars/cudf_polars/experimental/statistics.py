@@ -55,6 +55,7 @@ def collect_statistics(root: IR, config_options: ConfigOptions) -> StatsCollecto
     # Start with base statistics.
     # Here we build an outline of the statistics that will be
     # collected before any real data is sampled.
+    list(post_traversal([root]))  # WHY IS THIS NECESSARY?
     stats = collect_base_stats(root, config_options)
 
     # Apply PK-FK heuristics.
@@ -437,9 +438,12 @@ def _(ir: IR, stats: StatsCollector, config_options: ConfigOptions) -> None:
 @update_column_stats.register(DataFrameScan)
 def _(ir: DataFrameScan, stats: StatsCollector, config_options: ConfigOptions) -> None:
     # Use datasource row-count estimate.
-    stats.row_count[ir] = next(
-        iter(stats.column_stats[ir].values())
-    ).source_info.row_count
+    if stats.column_stats[ir]:
+        stats.row_count[ir] = next(
+            iter(stats.column_stats[ir].values())
+        ).source_info.row_count
+    else:
+        stats.row_count[ir] = ColumnStat[int](None)
 
     # Use datasource unique-stats information.
     for column_stats in stats.column_stats[ir].values():
@@ -452,11 +456,13 @@ def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
     # Use datasource row-count estimate.
     if ir.n_rows != -1:
         stats.row_count[ir] = ColumnStat[int](ir.n_rows)
-    else:
+    elif stats.column_stats[ir]:
         # TODO: Apply predicate selectivity
         stats.row_count[ir] = next(
             iter(stats.column_stats[ir].values())
         ).source_info.row_count
+    else:
+        stats.row_count[ir] = ColumnStat[int](None)
 
     # Use datasource unique-stats information.
     for column_stats in stats.column_stats[ir].values():
