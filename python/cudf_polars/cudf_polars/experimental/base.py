@@ -286,10 +286,6 @@ class JoinKey:
             default=None,
         )
 
-    def names(self) -> tuple[str, ...]:
-        """Return the names of the columns in the join key."""
-        return tuple(cs.name for cs in self.column_stats)
-
 
 class StatsCollector:
     """Column statistics collector."""
