@@ -9,7 +9,7 @@ from functools import reduce
 from typing import TYPE_CHECKING, Any
 
 from cudf_polars.dsl.ir import ConditionalJoin, Join, Slice
-from cudf_polars.experimental.base import PartitionInfo, get_key_name
+from cudf_polars.experimental.base import ColumnStat, PartitionInfo, get_key_name
 from cudf_polars.experimental.dispatch import generate_ir_tasks, lower_ir_node
 from cudf_polars.experimental.repartition import Repartition
 from cudf_polars.experimental.shuffle import Shuffle, _partition_dataframe
@@ -244,10 +244,17 @@ def _(
         )
         return rec(Slice(ir.schema, offset, length, new_join))
 
+    # Record pre-lowered statistics
+    stats = rec.state["stats"]
+    left_row_count = stats.row_count.get(ir.children[0], ColumnStat[int](None)).value
+    right_row_count = stats.row_count.get(ir.children[0], ColumnStat[int](None)).value
+    new_row_count = stats.row_count.get(ir, ColumnStat[int](None)).value
+
     # Lower children
     children, _partition_info = zip(*(rec(c) for c in ir.children), strict=True)
     partition_info = reduce(operator.or_, _partition_info)
 
+    new_node: IR
     left, right = children
     output_count = max(partition_info[left].count, partition_info[right].count)
     if output_count == 1:
@@ -258,6 +265,32 @@ def _(
         return _lower_ir_fallback(
             ir, rec, msg="Cross join not support for multiple partitions."
         )
+
+    # Check if we should repartition after the join
+    post_repartition_count: int | None = None
+    if (
+        new_row_count is not None
+        and left_row_count is not None
+        and right_row_count is not None
+    ):
+        epp_before = (
+            sum(
+                (
+                    (len(left.schema) * left_row_count) / partition_info[left].count,
+                    (len(right.schema) * right_row_count) / partition_info[right].count,
+                    # (left_row_count) / partition_info[left].count,
+                    # (right_row_count) / partition_info[right].count,
+                )
+            )
+            / 2.0
+        )
+        epp_after = (len(ir.schema) * new_row_count) / output_count
+        # epp_after = (new_row_count) / output_count
+        if epp_after < epp_before:
+            # Repartition after the join
+            post_repartition_count = max(
+                output_count, min(output_count * (epp_after / epp_before), 1)
+            )
 
     config_options = rec.state["config_options"]
     assert config_options.executor.name == "streaming", (
@@ -272,7 +305,7 @@ def _(
         config_options.executor.broadcast_join_limit,
     ):
         # Create a broadcast join
-        return _make_bcast_join(
+        new_node, partition_info = _make_bcast_join(
             ir,
             output_count,
             partition_info,
@@ -282,7 +315,7 @@ def _(
         )
     else:
         # Create a hash join
-        return _make_hash_join(
+        new_node, partition_info = _make_hash_join(
             ir,
             output_count,
             partition_info,
@@ -290,6 +323,12 @@ def _(
             right,
             config_options.executor.shuffle_method,
         )
+
+    if post_repartition_count:
+        new_node = Repartition(ir.schema, new_node)
+        partition_info[new_node] = PartitionInfo(count=post_repartition_count)
+
+    return new_node, partition_info
 
 
 @generate_ir_tasks.register(Join)

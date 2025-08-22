@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from typing import Any
 
     from cudf_polars.containers import DataFrame
-    from cudf_polars.experimental.dispatch import LowerIRTransformer
+    from cudf_polars.experimental.dispatch import LowerIRTransformer, State
     from cudf_polars.utils.config import ConfigOptions
 
 
@@ -85,12 +85,12 @@ def lower_ir_graph(
     --------
     lower_ir_node
     """
-    # TODO: Make statistics configurable
-    collect_statistics(ir, config_options)
-    # state["stats"] = collect_statistics(ir, config_options)
-    mapper: LowerIRTransformer = CachingVisitor(
-        lower_ir_node, state={"config_options": config_options}
-    )
+    state: State = {
+        "config_options": config_options,
+        # TODO: Make statistics collection more configurable
+        "stats": collect_statistics(ir, config_options),
+    }
+    mapper: LowerIRTransformer = CachingVisitor(lower_ir_node, state=state)
     return mapper(ir)
 
 
@@ -373,6 +373,14 @@ def _(
 
     new_node = ir.reconstruct([child])
     partition_info[new_node] = partition_info[child]
+
+    # # EXPERIMENTAL: Repartition to 80% after a filter.
+    # if partition_info[child].count > 1:
+    #     # Repartition after the filter
+    #     new_node = Repartition(new_node.schema, new_node)
+    #     new_count = max(1, int(partition_info[child].count * 0.8))
+    #     partition_info[new_node] = PartitionInfo(count=new_count)
+
     return new_node, partition_info
 
 

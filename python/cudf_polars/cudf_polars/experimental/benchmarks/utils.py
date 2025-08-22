@@ -344,10 +344,11 @@ def get_executor_options(
         and run_config.executor == "streaming"
     ):
         executor_options["unique_fraction"] = {
-            "c_custkey": 0.05,
-            "l_orderkey": 1.0,
-            "l_partkey": 0.1,
-            "o_custkey": 0.25,
+            # NOTE: Statistics should make this unnecessary
+            # "c_custkey": 0.05,
+            # "l_orderkey": 1.0,
+            # "l_partkey": 0.1,
+            # "o_custkey": 0.25,
         }
 
     return executor_options

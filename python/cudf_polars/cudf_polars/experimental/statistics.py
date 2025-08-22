@@ -55,7 +55,6 @@ def collect_statistics(root: IR, config_options: ConfigOptions) -> StatsCollecto
     # Start with base statistics.
     # Here we build an outline of the statistics that will be
     # collected before any real data is sampled.
-    list(post_traversal([root]))  # WHY IS THIS NECESSARY?
     stats = collect_base_stats(root, config_options)
 
     # Apply PK-FK heuristics.

@@ -18,6 +18,7 @@ from cudf_polars.experimental.base import PartitionInfo
 if TYPE_CHECKING:
     from collections.abc import MutableMapping, Sequence
 
+    from cudf_polars.bsae import ColumnStat, ColumnStats
     from cudf_polars.containers import DataFrame
     from cudf_polars.dsl.expr import Expr
     from cudf_polars.dsl.ir import IR
@@ -104,13 +105,36 @@ def _leaf_column_names(expr: Expr) -> tuple[str, ...]:
 def _get_unique_fractions(
     column_names: Sequence[str],
     user_unique_fractions: dict[str, float],
+    *,
+    row_count: ColumnStat[int] | None = None,
+    column_stats: dict[str, ColumnStats] | None = None,
 ) -> dict[str, float]:
     """Return unique-fraction statistics subset."""
-    return {
-        c: max(min(f, 1.0), 0.00001)
-        for c, f in user_unique_fractions.items()
-        if c in column_names
-    }
+    unique_fractions: dict[str, float] = {}
+    column_stats = column_stats or {}
+    for c in set(column_names).intersection(column_stats):
+        if row_count and column_stats[c].unique_stats.count.value is not None:
+            # Use local unique-count estimate (if available)
+            unique_fractions[c] = max(
+                min(1.0, column_stats[c].unique_stats.count.value / row_count.value),
+                0.00001,
+            )
+        elif column_stats[c].source_info.unique_stats().fraction.value is not None:
+            # Otherwise, use source unique-fraction estimate (if available)
+            unique_fractions[c] = max(
+                min(1.0, column_stats[c].source_info.unique_stats().fraction.value),
+                0.00001,
+            )
+
+    # Update with user-provided unique-fractions
+    unique_fractions.update(
+        {
+            c: max(min(f, 1.0), 0.00001)
+            for c, f in user_unique_fractions.items()
+            if c in column_names
+        }
+    )
+    return unique_fractions
 
 
 def _contains_over(exprs: Sequence[Expr]) -> bool:
