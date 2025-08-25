@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
     from cudf_polars.containers import DataFrame
     from cudf_polars.dsl.expr import NamedExpr
+    from cudf_polars.experimental.base import StatsCollector
     from cudf_polars.experimental.dispatch import LowerIRTransformer
     from cudf_polars.typing import Schema
     from cudf_polars.utils.config import (
@@ -108,7 +109,9 @@ class ScanPartitionPlan:
         self.flavor = flavor
 
     @staticmethod
-    def from_scan(ir: Scan, config_options: ConfigOptions) -> ScanPartitionPlan:
+    def from_scan(
+        ir: Scan, stats: StatsCollector, config_options: ConfigOptions
+    ) -> ScanPartitionPlan:
         """Extract the partitioning plan of a Scan operation."""
         if ir.typ == "parquet":
             # TODO: Use system info to set default blocksize
@@ -117,7 +120,9 @@ class ScanPartitionPlan:
             )
 
             blocksize: int = config_options.executor.target_partition_size
-            column_stats = _extract_scan_stats(ir, config_options)
+            column_stats = stats.column_stats.get(
+                ir, _extract_scan_stats(ir, config_options)
+            )
             column_sizes: list[int] = []
             for cs in column_stats.values():
                 storage_size = cs.source_info.storage_size
@@ -297,7 +302,7 @@ def _(
         and ir.skip_rows == 0
         and ir.row_index is None
     ):
-        plan = ScanPartitionPlan.from_scan(ir, config_options)
+        plan = ScanPartitionPlan.from_scan(ir, rec.state["stats"], config_options)
         paths = list(ir.paths)
         if plan.flavor == ScanPartitionFlavor.SPLIT_FILES:
             # Disable chunked reader when splitting files
