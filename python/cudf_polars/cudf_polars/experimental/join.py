@@ -317,7 +317,7 @@ def _(
             config_options.executor.shuffle_method,
         )
 
-    if post_repartition_count:
+    if post_repartition_count and post_repartition_count < output_count:
         new_node = Repartition(ir.schema, new_node)
         partition_info[new_node] = PartitionInfo(count=post_repartition_count)
 
