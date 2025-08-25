@@ -88,6 +88,7 @@ def lower_ir_graph(
     state: State = {
         "config_options": config_options,
         # TODO: Make statistics collection more configurable
+        # "stats": StatsCollector(),
         "stats": collect_statistics(ir, config_options),
     }
     mapper: LowerIRTransformer = CachingVisitor(lower_ir_node, state=state)
