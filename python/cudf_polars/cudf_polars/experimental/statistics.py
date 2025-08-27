@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import csv
 import itertools
 from typing import TYPE_CHECKING, TypeVar
 
