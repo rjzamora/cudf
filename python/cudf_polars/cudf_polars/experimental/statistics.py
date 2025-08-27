@@ -24,7 +24,6 @@ from cudf_polars.experimental.base import (
     ColumnStats,
     JoinKey,
     StatsCollector,
-    UniqueStats,
 )
 from cudf_polars.experimental.dispatch import (
     initialize_column_stats,
@@ -99,42 +98,37 @@ def collect_base_stats(root: IR, config_options: ConfigOptions) -> StatsCollecto
         # Initialize column statistics from datasource information
         stats.column_stats[node] = initialize_column_stats(node, stats, config_options)
         # Initialize Join-key information
-        initialize_join_key_info(node, stats, config_options)
+        if isinstance(node, Join):
+            initialize_join_key_info(node, stats)
     return stats
 
 
-def initialize_join_key_info(
-    node: IR, stats: StatsCollector, config_options: ConfigOptions
-) -> None:
+def initialize_join_key_info(node: Join, stats: StatsCollector) -> None:
     """
     Initialize join-key information for the given node.
 
     Parameters
     ----------
     node
-        IR node to initialize join-key information for.
+        Join node to initialize join-key information for.
     stats
         StatsCollector object to update.
-    config_options
-        GPUEngine configuration options.
 
     Notes
     -----
     This function updates ``stats.joins`` and ``stats.join_keys``.
     """
-    if isinstance(node, Join):
-        # Only need to update join-key information for Join nodes.
-        left, right = node.children
-        right_keys = [stats.column_stats[right][n.name] for n in node.right_on]
-        left_keys = [stats.column_stats[left][n.name] for n in node.left_on]
-        lkey = JoinKey(*right_keys)
-        rkey = JoinKey(*left_keys)
-        stats.join_keys[lkey].add(rkey)
-        stats.join_keys[rkey].add(lkey)
-        stats.joins[node] = [lkey, rkey]
-        for u, v in zip(left_keys, right_keys, strict=True):
-            stats.join_cols[u].add(v)
-            stats.join_cols[v].add(u)
+    left, right = node.children
+    right_keys = [stats.column_stats[right][n.name] for n in node.right_on]
+    left_keys = [stats.column_stats[left][n.name] for n in node.left_on]
+    lkey = JoinKey(*right_keys)
+    rkey = JoinKey(*left_keys)
+    stats.join_keys[lkey].add(rkey)
+    stats.join_keys[rkey].add(lkey)
+    stats.joins[node] = [lkey, rkey]
+    for u, v in zip(left_keys, right_keys, strict=True):
+        stats.join_cols[u].add(v)
+        stats.join_cols[v].add(u)
 
 
 T = TypeVar("T")
@@ -219,9 +213,9 @@ def apply_pkfk_heuristics(join_keys: Mapping[JoinKey, set[JoinKey]], join_cols: 
     for cols in find_equivalence_sets(join_cols):
         unique_count = max(
             (
-                cs.source_info.implied_unique_count.value
+                cs.source_info.unique_count_estimate.value
                 for cs in cols
-                if cs.source_info.implied_unique_count.value is not None
+                if cs.source_info.unique_count_estimate.value is not None
             ),
             default=min(
                 (cs.source_info.row_count.value for cs in cols if cs.source_info.row_count.value is not None),
@@ -229,7 +223,7 @@ def apply_pkfk_heuristics(join_keys: Mapping[JoinKey, set[JoinKey]], join_cols: 
             ),
         )
         for cs in cols:
-            cs.source_info.implied_unique_count = ColumnStat[int](unique_count)
+            cs.source_info.unique_count_estimate = ColumnStat[int](unique_count)
 
 
 def _update_unique_stats_columns(
@@ -437,7 +431,7 @@ def _(ir: GroupBy, stats: StatsCollector, config_options: ConfigOptions) -> None
     child_column_stats = stats.column_stats[child]
     child_row_count_estimate = stats.row_count[child].value
 
-    counts = [child_column_stats[k].source_info.implied_unique_count.value for k in key_names]
+    counts = [child_column_stats[k].source_info.unique_count_estimate.value for k in key_names]
     known_count = sum(c for c in counts if c is not None)
     unknown = sum(c is None for c in counts)
     if unknown == len(counts):
@@ -458,6 +452,13 @@ def _(ir: DataFrameScan, stats: StatsCollector, config_options: ConfigOptions) -
     else:
         stats.row_count[ir] = ColumnStat[int](None)
 
+    # Update unique-count estimates with sampled statistics
+    for column_stats in stats.column_stats[ir].values():
+        if column_stats.source_info.unique_count_estimate.value is None:
+            source_unique_stats = column_stats.source_info.unique_stats(force=False)
+            if source_unique_stats.count.value is not None:
+                column_stats.source_info.unique_count_estimate = source_unique_stats.count
+
 
 @update_column_stats.register(Scan)
 def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
@@ -472,6 +473,17 @@ def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
     else:
         # No column stats available.
         stats.row_count[ir] = ColumnStat[int](None)
+
+    # Update unique-count estimates with sampled statistics
+    for column_stats in stats.column_stats[ir].values():
+        if column_stats.source_info.unique_count_estimate.value is None:
+            source_unique_stats = column_stats.source_info.unique_stats(force=False)
+            if source_unique_stats.count.value is not None:
+                column_stats.source_info.unique_count_estimate = source_unique_stats.count
+            elif source_unique_stats.fraction.value is not None and stats.row_count[ir].value is not None:
+                column_stats.source_info.unique_count_estimate = ColumnStat[int](
+                    source_unique_stats.fraction.value * stats.row_count[ir].value
+                )
 
 
 @update_column_stats.register(Join)

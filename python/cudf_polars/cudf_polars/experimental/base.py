@@ -136,17 +136,17 @@ class ColumnSourceInfo:
     direct access to column-specific information.
     """
 
-    __slots__ = ("_allow_unique_sampling", "column_name", "implied_unique_count", "table_source_info")
+    __slots__ = ("_allow_unique_sampling", "column_name", "unique_count_estimate", "table_source_info")
     table_source_info: DataSourceInfo
     column_name: str
-    implied_unique_count: ColumnStat[int]
+    unique_count_estimate: ColumnStat[int]
     """Unique-value count implied by join heuristics."""
     _allow_unique_sampling: bool
 
     def __init__(self, table_source_info: DataSourceInfo, column_name: str) -> None:
         self.table_source_info = table_source_info
         self.column_name = column_name
-        self.implied_unique_count = ColumnStat[int](None)
+        self.unique_count_estimate = ColumnStat[int](None)
         self._allow_unique_sampling = False
 
     @property
