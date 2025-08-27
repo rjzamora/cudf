@@ -442,9 +442,9 @@ def test_base_stats_join_key_info():
 
     # Check basic collect_statistics behavior
     stats = collect_statistics(ir, config_options)
-    local_unique_count = stats.column_stats[ir]["cust_id"].unique_stats.count.value
+    implied_unique_count = stats.column_stats[ir]["cust_id"].source_info.implied_unique_count.value
     source_unique_count = (
         stats.column_stats[ir]["cust_id"].source_info.unique_stats().count.value
     )
-    assert local_unique_count == source_unique_count
+    assert implied_unique_count == source_unique_count
     assert stats.row_count[ir].value == q.collect().height

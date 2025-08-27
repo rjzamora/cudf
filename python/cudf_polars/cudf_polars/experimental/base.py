@@ -74,7 +74,7 @@ class ColumnStat(Generic[T]):
 @dataclasses.dataclass
 class UniqueStats:
     """
-    Unique-value statistics.
+    Sampled unique-value statistics.
 
     Parameters
     ----------
@@ -108,7 +108,7 @@ class DataSourceInfo:
         return ColumnStat[int]()  # pragma: no cover
 
     def unique_stats(self, column: str) -> UniqueStats:
-        """Return unique-value statistics for a column."""
+        """Return sampled unique-value statistics for a column."""
         return UniqueStats()  # pragma: no cover
 
     def storage_size(self, column: str) -> ColumnStat[int]:
@@ -136,14 +136,17 @@ class ColumnSourceInfo:
     direct access to column-specific information.
     """
 
-    __slots__ = ("_allow_unique_sampling", "column_name", "table_source_info")
+    __slots__ = ("_allow_unique_sampling", "column_name", "implied_unique_count", "table_source_info")
     table_source_info: DataSourceInfo
     column_name: str
+    implied_unique_count: ColumnStat[int]
+    """Unique-value count implied by join heuristics."""
     _allow_unique_sampling: bool
 
     def __init__(self, table_source_info: DataSourceInfo, column_name: str) -> None:
         self.table_source_info = table_source_info
         self.column_name = column_name
+        self.implied_unique_count = ColumnStat[int](None)
         self._allow_unique_sampling = False
 
     @property
@@ -195,16 +198,13 @@ class ColumnStats:
         Child ColumnStats objects.
     source_info
         Column source information.
-    unique_stats
-        Unique-value statistics.
     """
 
-    __slots__ = ("children", "name", "source_info", "unique_stats")
+    __slots__ = ("children", "name", "source_info")
 
     name: str
     children: tuple[ColumnStats, ...]
     source_info: ColumnSourceInfo
-    unique_stats: UniqueStats
 
     def __init__(
         self,
@@ -212,12 +212,10 @@ class ColumnStats:
         *,
         children: tuple[ColumnStats, ...] = (),
         source_info: ColumnSourceInfo | None = None,
-        unique_stats: UniqueStats | None = None,
     ) -> None:
         self.name = name
         self.children = children
         self.source_info = source_info or ColumnSourceInfo(DataSourceInfo(), name)
-        self.unique_stats = unique_stats or UniqueStats()
 
     def new_parent(
         self,
@@ -245,8 +243,6 @@ class ColumnStats:
             children=(self,),
             # Want to reference the same DataSourceInfo
             source_info=self.source_info,
-            # Want fresh UniqueStats so we can mutate in place
-            unique_stats=UniqueStats(),
         )
 
 
