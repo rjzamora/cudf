@@ -268,22 +268,22 @@ def _(
 
     # Check if we should repartition after the join
     post_repartition_count: int | None = None
-    if (
-        new_row_count is not None
-        and left_row_count is not None
-        and right_row_count is not None
-    ):
-        # "epp" means approximate elements per partition.
-        epp_before = max(
-            (len(left.schema) * left_row_count) / partition_info[left].count,
-            (len(right.schema) * right_row_count) / partition_info[right].count,
-        )
-        epp_after = (len(ir.schema) * new_row_count) / output_count
-        if epp_after < epp_before:
-            # Repartition after the join
-            post_repartition_count = max(
-                output_count, min(output_count * (epp_after / epp_before), 1)
-            )
+    # if (
+    #     new_row_count is not None
+    #     and left_row_count is not None
+    #     and right_row_count is not None
+    # ):
+    #     # "epp" means approximate elements per partition.
+    #     epp_before = max(
+    #         (len(left.schema) * left_row_count) / partition_info[left].count,
+    #         (len(right.schema) * right_row_count) / partition_info[right].count,
+    #     )
+    #     epp_after = (len(ir.schema) * new_row_count) / output_count
+    #     if epp_after < epp_before:
+    #         # Repartition after the join
+    #         post_repartition_count = max(
+    #             output_count, min(output_count * (epp_after / epp_before), 1)
+    #         )
 
     config_options = rec.state["config_options"]
     assert config_options.executor.name == "streaming", (

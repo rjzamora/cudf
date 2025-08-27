@@ -119,12 +119,22 @@ def _get_unique_fractions(
                 min(1.0, column_stats[c].unique_stats.count.value / row_count.value),
                 0.00001,
             )
-        elif column_stats[c].source_info.unique_stats().fraction.value is not None:
-            # Otherwise, use source unique-fraction estimate (if available)
-            unique_fractions[c] = max(
-                min(1.0, column_stats[c].source_info.unique_stats().fraction.value),
-                0.00001,
-            )
+        # if column_stats[c].unique_stats.fraction.value is not None:
+        #     # Use local unique-count estimate (if available)
+        #     unique_fractions[c] = max(
+        #         min(1.0, column_stats[c].unique_stats.fraction.value),
+        #         0.00001,
+        #     )
+        # elif column_stats[c].source_info.unique_stats().fraction.value is not None:
+        #     # Otherwise, use source unique-fraction estimate (if available)
+        #     unique_fractions[c] = max(
+        #         min(1.0, column_stats[c].source_info.unique_stats(force=True).fraction.value),
+        #         0.00001,
+        #     )
+
+    # # Debug write to file
+    # with open("unique_fractions.txt", "a") as f:
+    #     f.write(f"{unique_fractions}\n")
 
     # Update with user-provided unique-fractions
     unique_fractions.update(

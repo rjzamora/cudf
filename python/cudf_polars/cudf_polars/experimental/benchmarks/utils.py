@@ -354,10 +354,10 @@ def get_executor_options(
     ):
         executor_options["unique_fraction"] = {
             # NOTE: Statistics should make this unnecessary
-            # "c_custkey": 0.05,
-            # "l_orderkey": 1.0,
-            # "l_partkey": 0.1,
-            # "o_custkey": 0.25,
+            # "c_custkey": 0.05,  # We get 1.0 from statistics?
+            # "l_orderkey": 1.0,  # We get 0.249987 from statistics?
+            # "l_partkey": 0.1,  # We get 0.999394 from statistics?
+            # "o_custkey": 0.25,  # We get 0.998362 from statistics?
         }
 
     return executor_options

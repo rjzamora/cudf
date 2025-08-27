@@ -290,13 +290,15 @@ class JoinKey:
 class StatsCollector:
     """Column statistics collector."""
 
-    __slots__ = ("column_stats", "join_keys", "joins", "row_count")
+    __slots__ = ("column_stats", "join_cols", "join_keys", "joins", "row_count")
 
     row_count: dict[IR, ColumnStat[int]]
     """Estimated row count for each IR node."""
     column_stats: dict[IR, dict[str, ColumnStats]]
     """Column statistics for each IR node."""
     join_keys: MutableMapping[JoinKey, set[JoinKey]]
+    """Join-key mappings."""
+    join_cols: MutableMapping[ColumnStats, set[ColumnStats]]
     """Join-key mappings."""
     joins: dict[IR, list[JoinKey]]
     """Join keys associated with each IR node."""
@@ -306,5 +308,8 @@ class StatsCollector:
         self.column_stats: dict[IR, dict[str, ColumnStats]] = {}
         self.join_keys: MutableMapping[JoinKey, set[JoinKey]] = defaultdict(
             set[JoinKey]
+        )
+        self.join_cols: MutableMapping[ColumnStats, set[ColumnStats]] = defaultdict(
+            set[ColumnStats]
         )
         self.joins: dict[IR, list[JoinKey]] = {}
