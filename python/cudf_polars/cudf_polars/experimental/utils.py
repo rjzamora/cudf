@@ -5,15 +5,19 @@
 from __future__ import annotations
 
 import operator
+import math
 import warnings
 from functools import reduce
 from itertools import chain
 from typing import TYPE_CHECKING
 
+import pylibcudf as plc
+
 from cudf_polars.dsl.expr import Col, Expr, GroupedRollingWindow, UnaryFunction
 from cudf_polars.dsl.ir import Union
 from cudf_polars.dsl.traversal import traversal
-from cudf_polars.experimental.base import ColumnStat, PartitionInfo
+from cudf_polars.experimental.base import ColumnStat, PartitionInfo, StatsCollector
+from cudf_polars.utils.config import StatisticsPlanningMode
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping, Sequence
@@ -100,6 +104,43 @@ def _leaf_column_names(expr: Expr) -> tuple[str, ...]:
         return (expr.name,)
     else:
         return ()
+
+
+def _estimate_ideal_partition_count(
+    ir: IR,
+    stats: StatsCollector,
+    config_options: ConfigOptions,
+) -> int | None:
+    """Estimate the ideal number of partitions for a query node."""
+
+    assert config_options.executor.name == "streaming", (
+        "'in-memory' executor not supported in '_estimate_ideal_partition_count'"
+    )
+    row_count = stats.row_count.get(ir, ColumnStat[int](None))
+    if (
+        config_options.executor.statistics_planning_mode == StatisticsPlanningMode.OFF
+        or row_count.value is None
+    ):        
+        return None
+
+    size = 0
+    column_stats = stats.column_stats.get(ir, {})
+    for col, dtype in ir.schema.items():
+        if col in column_stats:
+            if (itemsize := column_stats[col].source_info.storage_size.value) is None:
+                try:
+                    itemsize = plc.types.size_of(dtype.plc)
+                except RuntimeError:
+                    # Pylibcudf will raise a RuntimeError for non fixed-width types.
+                    # Default to 32 bytes for these cases. This is basically a
+                    # complete guess, but it's better than nothing.
+                    itemsize = 32
+            size += row_count.value * itemsize
+        else:
+            return None
+
+    target_partition_size = config_options.executor.target_partition_size
+    return max(1, math.ceil(size / target_partition_size))
 
 
 def _get_unique_fractions(

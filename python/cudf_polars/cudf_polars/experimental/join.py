@@ -13,7 +13,7 @@ from cudf_polars.experimental.base import ColumnStat, PartitionInfo, get_key_nam
 from cudf_polars.experimental.dispatch import generate_ir_tasks, lower_ir_node
 from cudf_polars.experimental.repartition import Repartition
 from cudf_polars.experimental.shuffle import Shuffle, _partition_dataframe
-from cudf_polars.experimental.utils import _concat, _fallback_inform, _lower_ir_fallback
+from cudf_polars.experimental.utils import _concat, _estimate_ideal_partition_count, _fallback_inform, _lower_ir_fallback
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping
@@ -247,8 +247,18 @@ def _(
     # Record pre-lowered statistics
     stats = rec.state["stats"]
     left_row_count = stats.row_count.get(ir.children[0], ColumnStat[int](None)).value
-    right_row_count = stats.row_count.get(ir.children[0], ColumnStat[int](None)).value
+    right_row_count = stats.row_count.get(ir.children[1], ColumnStat[int](None)).value
     new_row_count = stats.row_count.get(ir, ColumnStat[int](None)).value
+    ideal_count_left = _estimate_ideal_partition_count(
+        ir.children[0],
+        stats,
+        rec.state["config_options"],
+    )
+    ideal_count_right = _estimate_ideal_partition_count(
+        ir.children[1],
+        stats,
+        rec.state["config_options"],
+    )
 
     # Lower children
     children, _partition_info = zip(*(rec(c) for c in ir.children), strict=True)
@@ -256,6 +266,11 @@ def _(
 
     new_node: IR
     left, right = children
+    if ideal_count_left is not None and ideal_count_left < partition_info[left].count:
+        print(f"Left has {partition_info[left].count} partitions, but ideal is {ideal_count_left}")
+    if ideal_count_right is not None and ideal_count_right < partition_info[right].count:
+        print(f"Right has {partition_info[right].count} partitions, but ideal is {ideal_count_right}")
+
     output_count = max(partition_info[left].count, partition_info[right].count)
     if output_count == 1:
         new_node = ir.reconstruct(children)
@@ -284,6 +299,7 @@ def _(
     #         post_repartition_count = max(
     #             output_count, min(output_count * (epp_after / epp_before), 1)
     #         )
+    #         print(f"REPARTIIONING FROM {output_count} TO {post_repartition_count}")
 
     config_options = rec.state["config_options"]
     assert config_options.executor.name == "streaming", (
