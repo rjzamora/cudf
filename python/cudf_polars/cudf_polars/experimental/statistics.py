@@ -12,6 +12,7 @@ from cudf_polars.dsl.ir import (
     IR,
     DataFrameScan,
     Distinct,
+    Filter,
     GroupBy,
     HConcat,
     Join,
@@ -406,6 +407,34 @@ def child_row_counts(ir: IR, stats: StatsCollector) -> list[int]:
     return child_row_counts
 
 
+def copy_child_unique_counts(
+    column_stats_mapping: dict[str, ColumnStats], selectivity: float = 1.0
+) -> None:
+    """Copy unique-count estimates from children to parent.
+
+    Parameters
+    ----------
+    column_stats_mapping
+        Mapping of column names to ColumnStats objects.
+    selectivity
+        Selectivity of the child unique-count estimate.
+    """
+    for column_stats in column_stats_mapping.values():
+        if len(column_stats.children) == 1:
+            column_stats.unique_count = column_stats.children[0].unique_count
+        else:
+            column_stats.unique_count = ColumnStat[int](
+                max(
+                    (cs.unique_count.value for cs in column_stats.children if cs.unique_count.value is not None),
+                    default=None,
+                )
+            )
+        if column_stats.unique_count.value is not None and selectivity < 1.0:
+            column_stats.unique_count = ColumnStat[int](
+                int(column_stats.unique_count.value * selectivity)
+            )
+
+
 @update_column_stats.register(IR)
 def _(ir: IR, stats: StatsCollector, config_options: ConfigOptions) -> None:
     # Default `update_column_stats` implementation.
@@ -493,9 +522,7 @@ def _(ir: GroupBy, stats: StatsCollector, config_options: ConfigOptions) -> None
         # Guess each additional key introduces a factor of 3 (TODO: Revise this)
         stats.row_count[ir] = ColumnStat[int](known_count * 3**unknown)
 
-    # Inherit unique-count from child
-    for column_stats in stats.column_stats[ir].values():
-        column_stats.unique_count = column_stats.children[0].unique_count
+    copy_child_unique_counts(stats.column_stats[ir])
 
 
 @update_column_stats.register(Join)
@@ -525,18 +552,7 @@ def _(ir: Join, stats: StatsCollector, config_options: ConfigOptions) -> None:
         else:
             stats.row_count[ir] = ColumnStat[int](max((1, left_rows, right_rows)))
 
-    # Assume maximum unique-count for each column.
-    for column_stats in stats.column_stats[ir].values():
-        column_stats.unique_count = ColumnStat[int](
-            max(
-                (
-                    cs.unique_count.value
-                    for cs in column_stats.children
-                    if cs.unique_count.value is not None
-                ),
-                default=None,
-            )
-        )
+    copy_child_unique_counts(stats.column_stats[ir])
 
 
 @update_column_stats.register(Union)
@@ -555,3 +571,18 @@ def _(ir: Union, stats: StatsCollector, config_options: ConfigOptions) -> None:
                 ),
             ) or None
         )
+
+
+# @update_column_stats.register(Filter)
+# def _(ir: Filter, stats: StatsCollector, config_options: ConfigOptions) -> None:
+#     # Default `update_column_stats` implementation.
+#     # Propagate largest child row-count estimate.
+#     child, = ir.children
+#     selectivity = 0.8
+#     if (child_count := stats.row_count[child].value) is not None:
+#         stats.row_count[ir] = ColumnStat[int](max(1, int(child_count * selectivity)))
+#     else:
+#         stats.row_count[ir] = ColumnStat[int](None)
+
+#     # TODO: Should we apply selectivity to the unique-count estimates?
+#     copy_child_unique_counts(stats.column_stats[ir], selectivity=selectivity)
