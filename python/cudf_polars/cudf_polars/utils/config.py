@@ -155,6 +155,19 @@ class ShuffleMethod(str, enum.Enum):
     _RAPIDSMPF_SINGLE = "rapidsmpf-single"
 
 
+class StatisticsPlanningMode(str, enum.Enum):
+    """
+    How the streaming executor uses statistics to create the physical plan.
+
+    * ``StatisticsPlanningMode.OFF`` : Do not use statistics to create the physical plan.
+    * ``StatisticsPlanningMode.ON`` : Use statistics to create the physical plan.
+    """
+    # TODO: Add one or more modes in-between OFF and ON.
+    # (e.g. use for unique-fraction estimates, but not for repartitioning)
+    OFF = "off"
+    ON = "on"
+
+
 T = TypeVar("T")
 
 
@@ -363,6 +376,12 @@ class StreamingExecutor:
         rather than a single file. By default, this will be set to True for
         the 'distributed' scheduler and False otherwise. The 'distrubuted'
         scheduler does not currently support ``sink_to_directory=False``.
+    statistics_planning_mode
+        Whether to use statistics to create the physical plan.
+        ``StatisticsPlanningMode.OFF`` by default.
+
+        This can be set using the ``CUDF_POLARS__EXECUTOR__STATISTICS_PLANNING_MODE``
+        environment variable.
 
     Notes
     -----
@@ -431,6 +450,13 @@ class StreamingExecutor:
             f"{_env_prefix}__SINK_TO_DIRECTORY", _bool_converter, default=None
         )
     )
+    statistics_planning_mode: StatisticsPlanningMode = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__STATISTICS_PLANNING_MODE",
+            StatisticsPlanningMode.__call__,
+            default=StatisticsPlanningMode.ON,
+        )
+    )
 
     def __post_init__(self) -> None:  # noqa: D105
         # Handle shuffle_method defaults for streaming executor
@@ -479,6 +505,9 @@ class StreamingExecutor:
             )
         object.__setattr__(self, "scheduler", Scheduler(self.scheduler))
         object.__setattr__(self, "shuffle_method", ShuffleMethod(self.shuffle_method))
+        object.__setattr__(
+            self, "statistics_planning_mode", StatisticsPlanningMode(self.statistics_planning_mode)
+        )
 
         if self.scheduler == "distributed":
             if self.sink_to_directory is False:

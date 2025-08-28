@@ -13,15 +13,15 @@ from typing import TYPE_CHECKING
 from cudf_polars.dsl.expr import Col, Expr, GroupedRollingWindow, UnaryFunction
 from cudf_polars.dsl.ir import Union
 from cudf_polars.dsl.traversal import traversal
-from cudf_polars.experimental.base import PartitionInfo
+from cudf_polars.experimental.base import ColumnStat, PartitionInfo
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping, Sequence
 
-    from cudf_polars.bsae import ColumnStat, ColumnStats
     from cudf_polars.containers import DataFrame
     from cudf_polars.dsl.expr import Expr
     from cudf_polars.dsl.ir import IR
+    from cudf_polars.experimental.base import ColumnStats
     from cudf_polars.experimental.dispatch import LowerIRTransformer
     from cudf_polars.utils.config import ConfigOptions
 
@@ -122,9 +122,9 @@ def _get_unique_fractions(
                     0.00001,
                 )
 
-    # Debug write to file
-    with open("unique_fractions.txt", "a") as f:
-        f.write(f"{unique_fractions}\n")
+    # # Debug write to file
+    # with open("unique_fractions.txt", "a") as f:
+    #     f.write(f"{unique_fractions}\n")
 
     # Update with user-provided unique-fractions
     unique_fractions.update(
