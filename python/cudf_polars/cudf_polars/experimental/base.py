@@ -198,13 +198,16 @@ class ColumnStats:
         Child ColumnStats objects.
     source_info
         Column source information.
+    unique_count
+        Unique-value count.
     """
 
-    __slots__ = ("children", "name", "source_info")
+    __slots__ = ("children", "name", "source_info", "unique_count")
 
     name: str
     children: tuple[ColumnStats, ...]
     source_info: ColumnSourceInfo
+    unique_count: ColumnStat[int]
 
     def __init__(
         self,
@@ -212,10 +215,12 @@ class ColumnStats:
         *,
         children: tuple[ColumnStats, ...] = (),
         source_info: ColumnSourceInfo | None = None,
+        unique_count: ColumnStat[int] | None = None,
     ) -> None:
         self.name = name
         self.children = children
         self.source_info = source_info or ColumnSourceInfo(DataSourceInfo(), name)
+        self.unique_count = unique_count or ColumnStat[int](None)
 
     def new_parent(
         self,

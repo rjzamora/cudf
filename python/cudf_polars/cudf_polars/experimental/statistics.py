@@ -384,9 +384,7 @@ def _(
     return _extract_dataframescan_stats(ir)
 
 
-def child_row_counts(
-    ir: IR, stats: StatsCollector, *, strict: bool = True
-) -> list[int]:
+def child_row_counts(ir: IR, stats: StatsCollector) -> list[int]:
     """
     Get row-count estimates for all children of the given IR node.
 
@@ -396,8 +394,6 @@ def child_row_counts(
         IR node to get row-count estimates for.
     stats
         StatsCollector object to get row-count estimates from.
-    strict
-        If True, returns an empty list if any child has an unknown row-count estimate.
 
     Returns
     -------
@@ -405,12 +401,7 @@ def child_row_counts(
     """
     child_row_counts: list[int] = []
     for child in ir.children:
-        if (value := stats.row_count[child].value) is None:
-            if strict:
-                # If strict, return an empty list if any
-                # child has an unknown row-count estimate.
-                return []
-        else:
+        if (value := stats.row_count[child].value) is not None:
             child_row_counts.append(value)
     return child_row_counts
 
@@ -422,24 +413,17 @@ def _(ir: IR, stats: StatsCollector, config_options: ConfigOptions) -> None:
     stats.row_count[ir] = ColumnStat[int](
         max(child_row_counts(ir, stats), default=None)
     )
-
-
-@update_column_stats.register(GroupBy)
-def _(ir: GroupBy, stats: StatsCollector, config_options: ConfigOptions) -> None:
-    key_names = [n.name for n in ir.keys]
-    child, = ir.children
-    child_column_stats = stats.column_stats[child]
-    child_row_count_estimate = stats.row_count[child].value
-
-    counts = [child_column_stats[k].source_info.unique_count_estimate.value for k in key_names]
-    known_count = sum(c for c in counts if c is not None)
-    unknown = sum(c is None for c in counts)
-    if unknown == len(counts):
-        # Total guess
-        stats.row_count[ir] = ColumnStat[int](max(1, child_row_count_estimate // 100))
-    else:
-        # Guess each additional key introduces a factor of 3
-        stats.row_count[ir] = ColumnStat[int](known_count * 3**unknown)
+    for column_stats in stats.column_stats[ir].values():
+        column_stats.unique_count = ColumnStat[int](
+            max(
+                (
+                    cs.unique_count.value
+                    for cs in column_stats.children
+                    if cs.unique_count.value is not None
+                ),
+                default=None,
+            )
+        )
 
 
 @update_column_stats.register(DataFrameScan)
@@ -455,9 +439,12 @@ def _(ir: DataFrameScan, stats: StatsCollector, config_options: ConfigOptions) -
     # Update unique-count estimates with sampled statistics
     for column_stats in stats.column_stats[ir].values():
         if column_stats.source_info.unique_count_estimate.value is None:
+            # We don't have a unique-count estimate, so we need to sample the data.
             source_unique_stats = column_stats.source_info.unique_stats(force=False)
             if source_unique_stats.count.value is not None:
-                column_stats.source_info.unique_count_estimate = source_unique_stats.count
+                column_stats.unique_count = source_unique_stats.count
+        else:
+            column_stats.unique_count = column_stats.source_info.unique_count_estimate
 
 
 @update_column_stats.register(Scan)
@@ -474,16 +461,41 @@ def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
         # No column stats available.
         stats.row_count[ir] = ColumnStat[int](None)
 
-    # Update unique-count estimates with sampled statistics
+    # Update unique-count estimates with estimated and/or sampled statistics
     for column_stats in stats.column_stats[ir].values():
         if column_stats.source_info.unique_count_estimate.value is None:
+            # We don't have a unique-count estimate, so we need to sample the data.
             source_unique_stats = column_stats.source_info.unique_stats(force=False)
             if source_unique_stats.count.value is not None:
-                column_stats.source_info.unique_count_estimate = source_unique_stats.count
+                column_stats.unique_count = source_unique_stats.count
             elif source_unique_stats.fraction.value is not None and stats.row_count[ir].value is not None:
-                column_stats.source_info.unique_count_estimate = ColumnStat[int](
+                column_stats.unique_count = ColumnStat[int](
                     source_unique_stats.fraction.value * stats.row_count[ir].value
                 )
+        else:
+            column_stats.unique_count = column_stats.source_info.unique_count_estimate
+
+
+@update_column_stats.register(GroupBy)
+def _(ir: GroupBy, stats: StatsCollector, config_options: ConfigOptions) -> None:
+    key_names = [n.name for n in ir.keys]
+    child, = ir.children
+    child_column_stats = stats.column_stats[child]
+    child_row_count_estimate = stats.row_count[child].value
+
+    counts = [child_column_stats[k].unique_count.value for k in key_names]
+    known_count = sum(c for c in counts if c is not None)
+    unknown = sum(c is None for c in counts)
+    if unknown == len(counts):
+        # Total guess (TODO: Revise this)
+        stats.row_count[ir] = ColumnStat[int](max(1, child_row_count_estimate // 100))
+    else:
+        # Guess each additional key introduces a factor of 3 (TODO: Revise this)
+        stats.row_count[ir] = ColumnStat[int](known_count * 3**unknown)
+
+    # Inherit unique-count from child
+    for column_stats in stats.column_stats[ir].values():
+        column_stats.unique_count = column_stats.children[0].unique_count
 
 
 @update_column_stats.register(Join)
@@ -513,10 +525,33 @@ def _(ir: Join, stats: StatsCollector, config_options: ConfigOptions) -> None:
         else:
             stats.row_count[ir] = ColumnStat[int](max((1, left_rows, right_rows)))
 
+    # Assume maximum unique-count for each column.
+    for column_stats in stats.column_stats[ir].values():
+        column_stats.unique_count = ColumnStat[int](
+            max(
+                (
+                    cs.unique_count.value
+                    for cs in column_stats.children
+                    if cs.unique_count.value is not None
+                ),
+                default=None,
+            )
+        )
+
 
 @update_column_stats.register(Union)
 def _(ir: Union, stats: StatsCollector, config_options: ConfigOptions) -> None:
     # Sum child row-count estimates.
-    # Note: We cannot inherit unique-stats information from children.
     row_counts = child_row_counts(ir, stats)
-    stats.row_count[ir] = ColumnStat[int](sum(row_counts) if row_counts else None)
+    stats.row_count[ir] = ColumnStat[int](sum(row_counts) or None)
+    # Add up unique counts (NOTE: This is probably very conservative).
+    for column_stats in stats.column_stats[ir].values():
+        column_stats.unique_count = ColumnStat[int](
+            sum(
+                (
+                    cs.unique_count.value
+                    for cs in column_stats.children
+                    if cs.unique_count.value is not None
+                ),
+            ) or None
+        )
