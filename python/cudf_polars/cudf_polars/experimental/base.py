@@ -84,6 +84,11 @@ class UniqueStats:
         Unique-value fraction. This corresponds to the total
         number of unique values (count) divided by the total
         number of rows.
+
+    Notes
+    -----
+    This class is used to track unique-value column statistics
+    that have been sampled from a data source.
     """
 
     count: ColumnStat[int] = dataclasses.field(default_factory=ColumnStat[int])
@@ -136,17 +141,22 @@ class ColumnSourceInfo:
     direct access to column-specific information.
     """
 
-    __slots__ = ("_allow_unique_sampling", "column_name", "unique_count_estimate", "table_source_info")
+    __slots__ = (
+        "_allow_unique_sampling",
+        "column_name",
+        "implied_unique_count",
+        "table_source_info",
+    )
     table_source_info: DataSourceInfo
     column_name: str
-    unique_count_estimate: ColumnStat[int]
+    implied_unique_count: ColumnStat[int]
     """Unique-value count implied by join heuristics."""
     _allow_unique_sampling: bool
 
     def __init__(self, table_source_info: DataSourceInfo, column_name: str) -> None:
         self.table_source_info = table_source_info
         self.column_name = column_name
-        self.unique_count_estimate = ColumnStat[int](None)
+        self.implied_unique_count = ColumnStat[int](None)
         self._allow_unique_sampling = False
 
     @property
@@ -268,17 +278,23 @@ class JoinKey:
     """
 
     column_stats: tuple[ColumnStats, ...]
-    unique_count_estimate: int | None
+    implied_unique_count: int | None
     """Estimated unique-value count from join heuristics."""
 
     def __init__(self, *column_stats: ColumnStats) -> None:
         self.column_stats = column_stats
-        self.unique_count_estimate = None
+        self.implied_unique_count = None
 
     @cached_property
     def source_row_count(self) -> int | None:
-        """Return the estimated row-count of the source columns."""
-        return min(
+        """
+        Return the estimated row-count of the source columns.
+
+        Notes
+        -----
+        This is the maximum row-count estimate of the source columns.
+        """
+        return max(
             (
                 cs.source_info.row_count.value
                 for cs in self.column_stats
@@ -288,29 +304,48 @@ class JoinKey:
         )
 
 
+class JoinInfo:
+    """
+    Join information.
+
+    Notes
+    -----
+    This class is used to track mappings between joined-on
+    columns and joined-on keys (groups of columns). We need
+    these mappings to calculate equivalence sets and make
+    join-based unique-count and row-count estimates.
+    """
+
+    __slots__ = ("column_map", "join_map", "key_map")
+
+    column_map: MutableMapping[ColumnStats, set[ColumnStats]]
+    """Mapping between joined columns."""
+    key_map: MutableMapping[JoinKey, set[JoinKey]]
+    """Mapping between joined keys (groups of columns)."""
+    join_map: dict[IR, list[JoinKey]]
+    """Mapping between IR nodes and associated join keys."""
+
+    def __init__(self) -> None:
+        self.column_map: MutableMapping[ColumnStats, set[ColumnStats]] = defaultdict(
+            set[ColumnStats]
+        )
+        self.key_map: MutableMapping[JoinKey, set[JoinKey]] = defaultdict(set[JoinKey])
+        self.join_map: dict[IR, list[JoinKey]] = {}
+
+
 class StatsCollector:
     """Column statistics collector."""
 
-    __slots__ = ("column_stats", "join_cols", "join_keys", "joins", "row_count")
+    __slots__ = ("column_stats", "join_info", "row_count")
 
     row_count: dict[IR, ColumnStat[int]]
     """Estimated row count for each IR node."""
     column_stats: dict[IR, dict[str, ColumnStats]]
     """Column statistics for each IR node."""
-    join_keys: MutableMapping[JoinKey, set[JoinKey]]
-    """Join-key mappings."""
-    join_cols: MutableMapping[ColumnStats, set[ColumnStats]]
-    """Join-key mappings."""
-    joins: dict[IR, list[JoinKey]]
-    """Join keys associated with each IR node."""
+    join_info: JoinInfo
+    """Join information."""
 
     def __init__(self) -> None:
         self.row_count: dict[IR, ColumnStat[int]] = {}
         self.column_stats: dict[IR, dict[str, ColumnStats]] = {}
-        self.join_keys: MutableMapping[JoinKey, set[JoinKey]] = defaultdict(
-            set[JoinKey]
-        )
-        self.join_cols: MutableMapping[ColumnStats, set[ColumnStats]] = defaultdict(
-            set[ColumnStats]
-        )
-        self.joins: dict[IR, list[JoinKey]] = {}
+        self.join_info = JoinInfo()

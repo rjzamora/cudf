@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-import operator
 import math
+import operator
 import warnings
 from functools import reduce
 from itertools import chain
@@ -16,7 +16,7 @@ import pylibcudf as plc
 from cudf_polars.dsl.expr import Col, Expr, GroupedRollingWindow, UnaryFunction
 from cudf_polars.dsl.ir import Union
 from cudf_polars.dsl.traversal import traversal
-from cudf_polars.experimental.base import ColumnStat, PartitionInfo, StatsCollector
+from cudf_polars.experimental.base import ColumnStat, PartitionInfo
 from cudf_polars.utils.config import StatisticsPlanningMode
 
 if TYPE_CHECKING:
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from cudf_polars.containers import DataFrame
     from cudf_polars.dsl.expr import Expr
     from cudf_polars.dsl.ir import IR
-    from cudf_polars.experimental.base import ColumnStats
+    from cudf_polars.experimental.base import ColumnStats, StatsCollector
     from cudf_polars.experimental.dispatch import LowerIRTransformer
     from cudf_polars.utils.config import ConfigOptions
 
@@ -112,7 +112,6 @@ def _estimate_ideal_partition_count(
     config_options: ConfigOptions,
 ) -> int | None:
     """Estimate the ideal number of partitions for a query node."""
-
     assert config_options.executor.name == "streaming", (
         "'in-memory' executor not supported in '_estimate_ideal_partition_count'"
     )
@@ -120,7 +119,7 @@ def _estimate_ideal_partition_count(
     if (
         config_options.executor.statistics_planning_mode == StatisticsPlanningMode.OFF
         or row_count.value is None
-    ):        
+    ):
         return None
 
     size = 0
@@ -154,12 +153,12 @@ def _get_unique_fractions(
     unique_fractions: dict[str, float] = {}
     column_stats = column_stats or {}
     row_count = row_count or ColumnStat[int](None)
-    if row_count.value is not None:
+    if isinstance(row_count.value, int) and row_count.value > 0:
         for c in set(column_names).intersection(column_stats):
-            if column_stats[c].unique_count.value is not None:
+            if (unique_count := column_stats[c].unique_count.value) is not None:
                 # Use unique_count_estimate (if available)
                 unique_fractions[c] = max(
-                    min(1.0, column_stats[c].unique_count.value / row_count.value),
+                    min(1.0, unique_count / row_count.value),
                     0.00001,
                 )
 

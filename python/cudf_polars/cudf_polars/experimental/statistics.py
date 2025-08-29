@@ -12,7 +12,6 @@ from cudf_polars.dsl.ir import (
     IR,
     DataFrameScan,
     Distinct,
-    Filter,
     GroupBy,
     HConcat,
     Join,
@@ -35,6 +34,7 @@ from cudf_polars.utils.config import StatisticsPlanningMode
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from cudf_polars.experimental.base import JoinInfo
     from cudf_polars.utils.config import ConfigOptions
 
 
@@ -68,7 +68,7 @@ def collect_statistics(root: IR, config_options: ConfigOptions) -> StatsCollecto
     # Here we use PK-FK heuristics to estimate the unique-count
     # for each join key (without needing to calculate unique-value
     # statistics with sampled data).
-    apply_pkfk_heuristics(stats.join_keys, stats.join_cols)
+    apply_pkfk_heuristics(stats.join_info)
 
     # Update statistics for each node.
     # Here we set local row-count and unique-value statistics
@@ -105,15 +105,15 @@ def collect_base_stats(root: IR, config_options: ConfigOptions) -> StatsCollecto
     for node in post_traversal([root]):
         # Initialize column statistics from datasource information
         stats.column_stats[node] = initialize_column_stats(node, stats, config_options)
-        # Initialize Join-key information
+        # Initialize join information
         if isinstance(node, Join):
-            initialize_join_key_info(node, stats)
+            initialize_join_info(node, stats)
     return stats
 
 
-def initialize_join_key_info(node: Join, stats: StatsCollector) -> None:
+def initialize_join_info(node: Join, stats: StatsCollector) -> None:
     """
-    Initialize join-key information for the given node.
+    Initialize join information for the given node.
 
     Parameters
     ----------
@@ -124,32 +124,33 @@ def initialize_join_key_info(node: Join, stats: StatsCollector) -> None:
 
     Notes
     -----
-    This function updates ``stats.joins`` and ``stats.join_keys``.
+    This function updates ``stats.join_info``.
     """
     left, right = node.children
+    join_info = stats.join_info
     right_keys = [stats.column_stats[right][n.name] for n in node.right_on]
     left_keys = [stats.column_stats[left][n.name] for n in node.left_on]
     lkey = JoinKey(*right_keys)
     rkey = JoinKey(*left_keys)
-    stats.join_keys[lkey].add(rkey)
-    stats.join_keys[rkey].add(lkey)
-    stats.joins[node] = [lkey, rkey]
+    join_info.key_map[lkey].add(rkey)
+    join_info.key_map[rkey].add(lkey)
+    join_info.join_map[node] = [lkey, rkey]
     for u, v in zip(left_keys, right_keys, strict=True):
-        stats.join_cols[u].add(v)
-        stats.join_cols[v].add(u)
+        join_info.column_map[u].add(v)
+        join_info.column_map[v].add(u)
 
 
 T = TypeVar("T")
 
 
-def find_equivalence_sets(joins: Mapping[T, set[T]]) -> list[set[T]]:
+def find_equivalence_sets(join_map: Mapping[T, set[T]]) -> list[set[T]]:
     """
     Find equivalence sets in a join-key mapping.
 
     Parameters
     ----------
-    joins
-        Join-key mapping to find equivalence sets in.
+    join_map
+        Joined key or column mapping to find equivalence sets in.
 
     Returns
     -------
@@ -161,13 +162,13 @@ def find_equivalence_sets(joins: Mapping[T, set[T]]) -> list[set[T]]:
     """
     seen = set()
     components = []
-    for v in joins:
+    for v in join_map:
         if v not in seen:
             cluster = {v}
             stack = [v]
             while stack:
                 node = stack.pop()
-                for n in joins[node]:
+                for n in join_map[node]:
                     if n not in cluster:
                         cluster.add(n)
                         stack.append(n)
@@ -176,34 +177,32 @@ def find_equivalence_sets(joins: Mapping[T, set[T]]) -> list[set[T]]:
     return components
 
 
-def apply_pkfk_heuristics(join_keys: Mapping[JoinKey, set[JoinKey]], join_cols: Mapping[ColumnStats, set[ColumnStats]]) -> None:
+def apply_pkfk_heuristics(join_info: JoinInfo) -> None:
     """
     Apply PK-FK unique-count heuristics to join keys.
 
     Parameters
     ----------
-    join_keys
-        Join-key mapping to apply PK-FK heuristics to.
-    join_cols
-        Column-join mapping to apply PK-FK heuristics to.
+    join_info
+        Join information to apply PK-FK heuristics to.
 
     Notes
     -----
     This function modifies the ``JoinKey`` objects being tracked
-    in ``StatsCollector.joins`` and ``StatsCollector.join_keys``
-    using PK-FK heuristics to estimate the local unique-value count.
-    It also modifies the ``ColumnStats`` objects being tracked
-    in ``StatsCollector.column_stats`` using the same heuristics.
+    in ``StatsCollector.join_info`` using PK-FK heuristics to
+    estimate the "implied" unique-value count. This function also
+    modifies the inderlying ``ColumnStats`` objects included in
+    a join key.
     """
     # This applies the PK-FK matching scheme of
     # https://blobs.duckdb.org/papers/tom-ebergen-msc-thesis-join-order-optimization-with-almost-no-statistics.pdf
     # See section 3.2
-    for keys in find_equivalence_sets(join_keys):
-        unique_count_estimate = max(
+    for keys in find_equivalence_sets(join_info.key_map):
+        implied_unique_count = max(
             (
-                c.unique_count_estimate
+                c.implied_unique_count
                 for c in keys
-                if c.unique_count_estimate is not None
+                if c.implied_unique_count is not None
             ),
             # Default unique-count estimate is the minimum source row count
             default=min(
@@ -213,25 +212,29 @@ def apply_pkfk_heuristics(join_keys: Mapping[JoinKey, set[JoinKey]], join_cols: 
         )
         for key in keys:
             # Update unique-count estimate for each join key
-            key.unique_count_estimate = unique_count_estimate
+            key.implied_unique_count = implied_unique_count
 
-    # We separately apply PK-FK heuristics to individual columns
-    # so that we can use the unique-count estimate elsewhere in
-    # the query plan.
-    for cols in find_equivalence_sets(join_cols):
+    # We separately apply PK-FK heuristics to individual columns so
+    # that we can update ColumnStats.source_info.implied_unique_count
+    # and use the per-column information elsewhere in the query plan.
+    for cols in find_equivalence_sets(join_info.column_map):
         unique_count = max(
             (
-                cs.source_info.unique_count_estimate.value
+                cs.source_info.implied_unique_count.value
                 for cs in cols
-                if cs.source_info.unique_count_estimate.value is not None
+                if cs.source_info.implied_unique_count.value is not None
             ),
             default=min(
-                (cs.source_info.row_count.value for cs in cols if cs.source_info.row_count.value is not None),
+                (
+                    cs.source_info.row_count.value
+                    for cs in cols
+                    if cs.source_info.row_count.value is not None
+                ),
                 default=None,
             ),
         )
         for cs in cols:
-            cs.source_info.unique_count_estimate = ColumnStat[int](unique_count)
+            cs.source_info.implied_unique_count = ColumnStat[int](unique_count)
 
 
 def _update_unique_stats_columns(
@@ -407,17 +410,22 @@ def child_row_counts(ir: IR, stats: StatsCollector) -> list[int]:
     -------
     List of non-null row-count estimates for all children.
     """
-    child_row_counts: list[int] = []
-    for child in ir.children:
-        if (value := stats.row_count[child].value) is not None:
-            child_row_counts.append(value)
+    child_row_counts: list[int] = [
+        value
+        for child in ir.children
+        if (value := stats.row_count[child].value) is not None
+    ]
+    # for child in ir.children:
+    #     if (value := stats.row_count[child].value) is not None:
+    #         child_row_counts.append(value)
     return child_row_counts
 
 
 def copy_child_unique_counts(
     column_stats_mapping: dict[str, ColumnStats], selectivity: float = 1.0
 ) -> None:
-    """Copy unique-count estimates from children to parent.
+    """
+    Copy unique-count estimates from children to parent.
 
     Parameters
     ----------
@@ -432,7 +440,11 @@ def copy_child_unique_counts(
         else:
             column_stats.unique_count = ColumnStat[int](
                 max(
-                    (cs.unique_count.value for cs in column_stats.children if cs.unique_count.value is not None),
+                    (
+                        cs.unique_count.value
+                        for cs in column_stats.children
+                        if cs.unique_count.value is not None
+                    ),
                     default=None,
                 )
             )
@@ -474,13 +486,13 @@ def _(ir: DataFrameScan, stats: StatsCollector, config_options: ConfigOptions) -
 
     # Update unique-count estimates with sampled statistics
     for column_stats in stats.column_stats[ir].values():
-        if column_stats.source_info.unique_count_estimate.value is None:
+        if column_stats.source_info.implied_unique_count.value is None:
             # We don't have a unique-count estimate, so we need to sample the data.
             source_unique_stats = column_stats.source_info.unique_stats(force=False)
             if source_unique_stats.count.value is not None:
                 column_stats.unique_count = source_unique_stats.count
         else:
-            column_stats.unique_count = column_stats.source_info.unique_count_estimate
+            column_stats.unique_count = column_stats.source_info.implied_unique_count
 
 
 @update_column_stats.register(Scan)
@@ -499,23 +511,25 @@ def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
 
     # Update unique-count estimates with estimated and/or sampled statistics
     for column_stats in stats.column_stats[ir].values():
-        if column_stats.source_info.unique_count_estimate.value is None:
+        if column_stats.source_info.implied_unique_count.value is None:
             # We don't have a unique-count estimate, so we need to sample the data.
             source_unique_stats = column_stats.source_info.unique_stats(force=False)
             if source_unique_stats.count.value is not None:
                 column_stats.unique_count = source_unique_stats.count
-            elif source_unique_stats.fraction.value is not None and stats.row_count[ir].value is not None:
+            elif (
+                unique_fraction := source_unique_stats.fraction.value
+            ) is not None and (row_count := stats.row_count[ir].value) is not None:
                 column_stats.unique_count = ColumnStat[int](
-                    source_unique_stats.fraction.value * stats.row_count[ir].value
+                    max(1, int(unique_fraction * row_count))
                 )
         else:
-            column_stats.unique_count = column_stats.source_info.unique_count_estimate
+            column_stats.unique_count = column_stats.source_info.implied_unique_count
 
 
 @update_column_stats.register(GroupBy)
 def _(ir: GroupBy, stats: StatsCollector, config_options: ConfigOptions) -> None:
     key_names = [n.name for n in ir.keys]
-    child, = ir.children
+    (child,) = ir.children
     child_column_stats = stats.column_stats[child]
     child_row_count_estimate = stats.row_count[child].value
 
@@ -524,7 +538,11 @@ def _(ir: GroupBy, stats: StatsCollector, config_options: ConfigOptions) -> None
     unknown = sum(c is None for c in counts)
     if unknown == len(counts):
         # Total guess (TODO: Revise this)
-        stats.row_count[ir] = ColumnStat[int](max(1, child_row_count_estimate // 100))
+        stats.row_count[ir] = ColumnStat[int](
+            None
+            if child_row_count_estimate is None
+            else max(1, child_row_count_estimate // 100)
+        )
     else:
         # Guess each additional key introduces a factor of 3 (TODO: Revise this)
         stats.row_count[ir] = ColumnStat[int](known_count * 3**unknown)
@@ -542,19 +560,19 @@ def _(ir: Join, stats: StatsCollector, config_options: ConfigOptions) -> None:
         stats.row_count[ir] = ColumnStat[int](None)
     else:
         # Both children have row-count estimates.
-        join_key_unique_count_estimate = max(
+        join_key_implied_unique_count = max(
             # Use PK-FK join unique-count estimates in case
             # directly-sampled statistics are missing.
             [
-                u.unique_count_estimate
-                for u in stats.joins[ir]
-                if u.unique_count_estimate is not None
+                u.implied_unique_count
+                for u in stats.join_info.join_map[ir]
+                if u.implied_unique_count is not None
             ],
             default=None,
         )
-        if join_key_unique_count_estimate is not None:
+        if join_key_implied_unique_count is not None:
             stats.row_count[ir] = ColumnStat[int](
-                max(1, (left_rows * right_rows) // join_key_unique_count_estimate)
+                max(1, (left_rows * right_rows) // join_key_implied_unique_count)
             )
         else:
             stats.row_count[ir] = ColumnStat[int](max((1, left_rows, right_rows)))
@@ -576,7 +594,8 @@ def _(ir: Union, stats: StatsCollector, config_options: ConfigOptions) -> None:
                     for cs in column_stats.children
                     if cs.unique_count.value is not None
                 ),
-            ) or None
+            )
+            or None
         )
 
 
