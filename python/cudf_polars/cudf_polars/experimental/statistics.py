@@ -12,6 +12,7 @@ from cudf_polars.dsl.ir import (
     IR,
     DataFrameScan,
     Distinct,
+    Filter,
     GroupBy,
     HConcat,
     Join,
@@ -421,9 +422,7 @@ def child_row_counts(ir: IR, stats: StatsCollector) -> list[int]:
     return child_row_counts
 
 
-def copy_child_unique_counts(
-    column_stats_mapping: dict[str, ColumnStats], selectivity: float = 1.0
-) -> None:
+def copy_child_unique_counts(column_stats_mapping: dict[str, ColumnStats]) -> None:
     """
     Copy unique-count estimates from children to parent.
 
@@ -431,8 +430,6 @@ def copy_child_unique_counts(
     ----------
     column_stats_mapping
         Mapping of column names to ColumnStats objects.
-    selectivity
-        Selectivity of the child unique-count estimate.
     """
     for column_stats in column_stats_mapping.values():
         if len(column_stats.children) == 1:
@@ -447,10 +444,6 @@ def copy_child_unique_counts(
                     ),
                     default=None,
                 )
-            )
-        if column_stats.unique_count.value is not None and selectivity < 1.0:
-            column_stats.unique_count = ColumnStat[int](
-                int(column_stats.unique_count.value * selectivity)
             )
 
 
@@ -599,16 +592,16 @@ def _(ir: Union, stats: StatsCollector, config_options: ConfigOptions) -> None:
         )
 
 
-# @update_column_stats.register(Filter)
-# def _(ir: Filter, stats: StatsCollector, config_options: ConfigOptions) -> None:
-#     # Default `update_column_stats` implementation.
-#     # Propagate largest child row-count estimate.
-#     child, = ir.children
-#     selectivity = 0.8
-#     if (child_count := stats.row_count[child].value) is not None:
-#         stats.row_count[ir] = ColumnStat[int](max(1, int(child_count * selectivity)))
-#     else:
-#         stats.row_count[ir] = ColumnStat[int](None)
+@update_column_stats.register(Filter)
+def _(ir: Filter, stats: StatsCollector, config_options: ConfigOptions) -> None:
+    # Default `update_column_stats` implementation.
+    # Propagate largest child row-count estimate.
+    (child,) = ir.children
+    selectivity = 0.8
+    if (child_count := stats.row_count[child].value) is not None:
+        stats.row_count[ir] = ColumnStat[int](max(1, int(child_count * selectivity)))
+    else:
+        stats.row_count[ir] = ColumnStat[int](None)
 
-#     # TODO: Should we apply selectivity to the unique-count estimates?
-#     copy_child_unique_counts(stats.column_stats[ir], selectivity=selectivity)
+    # TODO: Should we apply selectivity to the unique-count estimates?
+    copy_child_unique_counts(stats.column_stats[ir])

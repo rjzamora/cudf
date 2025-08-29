@@ -126,14 +126,14 @@ def _estimate_ideal_partition_count(
     column_stats = stats.column_stats.get(ir, {})
     for col, dtype in ir.schema.items():
         if col in column_stats:
-            if (itemsize := column_stats[col].source_info.storage_size.value) is None:
-                try:
-                    itemsize = plc.types.size_of(dtype.plc)
-                except RuntimeError:
-                    # Pylibcudf will raise a RuntimeError for non fixed-width types.
-                    # Default to 32 bytes for these cases. This is basically a
-                    # complete guess, but it's better than nothing.
-                    itemsize = 32
+            # if (itemsize := column_stats[col].source_info.storage_size.value) is None:
+            try:
+                itemsize = plc.types.size_of(dtype.plc)
+            except RuntimeError:
+                # Pylibcudf will raise a RuntimeError for non fixed-width types.
+                # Default to 32 bytes for these cases. This is basically a
+                # complete guess, but may be better than nothing.
+                itemsize = 32
             size += row_count.value * itemsize
         else:
             return None
@@ -158,7 +158,8 @@ def _get_unique_fractions(
             if (unique_count := column_stats[c].unique_count.value) is not None:
                 # Use unique_count_estimate (if available)
                 unique_fractions[c] = max(
-                    min(1.0, unique_count / row_count.value),
+                    # NOTE: We multiply by 0.8 to encourage repartitioning.
+                    min(1.0, 0.8 * (unique_count / row_count.value)),
                     0.00001,
                 )
 
