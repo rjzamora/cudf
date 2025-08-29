@@ -158,8 +158,7 @@ def _get_unique_fractions(
             if (unique_count := column_stats[c].unique_count.value) is not None:
                 # Use unique_count_estimate (if available)
                 unique_fractions[c] = max(
-                    # NOTE: We multiply by 0.8 to encourage repartitioning.
-                    min(1.0, 0.8 * (unique_count / row_count.value)),
+                    min(1.0, unique_count / row_count.value),
                     0.00001,
                 )
 
