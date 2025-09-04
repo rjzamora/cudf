@@ -33,7 +33,6 @@ from cudf_polars.experimental.dispatch import (
     update_column_stats,
 )
 from cudf_polars.utils import conversion
-from cudf_polars.utils.config import StatisticsPlanningMode
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -58,12 +57,6 @@ def collect_statistics(root: IR, config_options: ConfigOptions) -> StatsCollecto
     -------
     A StatsCollector object with populated column statistics.
     """
-    assert config_options.executor.name == "streaming", (
-        "'in-memory' executor not supported in 'collect_statistics'"
-    )
-    if config_options.executor.statistics_planning_mode == StatisticsPlanningMode.OFF:
-        return StatsCollector()
-
     # Start with base statistics.
     # Here we build an outline of the statistics that will be
     # collected before any real data is sampled.
