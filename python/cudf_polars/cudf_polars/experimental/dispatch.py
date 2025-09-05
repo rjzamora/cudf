@@ -74,7 +74,9 @@ def lower_ir_node(
 
 @singledispatch
 def generate_ir_tasks(
-    ir: IR, partition_info: MutableMapping[IR, PartitionInfo]
+    ir: IR,
+    partition_info: MutableMapping[IR, PartitionInfo],
+    config_options: ConfigOptions,
 ) -> MutableMapping[Any, Any]:
     """
     Generate a task graph for evaluation of an IR node.
@@ -85,6 +87,8 @@ def generate_ir_tasks(
         IR node to generate tasks for.
     partition_info
         Partitioning information, obtained from :func:`lower_ir_graph`.
+    config_options
+        GPUEngine configuration options.
 
     Returns
     -------

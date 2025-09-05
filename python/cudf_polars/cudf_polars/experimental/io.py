@@ -28,6 +28,7 @@ from cudf_polars.experimental.base import (
     get_key_name,
 )
 from cudf_polars.experimental.dispatch import generate_ir_tasks, lower_ir_node
+from cudf_polars.experimental.spilling import unspill_and_evaluate
 
 if TYPE_CHECKING:
     from collections.abc import Hashable, MutableMapping
@@ -50,7 +51,7 @@ def _(
     config_options = rec.state["config_options"]
 
     assert config_options.executor.name == "streaming", (
-        "'in-memory' executor not supported in 'generate_ir_tasks'"
+        "'in-memory' executor not supported in 'lower_ir_node'"
     )
 
     rows_per_partition = config_options.executor.max_rows_per_partition
@@ -113,7 +114,7 @@ class ScanPartitionPlan:
         if ir.typ == "parquet":
             # TODO: Use system info to set default blocksize
             assert config_options.executor.name == "streaming", (
-                "'in-memory' executor not supported in 'generate_ir_tasks'"
+                "'in-memory' executor not supported in 'from_scan'"
             )
 
             blocksize: int = config_options.executor.target_partition_size
@@ -430,7 +431,12 @@ def _sink_to_directory(
     ready: None,
 ) -> DataFrame:
     """Sink a partition to a new file."""
-    return Sink.do_evaluate(schema, kind, path, parquet_options, options, df)
+    return unspill_and_evaluate(
+        Sink.do_evaluate,
+        False,  # noqa: FBT003
+        (schema, kind, path, parquet_options, options),
+        df,
+    )
 
 
 def _sink_to_parquet_file(
@@ -519,8 +525,10 @@ def _file_sink_graph(
     if count == 1:
         return {
             (name, 0): (
+                unspill_and_evaluate,
                 sink.do_evaluate,
-                *sink._non_child_args,
+                False,
+                sink._non_child_args,
                 (child_name, 0),
             )
         }
@@ -575,7 +583,9 @@ def _directory_sink_graph(
 
 @generate_ir_tasks.register(StreamingSink)
 def _(
-    ir: StreamingSink, partition_info: MutableMapping[IR, PartitionInfo]
+    ir: StreamingSink,
+    partition_info: MutableMapping[IR, PartitionInfo],
+    config_options: ConfigOptions,
 ) -> MutableMapping[Any, Any]:
     if ir.executor_options.sink_to_directory:
         return _directory_sink_graph(ir, partition_info)

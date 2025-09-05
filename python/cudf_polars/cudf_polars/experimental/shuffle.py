@@ -16,6 +16,7 @@ from cudf_polars.dsl.ir import IR
 from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
 from cudf_polars.experimental.base import get_key_name
 from cudf_polars.experimental.dispatch import generate_ir_tasks, lower_ir_node
+from cudf_polars.experimental.spilling import unspill
 from cudf_polars.experimental.utils import _concat
 
 if TYPE_CHECKING:
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
     from cudf_polars.experimental.dispatch import LowerIRTransformer
     from cudf_polars.experimental.parallel import PartitionInfo
     from cudf_polars.typing import Schema
-    from cudf_polars.utils.config import ShuffleMethod
+    from cudf_polars.utils.config import ConfigOptions, ShuffleMethod
 
 
 # Supported shuffle methods
@@ -40,6 +41,7 @@ class ShuffleOptions(TypedDict):
     column_names: Sequence[str]
     dtypes: Sequence[DataType]
     cluster_kind: str
+    spillable: bool
 
 
 # Experimental rapidsmpf shuffler integration
@@ -62,6 +64,8 @@ class RMPFIntegration:  # pragma: no cover
         if options["cluster_kind"] == "dask":
             from rapidsmpf.integrations.dask import get_worker_context
 
+            if options["spillable"]:
+                df = unspill(df)
         else:
             from rapidsmpf.integrations.single import get_worker_context
 
@@ -103,7 +107,7 @@ class RMPFIntegration:  # pragma: no cover
         shuffler.wait_on(partition_id)
         column_names = options["column_names"]
         dtypes = options["dtypes"]
-        return DataFrame.from_table(
+        result = DataFrame.from_table(
             unpack_and_concat(
                 unspill_partitions(
                     shuffler.extract(partition_id),
@@ -118,6 +122,11 @@ class RMPFIntegration:  # pragma: no cover
             column_names,
             dtypes,
         )
+        if options["spillable"] and options["cluster_kind"] == "dask":
+            from rapidsmpf.integrations.dask.spilling import SpillableWrapper
+
+            return SpillableWrapper(on_device=result)
+        return result
 
 
 class Shuffle(IR):
@@ -189,6 +198,8 @@ def _partition_dataframe(
     A dictionary mapping between int partition indices and
     DataFrame fragments.
     """
+    df = unspill(df)
+
     if df.num_rows == 0:
         # Fast path for empty DataFrame
         return dict.fromkeys(range(count), df)
@@ -280,7 +291,9 @@ def _(
 
 @generate_ir_tasks.register(Shuffle)
 def _(
-    ir: Shuffle, partition_info: MutableMapping[IR, PartitionInfo]
+    ir: Shuffle,
+    partition_info: MutableMapping[IR, PartitionInfo],
+    config_options: ConfigOptions,
 ) -> MutableMapping[Any, Any]:
     # Extract "shuffle_method" configuration
     shuffle_method = ir.shuffle_method
@@ -303,6 +316,11 @@ def _(
 
         shuffle_on = [k.name for k in _keys]
 
+        assert config_options.executor.name == "streaming", (
+            "'in-memory' executor not supported in 'generate_ir_tasks'"
+        )
+        spillable_output = config_options.executor.rapidsmpf_spill
+
         try:
             return rapidsmpf_shuffle_graph(
                 get_key_name(ir.children[0]),
@@ -315,6 +333,7 @@ def _(
                     "column_names": list(ir.schema.keys()),
                     "dtypes": list(ir.schema.values()),
                     "cluster_kind": cluster_kind,
+                    "spillable": spillable_output,
                 },
             )
         except ValueError as err:

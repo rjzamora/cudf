@@ -8,12 +8,13 @@ import operator
 import warnings
 from functools import reduce
 from itertools import chain
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from cudf_polars.dsl.expr import Col, Expr, GroupedRollingWindow, UnaryFunction
 from cudf_polars.dsl.ir import Union
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.experimental.base import PartitionInfo
+from cudf_polars.experimental.spilling import unspill_and_evaluate
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping, Sequence
@@ -25,9 +26,11 @@ if TYPE_CHECKING:
     from cudf_polars.utils.config import ConfigOptions
 
 
-def _concat(*dfs: DataFrame) -> DataFrame:
+def _concat(*dfs: DataFrame, **kwargs: Any) -> DataFrame:
     # Concatenate a sequence of DataFrames vertically
-    return Union.do_evaluate(None, *dfs)
+    spillable_output: bool = kwargs.pop("spillable_output", False)
+    assert not kwargs, "Unexpected keyword arguments in _concat"
+    return unspill_and_evaluate(Union.do_evaluate, spillable_output, (None,), *dfs)
 
 
 def _fallback_inform(msg: str, config_options: ConfigOptions) -> None:

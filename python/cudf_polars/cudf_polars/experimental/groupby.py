@@ -275,7 +275,7 @@ def _(
     else:
         # N-ary tree reduction
         assert config_options.executor.name == "streaming", (
-            "'in-memory' executor not supported in 'generate_ir_tasks'"
+            "'in-memory' executor not supported in 'lower_ir_node'"
         )
 
         n_ary = config_options.executor.groupby_n_ary

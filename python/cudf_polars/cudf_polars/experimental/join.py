@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import operator
-from functools import reduce
+from functools import partial, reduce
 from typing import TYPE_CHECKING, Any
 
 from cudf_polars.dsl.ir import ConditionalJoin, Join, Slice
@@ -13,6 +13,7 @@ from cudf_polars.experimental.base import PartitionInfo, get_key_name
 from cudf_polars.experimental.dispatch import generate_ir_tasks, lower_ir_node
 from cudf_polars.experimental.repartition import Repartition
 from cudf_polars.experimental.shuffle import Shuffle, _partition_dataframe
+from cudf_polars.experimental.spilling import unspill_and_evaluate
 from cudf_polars.experimental.utils import _concat, _fallback_inform, _lower_ir_fallback
 
 if TYPE_CHECKING:
@@ -21,7 +22,7 @@ if TYPE_CHECKING:
     from cudf_polars.dsl.expr import NamedExpr
     from cudf_polars.dsl.ir import IR
     from cudf_polars.experimental.parallel import LowerIRTransformer
-    from cudf_polars.utils.config import ShuffleMethod
+    from cudf_polars.utils.config import ConfigOptions, ShuffleMethod
 
 
 def _maybe_shuffle_frame(
@@ -294,7 +295,9 @@ def _(
 
 @generate_ir_tasks.register(Join)
 def _(
-    ir: Join, partition_info: MutableMapping[IR, PartitionInfo]
+    ir: Join,
+    partition_info: MutableMapping[IR, PartitionInfo],
+    config_options: ConfigOptions,
 ) -> MutableMapping[Any, Any]:
     left, right = ir.children
     output_count = partition_info[ir].count
@@ -308,14 +311,21 @@ def _(
         and partition_info[right].count == output_count
     )
 
+    assert config_options.executor.name == "streaming", (
+        "'in-memory' executor not supported in 'generate_ir_tasks'"
+    )
+    spillable_output = config_options.executor.rapidsmpf_spill
+
     if output_count == 1 or (left_partitioned and right_partitioned):
         # Partition-wise join
         left_name = get_key_name(left)
         right_name = get_key_name(right)
         return {
             key: (
+                unspill_and_evaluate,
                 ir.do_evaluate,
-                *ir._non_child_args,
+                spillable_output,
+                ir._non_child_args,
                 (left_name, i),
                 (right_name, i),
             )
@@ -374,16 +384,21 @@ def _(
 
                 inter_key = (inter_name, part_out, j)
                 graph[(inter_name, part_out, j)] = (
+                    unspill_and_evaluate,
                     ir.do_evaluate,
-                    ir.left_on,
-                    ir.right_on,
-                    ir.options,
+                    spillable_output,
+                    ir._non_child_args,
                     *join_children,
                 )
                 _concat_list.append(inter_key)
             if len(_concat_list) == 1:
                 graph[(out_name, part_out)] = graph.pop(_concat_list[0])
             else:
-                graph[(out_name, part_out)] = (_concat, *_concat_list)
+                func = (
+                    partial(_concat, spillable_output=spillable_output)
+                    if config_options.executor.rapidsmpf_spill
+                    else _concat
+                )
+                graph[(out_name, part_out)] = (func, *_concat_list)
 
         return graph

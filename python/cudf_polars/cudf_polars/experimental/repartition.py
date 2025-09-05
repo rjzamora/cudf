@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import itertools
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from cudf_polars.dsl.ir import IR
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
 
     from cudf_polars.experimental.parallel import PartitionInfo
     from cudf_polars.typing import Schema
+    from cudf_polars.utils.config import ConfigOptions
 
 
 class Repartition(IR):
@@ -44,7 +46,9 @@ class Repartition(IR):
 
 @generate_ir_tasks.register(Repartition)
 def _(
-    ir: Repartition, partition_info: MutableMapping[IR, PartitionInfo]
+    ir: Repartition,
+    partition_info: MutableMapping[IR, PartitionInfo],
+    config_options: ConfigOptions,
 ) -> MutableMapping[Any, Any]:
     # Repartition an IR node.
     # Only supports rapartitioning to fewer (for now).
@@ -52,6 +56,11 @@ def _(
     (child,) = ir.children
     count_in = partition_info[child].count
     count_out = partition_info[ir].count
+
+    assert config_options.executor.name == "streaming", (
+        "in-memory executor not supported in generate_ir_tasks"
+    )
+    spillable_output = config_options.executor.rapidsmpf_spill
 
     if count_out > count_in:  # pragma: no cover
         raise NotImplementedError(
@@ -63,7 +72,13 @@ def _(
     # Spread remainder evenly over the partitions.
     offsets = [0, *itertools.accumulate(n + (i < remainder) for i in range(count_out))]
     child_keys = tuple(partition_info[child].keys(child))
+    # If rapidsmpf_spill is enabled, wrap the output of _concat in a SpillableWrapper.
+    # The output of _concat may be large, so we want it to be spillable.
+    func = partial(_concat, spillable_output=True) if spillable_output else _concat
     return {
-        (key_name, i): (_concat, *child_keys[offsets[i] : offsets[i + 1]])
+        (key_name, i): (
+            func,
+            *child_keys[offsets[i] : offsets[i + 1]],
+        )
         for i in range(count_out)
     }
