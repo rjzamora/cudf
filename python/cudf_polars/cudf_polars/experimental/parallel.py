@@ -20,7 +20,6 @@ from cudf_polars.dsl.ir import (
     IR,
     Cache,
     Filter,
-    GroupBy,
     HConcat,
     HStack,
     MapFunction,
@@ -213,16 +212,13 @@ def _(
     child_names = [get_key_name(c) for c in ir.children]
     bcast_child = [partition_info[c].count == 1 for c in ir.children]
 
-    # Wrap the output of specific IR types in a SpillableWrapper.
-    # For now, this is only GroupBy. We also wrap the output of
-    # Join and Shuffle (whose graph logic is defined elsewhere).
-    # The output of _concat is also wrapped in some cases.
+    # Possibly wrap the output of ir.do_evaluate in a SpillableWrapper.
+    # We also wrap the output of _concat, Join and Shuffle (whose graph
+    # logic is defined elsewhere).
     assert config_options.executor.name == "streaming", (
         "'in-memory' executor not supported in 'generate_ir_tasks'"
     )
-    spillable_output = config_options.executor.rapidsmpf_spill and isinstance(
-        ir, GroupBy
-    )
+    spillable_output = config_options.executor.rapidsmpf_spill
 
     return {
         key: (
