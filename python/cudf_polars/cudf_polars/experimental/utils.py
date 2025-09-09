@@ -17,7 +17,6 @@ from cudf_polars.dsl.expr import Col, Expr, GroupedRollingWindow, UnaryFunction
 from cudf_polars.dsl.ir import Union
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.experimental.base import ColumnStat, PartitionInfo
-from cudf_polars.utils.config import StatisticsPlanningMode
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping, Sequence
@@ -117,8 +116,8 @@ def _estimate_ideal_partition_count(
     )
     row_count = stats.row_count.get(ir, ColumnStat[int](None))
     if (
-        config_options.executor.statistics_planning_mode == StatisticsPlanningMode.OFF
-        or row_count.value is None
+        row_count.value is None
+        or config_options.executor.statistics_planning_options.enable
     ):
         return None
 

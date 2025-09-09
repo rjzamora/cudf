@@ -37,7 +37,6 @@ from cudf_polars.experimental.io import _clear_source_info_cache
 from cudf_polars.experimental.repartition import Repartition
 from cudf_polars.experimental.statistics import collect_statistics
 from cudf_polars.experimental.utils import _concat, _contains_over, _lower_ir_fallback
-from cudf_polars.utils.config import StatisticsPlanningMode
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping
@@ -89,10 +88,10 @@ def lower_ir_graph(
     assert config_options.executor.name == "streaming", (
         "'in-memory' executor not supported in 'lower_ir_graph'"
     )
-    if config_options.executor.statistics_planning_mode == StatisticsPlanningMode.OFF:
-        stats = StatsCollector()
-    else:
+    if config_options.executor.statistics_planning_options.enable:
         stats = collect_statistics(ir, config_options)
+    else:
+        stats = StatsCollector()
 
     state: State = {"config_options": config_options, "stats": stats}
     mapper: LowerIRTransformer = CachingVisitor(lower_ir_node, state=state)
