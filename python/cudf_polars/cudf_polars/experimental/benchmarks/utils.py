@@ -354,7 +354,7 @@ def get_executor_options(
         and run_config.executor == "streaming"
     ):
         executor_options["unique_fraction"] = {
-            # NOTE: Statistics should make this unnecessary
+            # NOTE: Statistics should make this config unnecessary
             # "c_custkey": 0.05,  # We get 1.0 from statistics?
             # "l_orderkey": 1.0,  # We get 0.249987 from statistics?
             # "l_partkey": 0.1,  # We get 0.999394 from statistics?

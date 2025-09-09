@@ -142,12 +142,12 @@ def update_column_stats(
     ir: IR, stats: StatsCollector, config_options: ConfigOptions
 ) -> None:
     """
-    Finalize column statistics for an IR node.
+    Finalize local column statistics for an IR node.
 
     Parameters
     ----------
     ir
-        The IR node to finalize columnstatistics for.
+        The IR node to finalize local column statistics for.
     stats
         The `StatsCollector` object containing known statistics.
     config_options

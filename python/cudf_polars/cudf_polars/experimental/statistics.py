@@ -12,7 +12,6 @@ from cudf_polars.dsl.ir import (
     IR,
     DataFrameScan,
     Distinct,
-    Filter,
     GroupBy,
     HConcat,
     Join,
@@ -59,18 +58,28 @@ def collect_statistics(root: IR, config_options: ConfigOptions) -> StatsCollecto
     """
     # Start with base statistics.
     # Here we build an outline of the statistics that will be
-    # collected before any real data is sampled.
+    # collected before any real data is sampled. We will not
+    # read any Parquet metadata or sample any unique-value
+    # statistics during this step.
+    # (That said, Polars does it's own metadata sampling
+    # before we ever get the logical plan in cudf-polars)
     stats = collect_base_stats(root, config_options)
 
     # Apply PK-FK heuristics.
-    # Here we use PK-FK heuristics to estimate the unique-count
-    # for each join key (without needing to calculate unique-value
-    # statistics with sampled data).
+    # Here we use PK-FK heuristics to estimate the unique count
+    # for each join key. We will not do any unique-value sampling
+    # during this step. However, we will use Parquet metadata to
+    # estimate the row-count for each table source. This metadata
+    # is cached in the DataSourceInfo object for each table.
     apply_pkfk_heuristics(stats.join_info)
 
     # Update statistics for each node.
     # Here we set local row-count and unique-value statistics
-    # on each node in the IR graph.
+    # on each node in the IR graph. We DO perform unique-value
+    # sampling during this step. However, we only sample columns
+    # that have been marked as needing unique-value statistics
+    # during the `collect_base_stats` step. We always sample ALL
+    # "marked" columns within the same table source at once.
     for node in post_traversal([root]):
         update_column_stats(node, stats, config_options)
 
@@ -398,14 +407,14 @@ def _(
     return _extract_dataframescan_stats(ir)
 
 
-def child_row_counts(ir: IR, stats: StatsCollector) -> list[int]:
+def known_child_row_counts(ir: IR, stats: StatsCollector) -> list[int]:
     """
-    Get row-count estimates for all children of the given IR node.
+    Get all non-null row-count estimates for the children of and IR node.
 
     Parameters
     ----------
     ir
-        IR node to get row-count estimates for.
+        IR node to get non-null row-count estimates for.
     stats
         StatsCollector object to get row-count estimates from.
 
@@ -438,20 +447,19 @@ def copy_child_unique_counts(column_stats_mapping: dict[str, ColumnStats]) -> No
         Mapping of column names to ColumnStats objects.
     """
     for column_stats in column_stats_mapping.values():
-        if len(column_stats.children) == 1:
-            column_stats.unique_count = column_stats.children[0].unique_count
-        else:
-            column_stats.unique_count = ColumnStat[int](
-                # Assume we get the maximum child unique-count estimate
-                max(
-                    (
-                        cs.unique_count.value
-                        for cs in column_stats.children
-                        if cs.unique_count.value is not None
-                    ),
-                    default=None,
-                )
-            )
+        column_stats.unique_count = ColumnStat[int](
+            # Assume we get the maximum child unique-count estimate
+            value=max(
+                (
+                    cs.unique_count.value
+                    for cs in column_stats.children
+                    if cs.unique_count.value is not None
+                ),
+                default=None,
+            ),
+            exact=len(column_stats.children) == 1
+            and column_stats.children[0].unique_count.exact,
+        )
 
 
 @update_column_stats.register(IR)
@@ -459,13 +467,15 @@ def _(ir: IR, stats: StatsCollector, config_options: ConfigOptions) -> None:
     # Default `update_column_stats` implementation.
     # Propagate largest child row-count estimate.
     stats.row_count[ir] = ColumnStat[int](
-        max(child_row_counts(ir, stats), default=None)
+        max(known_child_row_counts(ir, stats), default=None)
     )
 
     # Apply slice if relevant.
     # We can also limit the unique-count estimate to the row-count estimate.
     max_unique_count: int | None = None
     if (value := stats.row_count[ir].value) is not None and isinstance(ir, Sort):
+        # Apply slice for IR nodes supporting slice pushdown.
+        # TODO: Include types other than Sort.
         max_unique_count = apply_slice(value, ir.zlice)
         stats.row_count[ir] = ColumnStat[int](max_unique_count)
 
@@ -506,9 +516,7 @@ def _(ir: DataFrameScan, stats: StatsCollector, config_options: ConfigOptions) -
 @update_column_stats.register(Scan)
 def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
     # Use datasource row-count estimate.
-    if ir.n_rows != -1:
-        stats.row_count[ir] = ColumnStat[int](ir.n_rows)
-    elif stats.column_stats[ir]:
+    if stats.column_stats[ir]:
         # TODO: Apply predicate selectivity
         stats.row_count[ir] = next(
             iter(stats.column_stats[ir].values())
@@ -516,6 +524,13 @@ def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
     else:  # pragma: no cover; We always have stats.column_stats[ir]
         # No column stats available.
         stats.row_count[ir] = ColumnStat[int](None)
+
+    # Account for the n_rows argument.
+    if ir.n_rows != -1:
+        if (metadata_value := stats.row_count[ir].value) is not None:
+            stats.row_count[ir] = ColumnStat[int](min(metadata_value, ir.n_rows))
+        else:
+            stats.row_count[ir] = ColumnStat[int](ir.n_rows)
 
     # Update unique-count estimates with estimated and/or sampled statistics
     for column_stats in stats.column_stats[ir].values():
@@ -534,24 +549,30 @@ def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
             column_stats.unique_count = column_stats.source_info.implied_unique_count
 
 
-def _update_distinct_stats(
-    ir: Distinct | GroupBy,
-    stats: StatsCollector,
-    key_names: list[str],
+@update_column_stats.register(Distinct)
+@update_column_stats.register(GroupBy)
+def _(
+    ir: Distinct | GroupBy, stats: StatsCollector, config_options: ConfigOptions
 ) -> None:
-    """Update statistics for a Distinct or GroupBy node."""
+    # Update statistics for a Distinct or GroupBy node.
     (child,) = ir.children
     child_column_stats = stats.column_stats[child]
     child_row_count = stats.row_count[child].value
+    key_names = (
+        list(ir.subset or ir.schema)
+        if isinstance(ir, Distinct)
+        else [n.name for n in ir.keys]
+    )
     unique_counts = [child_column_stats[k].unique_count.value for k in key_names]
     known_unique_count = sum(c for c in unique_counts if c is not None)
     unknown_unique_count = sum(c is None for c in unique_counts)
-    if unknown_unique_count == len(unique_counts):
-        # No unique-count estimates, so use the child row-count.
+    if unknown_unique_count > 0:
+        # Use the child row-count to be conservative.
+        # TODO: Should we use a different heuristic here? For example,
+        # we could assume each unknown key introduces a factor of 3.
         stats.row_count[ir] = ColumnStat[int](child_row_count)
     else:
-        # Guess each unknown key introduces a factor of 3
-        unique_count = known_unique_count * 3**unknown_unique_count
+        unique_count = known_unique_count
         if child_row_count is not None:
             # Don't allow the unique-count to exceed the child row-count.
             unique_count = min(child_row_count, unique_count)
@@ -560,29 +581,17 @@ def _update_distinct_stats(
     copy_child_unique_counts(stats.column_stats[ir])
 
 
-@update_column_stats.register(Distinct)
-def _(ir: Distinct, stats: StatsCollector, config_options: ConfigOptions) -> None:
-    _update_distinct_stats(ir, stats, list(ir.subset or ir.schema))
-
-
-@update_column_stats.register(GroupBy)
-def _(ir: GroupBy, stats: StatsCollector, config_options: ConfigOptions) -> None:
-    _update_distinct_stats(ir, stats, [n.name for n in ir.keys])
-
-
 @update_column_stats.register(Join)
 def _(ir: Join, stats: StatsCollector, config_options: ConfigOptions) -> None:
     # Apply basic join-cardinality estimation.
-    try:
-        left_rows, right_rows = child_row_counts(ir, stats)
-    except ValueError:
-        # One or more children have an unknown row-count estimate.
-        stats.row_count[ir] = ColumnStat[int](None)
-    else:
+    child_row_counts = known_child_row_counts(ir, stats)
+    if len(child_row_counts) == 2:
         # Both children have row-count estimates.
-        join_key_implied_unique_count = max(
-            # Use PK-FK join unique-count estimates in case
-            # directly-sampled statistics are missing.
+
+        # Use the PK-FK unique-count estimate for the join key.
+        # Otherwise, use the maximum unique-count estimate from the children.
+        unique_count_estimate = max(
+            # Join-based estimate (higher priority).
             [
                 u.implied_unique_count
                 for u in stats.join_info.join_map[ir]
@@ -590,12 +599,21 @@ def _(ir: Join, stats: StatsCollector, config_options: ConfigOptions) -> None:
             ],
             default=None,
         )
-        if join_key_implied_unique_count is not None:
+        # TODO: Use local unique-count statistics if the implied unique-count
+        # estimates are missing. This never happens for now, but it will happen
+        # if/when we add a config option to disable PK-FK heuristics.
+
+        # Calculate the output row-count estimate.
+        left_rows, right_rows = child_row_counts
+        if unique_count_estimate is not None:
             stats.row_count[ir] = ColumnStat[int](
-                max(1, (left_rows * right_rows) // join_key_implied_unique_count)
+                max(1, (left_rows * right_rows) // unique_count_estimate)
             )
-        else:  # pragma: no cover; We always have pk-fk heuristics (for now).
+        else:  # pragma: no cover; We always have a unique-count estimate (for now).
             stats.row_count[ir] = ColumnStat[int](max((1, left_rows, right_rows)))
+    else:
+        # One or more children have an unknown row-count estimate.
+        stats.row_count[ir] = ColumnStat[int](None)
 
     copy_child_unique_counts(stats.column_stats[ir])
 
@@ -603,7 +621,7 @@ def _(ir: Join, stats: StatsCollector, config_options: ConfigOptions) -> None:
 @update_column_stats.register(Union)
 def _(ir: Union, stats: StatsCollector, config_options: ConfigOptions) -> None:
     # Add up child row-count estimates.
-    row_counts = child_row_counts(ir, stats)
+    row_counts = known_child_row_counts(ir, stats)
     stats.row_count[ir] = ColumnStat[int](sum(row_counts) or None)
     # Add up unique counts (NOTE: This is probably very conservative).
     for column_stats in stats.column_stats[ir].values():
@@ -617,18 +635,3 @@ def _(ir: Union, stats: StatsCollector, config_options: ConfigOptions) -> None:
             )
             or None
         )
-
-
-@update_column_stats.register(Filter)
-def _(ir: Filter, stats: StatsCollector, config_options: ConfigOptions) -> None:
-    # Default `update_column_stats` implementation.
-    # Propagate largest child row-count estimate.
-    (child,) = ir.children
-    selectivity = 0.8
-    if (child_count := stats.row_count[child].value) is not None:
-        stats.row_count[ir] = ColumnStat[int](max(1, int(child_count * selectivity)))
-    else:
-        stats.row_count[ir] = ColumnStat[int](None)
-
-    # TODO: Should we apply selectivity to the unique-count estimates?
-    copy_child_unique_counts(stats.column_stats[ir])
