@@ -87,6 +87,16 @@ hybrid_scan_reader_impl::hybrid_scan_reader_impl(cudf::host_span<uint8_t const> 
   _extended_metadata = static_cast<aggregate_reader_metadata*>(_metadata.get());
 }
 
+hybrid_scan_reader_impl::hybrid_scan_reader_impl(FileMetaData const& parquet_metadata,
+                                                 parquet_reader_options const& options)
+{
+  _metadata = std::make_unique<aggregate_reader_metadata>(
+    parquet_metadata,
+    options.is_enabled_use_arrow_schema(),
+    options.get_columns().has_value() and options.is_enabled_allow_mismatched_pq_schemas());
+  _extended_metadata = static_cast<aggregate_reader_metadata*>(_metadata.get());
+}
+
 FileMetaData hybrid_scan_reader_impl::parquet_metadata() const
 {
   return _extended_metadata->parquet_metadata();
@@ -437,13 +447,10 @@ table_with_metadata hybrid_scan_reader_impl::materialize_filter_columns(
 
   select_columns(read_columns_mode::FILTER_COLUMNS, options);
 
-  auto output_dtypes = get_output_types(_output_buffers_template);
-
-  auto data_page_mask =
-    (mask_data_pages == use_data_page_mask::YES)
-      ? _extended_metadata->compute_data_page_mask(
-          row_mask, row_group_indices, output_dtypes, _output_column_schemas, stream)
-      : std::vector<std::vector<bool>>{};
+  auto data_page_mask = (mask_data_pages == use_data_page_mask::YES)
+                          ? _extended_metadata->compute_data_page_mask(
+                              row_mask, row_group_indices, _input_columns, stream)
+                          : std::vector<std::vector<bool>>{};
 
   prepare_data(row_group_indices, std::move(column_chunk_buffers), data_page_mask, options);
 
@@ -468,13 +475,10 @@ table_with_metadata hybrid_scan_reader_impl::materialize_payload_columns(
 
   select_columns(read_columns_mode::PAYLOAD_COLUMNS, options);
 
-  auto output_dtypes = get_output_types(_output_buffers_template);
-
-  auto data_page_mask =
-    (mask_data_pages == use_data_page_mask::YES)
-      ? _extended_metadata->compute_data_page_mask(
-          row_mask, row_group_indices, output_dtypes, _output_column_schemas, stream)
-      : std::vector<std::vector<bool>>{};
+  auto data_page_mask = (mask_data_pages == use_data_page_mask::YES)
+                          ? _extended_metadata->compute_data_page_mask(
+                              row_mask, row_group_indices, _input_columns, stream)
+                          : std::vector<std::vector<bool>>{};
 
   prepare_data(row_group_indices, std::move(column_chunk_buffers), data_page_mask, options);
 

@@ -67,7 +67,7 @@ def unspill_and_evaluate(
 
                         raise Reschedule()
 
-        except (ImportError, ValueError):
+        except (AttributeError, ImportError, ValueError):
             pass
 
     # Execute the task
