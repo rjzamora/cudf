@@ -8,6 +8,9 @@ import operator
 from functools import reduce
 from typing import TYPE_CHECKING, Any, Literal
 
+import pylibcudf as plc
+from rmm.pylibrmm.stream import DEFAULT_STREAM
+
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.expr import Col
 from cudf_polars.dsl.ir import ConditionalJoin, Join, Slice
@@ -21,8 +24,21 @@ from cudf_polars.experimental.shuffle import (
 )
 from cudf_polars.experimental.utils import _concat, _fallback_inform, _lower_ir_fallback
 
+try:
+    from rapidsmpf.buffer.packed_data import PackedData
+
+    if TYPE_CHECKING:
+        from rapidsmpf.integrations.core import WorkerContext
+
+except ImportError:
+    PackedData = Any
+
+    if TYPE_CHECKING:
+        WorkerContext = Any
+
+
 if TYPE_CHECKING:
-    from collections.abc import MutableMapping
+    from collections.abc import Callable, MutableMapping
 
     from cudf_polars.dsl.expr import NamedExpr
     from cudf_polars.dsl.ir import IR
@@ -39,8 +55,16 @@ def _use_rapidsmpf_join(ir: Join, shuffle_method: ShuffleMethod) -> bool:
     )
 
 
-class RMPFJoin(Join):
+class FusedJoin(Join):
     """Fused RapidsMPF join."""
+
+
+class LeftBcastJoin(FusedJoin):
+    """Fused RapidsMPF left bcast join."""
+
+
+class RightBcastJoin(FusedJoin):
+    """Fused RapidsMPF right bcast join."""
 
 
 class RMPFJoinIntegration:
@@ -52,11 +76,77 @@ class RMPFJoinIntegration:
         return RMPFIntegration()
 
     @staticmethod
+    def pack_partition(ctx: WorkerContext, data: DataFrame, options: Any) -> PackedData:
+        """Pack a partition for broadcasting."""
+        packed_columns = plc.contiguous_split.pack(data.table)
+        return PackedData.from_cudf_packed_columns(
+            packed_columns, DEFAULT_STREAM, ctx.br
+        )
+
+    @staticmethod
+    def unpack_partition(
+        ctx: WorkerContext, data: PackedData, options: Any
+    ) -> DataFrame:
+        """Unpack a finished partition from the RMPF shuffler."""
+        from rapidsmpf.integrations.cudf.partition import (
+            unpack_and_concat,
+            unspill_partitions,
+        )
+
+        plc_table = unpack_and_concat(
+            unspill_partitions(
+                [data],
+                br=ctx.br,
+                allow_overbooking=True,
+                statistics=ctx.statistics,
+            ),
+            br=ctx.br,
+            stream=DEFAULT_STREAM,
+        )
+        return DataFrame.from_table(
+            plc_table,
+            options["column_names"],
+            options["dtypes"],
+        )
+
+    @staticmethod
+    def local_repartition(
+        data: DataFrame,
+        partition_count: int,
+        options: Any,
+    ) -> dict[int, DataFrame]:
+        """
+        Break a single DataFrame partition into multiple local partitions.
+
+        Parameters
+        ----------
+        data
+            The local DataFrame partition.
+        partition_count
+            The number of local partitions to generate.
+        options
+            Additional options.
+
+        Returns
+        -------
+        A dictionary of DataFrame partitions.
+        The keys are the partition ids.
+        The values are the DataFrame partitions.
+        """
+        return _hash_partition_dataframe(
+            data,
+            0,  # Used only by sorted shuffling
+            partition_count,
+            None,
+            options["on"],
+        )
+
+    @staticmethod
     def join_partition(
-        left_input: int | DataFrame,
-        right_input: int | DataFrame,
+        left_input: Callable[[int], DataFrame],
+        right_input: Callable[[int], DataFrame],
         bcast_side: Literal["left", "right", "none"],
-        bcast_count: int | None,
+        bcast_count: int,
         options: Any,
     ) -> DataFrame:
         """
@@ -65,15 +155,9 @@ class RMPFJoinIntegration:
         Parameters
         ----------
         left_input
-            The left partition or a callable that produces
-            chunks of a broadcasted left partition.
-            The bcast_count argument corresponds to the number
-            of chunks the callable can produce.
+            A callable that produces the partition(s) needed for the left table.
         right_input
-            The right partition or a callable that produces
-            chunks of a broadcasted right partition.
-            The bcast_count argument corresponds to the number
-            of chunks the callable can produce.
+            A callable that produces the partition(s) needed for the right table.
         bcast_side
             The side of the join being broadcasted (if either).
         bcast_count
@@ -90,17 +174,21 @@ class RMPFJoinIntegration:
         -----
         This method is used to produce a single joined table chunk.
         """
-        if bcast_side != "none":  # pragma: no cover
-            raise NotImplementedError("Broadcast join not implemented.")
-
-        # Broadcast joins are not supported yet, so the input must be a DataFrame.
-        assert isinstance(left_input, DataFrame), "Expected DataFrame"
-        assert isinstance(right_input, DataFrame), "Expected DataFrame"
-        left = left_input
-        right = right_input
+        if bcast_side not in ("left", "right", "none"):  # pragma: no cover
+            raise ValueError(
+                f"Expected one of 'left', 'right', or 'none'. Got {bcast_side}"
+            )
 
         non_child_args = options.get("non_child_args", ())
-        return Join.do_evaluate(*non_child_args, left, right)
+        if bcast_side == "none" or bcast_count < 2:
+            return Join.do_evaluate(*non_child_args, left_input(0), right_input(0))
+        else:
+            return _concat(
+                *(
+                    Join.do_evaluate(*non_child_args, left_input(i), right_input(i))
+                    for i in range(bcast_count)
+                )
+            )
 
 
 def _maybe_shuffle_frame(
@@ -143,7 +231,14 @@ def _make_hash_join(
     if _use_rapidsmpf_join(ir, shuffle_method):
         # Convert ir to RMPFJoin.
         # We don't need to shuffle the children
-        ir = RMPFJoin(ir.schema, ir.left_on, ir.right_on, ir.options, left, right)
+        ir = FusedJoin(
+            ir.schema,
+            ir.left_on,
+            ir.right_on,
+            ir.options,
+            left,
+            right,
+        )
     else:
         # Shuffle left and right dataframes (if necessary)
         new_left = _maybe_shuffle_frame(
@@ -228,42 +323,61 @@ def _make_bcast_join(
     left: IR,
     right: IR,
     shuffle_method: ShuffleMethod,
-) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
-    if ir.options[0] != "Inner":
-        left_count = partition_info[left].count
-        right_count = partition_info[right].count
+) -> tuple[Join, MutableMapping[IR, PartitionInfo]]:
+    left_count = partition_info[left].count
+    right_count = partition_info[right].count
 
-        # Shuffle the smaller table (if necessary) - Notes:
-        # - We need to shuffle the smaller table if
-        #   (1) we are not doing an "inner" join,
-        #   and (2) the small table contains multiple
-        #   partitions.
-        # - We cannot simply join a large-table partition
-        #   to each small-table partition, and then
-        #   concatenate the partial-join results, because
-        #   a non-"inner" join does NOT commute with
-        #   concatenation.
-        # - In some cases, we can perform the partial joins
-        #   sequentially. However, we are starting with a
-        #   catch-all algorithm that works for all cases.
-        if left_count >= right_count:
-            right = _maybe_shuffle_frame(
-                right,
-                ir.right_on,
-                partition_info,
-                shuffle_method,
-                right_count,
-            )
-        else:
-            left = _maybe_shuffle_frame(
-                left,
-                ir.left_on,
-                partition_info,
-                shuffle_method,
-                left_count,
-            )
+    new_node: Join
+    rmp_bcast_enabled = False  # Spilling not currently working with RMPF bcast join yet
+    if rmp_bcast_enabled and _use_rapidsmpf_join(
+        ir, shuffle_method
+    ):  # pragma: no cover
+        # Convert ir to RMPFJoin.
+        # We don't need to pre-shuffle the small table yet.
+        join_type = RightBcastJoin if left_count >= right_count else LeftBcastJoin
+        new_node = join_type(
+            ir.schema,
+            ir.left_on,
+            ir.right_on,
+            ir.options,
+            left,
+            right,
+        )
 
-    new_node = ir.reconstruct([left, right])
+    else:
+        if ir.options[0] != "Inner":
+            # Shuffle the smaller table (if necessary) - Notes:
+            # - We need to shuffle the smaller table if
+            #   (1) we are not doing an "inner" join,
+            #   and (2) the small table contains multiple
+            #   partitions.
+            # - We cannot simply join a large-table partition
+            #   to each small-table partition, and then
+            #   concatenate the partial-join results, because
+            #   a non-"inner" join does NOT commute with
+            #   concatenation.
+            # - In some cases, we can perform the partial joins
+            #   sequentially. However, we are starting with a
+            #   catch-all algorithm that works for all cases.
+            if left_count >= right_count:
+                right = _maybe_shuffle_frame(
+                    right,
+                    ir.right_on,
+                    partition_info,
+                    shuffle_method,
+                    right_count,
+                )
+            else:
+                left = _maybe_shuffle_frame(
+                    left,
+                    ir.left_on,
+                    partition_info,
+                    shuffle_method,
+                    left_count,
+                )
+
+        new_node = ir.reconstruct([left, right])
+
     partition_info[new_node] = PartitionInfo(count=output_count)
     return new_node, partition_info
 
@@ -392,8 +506,25 @@ def _(
         and partition_info[right].count == output_count
     )
 
-    if isinstance(ir, RMPFJoin):
+    if isinstance(ir, FusedJoin):
         from rapidsmpf.integrations.dask.join import rapidsmpf_join_graph
+
+        need_local_repartition = False
+        bcast_side: Literal["left", "right", "none"] = "none"
+        if isinstance(ir, (LeftBcastJoin, RightBcastJoin)):  # pragma: no cover
+            # TODO: RMPF bcast join doesn't seem to work with spilling yet
+            bcast_side = "left" if isinstance(ir, LeftBcastJoin) else "right"
+            if ir.options[0] != "Inner":
+                need_local_repartition = True
+                # We need to adjust the pre-partitioned check,
+                # because the small-table doesn't need to have the
+                # final partition count for us to avoid the pre-shuffle.
+                if bcast_side == "left":
+                    left_partitioned = partition_info[left].partitioned_on == ir.left_on
+                elif bcast_side == "right":
+                    right_partitioned = (
+                        partition_info[right].partitioned_on == ir.right_on
+                    )
 
         return rapidsmpf_join_graph(
             get_key_name(left),
@@ -415,6 +546,8 @@ def _(
             {
                 "non_child_args": ir._non_child_args,
             },
+            bcast_side=bcast_side,
+            need_local_repartition=need_local_repartition,
             left_pre_shuffled=left_partitioned,
             right_pre_shuffled=right_partitioned,
         )
