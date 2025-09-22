@@ -28,12 +28,13 @@ try:
     from rapidsmpf.buffer.packed_data import PackedData
 
     if TYPE_CHECKING:
-        from rapidsmpf.integrations.core import WorkerContext
+        from rapidsmpf.integrations.core import BCastJoinInfo, WorkerContext
 
 except ImportError:
     PackedData = Any
 
     if TYPE_CHECKING:
+        BCastJoinInfo = Any
         WorkerContext = Any
 
 
@@ -145,8 +146,7 @@ class RMPFJoinIntegration:
     def join_partition(
         left_input: Callable[[int], DataFrame],
         right_input: Callable[[int], DataFrame],
-        bcast_side: Literal["left", "right", "none"],
-        bcast_count: int,
+        bcast_info: BCastJoinInfo,
         options: Any,
     ) -> DataFrame:
         """
@@ -158,11 +158,8 @@ class RMPFJoinIntegration:
             A callable that produces the partition(s) needed for the left table.
         right_input
             A callable that produces the partition(s) needed for the right table.
-        bcast_side
-            The side of the join being broadcasted (if either).
-        bcast_count
-            The number of broadcasted chunks.
-            Ignored unless ``bcast_side`` is "left" or "right".
+        bcast_info
+            The broadcast join information.
         options
             Additional join options.
 
@@ -174,11 +171,8 @@ class RMPFJoinIntegration:
         -----
         This method is used to produce a single joined table chunk.
         """
-        if bcast_side not in ("left", "right", "none"):  # pragma: no cover
-            raise ValueError(
-                f"Expected one of 'left', 'right', or 'none'. Got {bcast_side}"
-            )
-
+        bcast_count = bcast_info.bcast_count
+        bcast_side = bcast_info.bcast_side
         non_child_args = options.get("non_child_args", ())
         if bcast_side == "none" or bcast_count < 2:
             return Join.do_evaluate(*non_child_args, left_input(0), right_input(0))
