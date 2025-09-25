@@ -203,8 +203,10 @@ class RunConfig:
     rmm_async: bool
     rapidsmpf_oom_protection: bool
     rapidsmpf_spill: bool
+    rapidsmpf_join: bool
     spill_device: float
     query_set: str
+    stats_planning: bool
 
     def __post_init__(self) -> None:  # noqa: D105
         if self.gather_shuffle_stats and self.shuffle != "rapidsmpf":
@@ -272,8 +274,10 @@ class RunConfig:
             rapidsmpf_oom_protection=args.rapidsmpf_oom_protection,
             spill_device=args.spill_device,
             rapidsmpf_spill=args.rapidsmpf_spill,
+            rapidsmpf_join=args.rapidsmpf_join,
             max_rows_per_partition=args.max_rows_per_partition,
             query_set=args.query_set,
+            stats_planning=args.stats_planning,
         )
 
     def serialize(self, engine: pl.GPUEngine | None) -> dict:
@@ -300,6 +304,7 @@ class RunConfig:
                 print(f"blocksize: {self.blocksize}")
                 print(f"shuffle_method: {self.shuffle}")
                 print(f"broadcast_join_limit: {self.broadcast_join_limit}")
+                print(f"stats_planning: {self.stats_planning}")
                 if self.scheduler == "distributed":
                     print(f"n_workers: {self.n_workers}")
                     print(f"threads: {self.threads}")
@@ -307,6 +312,7 @@ class RunConfig:
                     print(f"rapidsmpf_oom_protection: {self.rapidsmpf_oom_protection}")
                     print(f"spill_device: {self.spill_device}")
                     print(f"rapidsmpf_spill: {self.rapidsmpf_spill}")
+                    print(f"rapidsmpf_join: {self.rapidsmpf_join}")
             if len(records) > 0:
                 print(f"iterations: {self.iterations}")
                 print("---------------------------------------")
@@ -347,11 +353,16 @@ def get_executor_options(
         executor_options["rapidsmpf_spill"] = run_config.rapidsmpf_spill
     if run_config.scheduler == "distributed":
         executor_options["scheduler"] = "distributed"
+    if run_config.stats_planning:
+        executor_options["stats_planning"] = {"use_reduction_planning": True}
+    executor_options["rapidsmpf_join"] = run_config.rapidsmpf_join
 
     if (
         benchmark
         and benchmark.__name__ == "PDSHQueries"
         and run_config.executor == "streaming"
+        # Only use the unique_fraction config if stats_planning is disabled
+        and not run_config.stats_planning
     ):
         executor_options["unique_fraction"] = {
             "c_custkey": 0.05,
@@ -375,7 +386,7 @@ def print_query_plan(
         if args.explain_logical:
             print(f"\nQuery {q_id} - Logical plan\n")
             print(q.explain())
-        elif args.explain:
+        if args.explain:
             print(f"\nQuery {q_id} - Physical plan\n")
             print(q.show_graph(engine="streaming", plan_stage="physical"))
     elif CUDF_POLARS_AVAILABLE:
@@ -383,7 +394,7 @@ def print_query_plan(
         if args.explain_logical:
             print(f"\nQuery {q_id} - Logical plan\n")
             print(explain_query(q, engine, physical=False))
-        elif args.explain:
+        if args.explain:
             print(f"\nQuery {q_id} - Physical plan\n")
             print(explain_query(q, engine))
     else:
@@ -607,6 +618,12 @@ def parse_args(
         help="Shuffle method to use for distributed execution.",
     )
     parser.add_argument(
+        "--rapidsmpf-join",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use rapidsmpf for hash-join operations.",
+    )
+    parser.add_argument(
         "--broadcast-join-limit",
         default=None,
         type=int,
@@ -713,6 +730,12 @@ def parse_args(
         choices=["duckdb", "cpu"],
         default="duckdb",
         help="Which engine to use as the baseline for validation.",
+    )
+    parser.add_argument(
+        "--stats-planning",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable statistics planning.",
     )
     return parser.parse_args(args)
 

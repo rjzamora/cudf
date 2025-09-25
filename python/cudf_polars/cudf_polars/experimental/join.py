@@ -41,18 +41,26 @@ except ImportError:
 if TYPE_CHECKING:
     from collections.abc import Callable, MutableMapping
 
+    from rapidsmpf.integrations.core import BCastJoinInfo
+
     from cudf_polars.dsl.expr import NamedExpr
     from cudf_polars.dsl.ir import IR
     from cudf_polars.experimental.parallel import LowerIRTransformer
     from cudf_polars.utils.config import ShuffleMethod
 
 
-def _use_rapidsmpf_join(ir: Join, shuffle_method: ShuffleMethod) -> bool:
+def _use_rapidsmpf_join(
+    ir: Join,
+    shuffle_method: ShuffleMethod,
+    rapidsmpf_join: bool,  # noqa: FBT001
+) -> bool:
     """Return whether RapidsMPF will be used for the join."""
     # Don't use rapidsmpf join if the shuffle method is not "rapidsmpf"
     # or if the keys are not "simple"
-    return shuffle_method == "rapidsmpf" and all(
-        isinstance(ne.value, Col) for ne in (ir.left_on + ir.right_on)
+    return (
+        rapidsmpf_join
+        and shuffle_method == "rapidsmpf"
+        and all(isinstance(ne.value, Col) for ne in (ir.left_on + ir.right_on))
     )
 
 
@@ -146,7 +154,7 @@ class RMPFJoinIntegration:
     def join_partition(
         left_input: Callable[[int], DataFrame],
         right_input: Callable[[int], DataFrame],
-        bcast_info: BCastJoinInfo,
+        bcast_info: BCastJoinInfo | None,
         options: Any,
     ) -> DataFrame:
         """
@@ -171,16 +179,14 @@ class RMPFJoinIntegration:
         -----
         This method is used to produce a single joined table chunk.
         """
-        bcast_count = bcast_info.bcast_count
-        bcast_side = bcast_info.bcast_side
         non_child_args = options.get("non_child_args", ())
-        if bcast_side == "none" or bcast_count < 2:
+        if bcast_info is None or bcast_info.bcast_count == 1:
             return Join.do_evaluate(*non_child_args, left_input(0), right_input(0))
         else:
             return _concat(
                 *(
                     Join.do_evaluate(*non_child_args, left_input(i), right_input(i))
-                    for i in range(bcast_count)
+                    for i in range(bcast_info.bcast_count)
                 )
             )
 
@@ -221,8 +227,9 @@ def _make_hash_join(
     left: IR,
     right: IR,
     shuffle_method: ShuffleMethod,
+    rapidsmpf_join: bool,  # noqa: FBT001
 ) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
-    if _use_rapidsmpf_join(ir, shuffle_method):
+    if _use_rapidsmpf_join(ir, shuffle_method, rapidsmpf_join):
         # Convert ir to RMPFJoin.
         # We don't need to shuffle the children
         ir = FusedJoin(
@@ -317,14 +324,21 @@ def _make_bcast_join(
     left: IR,
     right: IR,
     shuffle_method: ShuffleMethod,
+    rapidsmpf_join: bool,  # noqa: FBT001
 ) -> tuple[Join, MutableMapping[IR, PartitionInfo]]:
     left_count = partition_info[left].count
     right_count = partition_info[right].count
 
     new_node: Join
     rmp_bcast_enabled = False  # Spilling not currently working with RMPF bcast join yet
+    # TODO: We proabably want to avoid RMPF bcast join when
+    # the small table has a small number of partitions. The
+    # RMPF apporoach requires us to pin tasks to specific
+    # workers, which can reduce performance compared to a
+    # "pure" task-based approach. We will only benefit from
+    # RMPF when the broadcasted table is large (many partitions).
     if rmp_bcast_enabled and _use_rapidsmpf_join(
-        ir, shuffle_method
+        ir, shuffle_method, rapidsmpf_join
     ):  # pragma: no cover
         # Convert ir to RMPFJoin.
         # We don't need to pre-shuffle the small table yet.
@@ -471,6 +485,7 @@ def _(
             left,
             right,
             config_options.executor.shuffle_method,
+            config_options.executor.rapidsmpf_join,
         )
     else:
         # Create a hash join
@@ -481,6 +496,7 @@ def _(
             left,
             right,
             config_options.executor.shuffle_method,
+            config_options.executor.rapidsmpf_join,
         )
 
 
@@ -504,7 +520,7 @@ def _(
         from rapidsmpf.integrations.dask.join import rapidsmpf_join_graph
 
         need_local_repartition = False
-        bcast_side: Literal["left", "right", "none"] = "none"
+        bcast_side: Literal["left", "right", None] = None
         if isinstance(ir, (LeftBcastJoin, RightBcastJoin)):  # pragma: no cover
             # TODO: RMPF bcast join doesn't seem to work with spilling yet
             bcast_side = "left" if isinstance(ir, LeftBcastJoin) else "right"
