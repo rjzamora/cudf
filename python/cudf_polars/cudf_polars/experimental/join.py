@@ -28,6 +28,7 @@ try:
     from rapidsmpf.buffer.packed_data import PackedData
 
     if TYPE_CHECKING:
+        from rapidsmpf.buffer.spill_collection import Spillable
         from rapidsmpf.integrations.core import BCastJoinInfo, WorkerContext
 
 except ImportError:
@@ -35,6 +36,7 @@ except ImportError:
 
     if TYPE_CHECKING:
         BCastJoinInfo = Any
+        Spillable = Any
         WorkerContext = Any
 
 
@@ -95,12 +97,13 @@ class RMPFJoinIntegration:
     @staticmethod
     def unpack_partition(
         ctx: WorkerContext, data: PackedData, options: Any
-    ) -> DataFrame:
+    ) -> Spillable:
         """Unpack a finished partition from the RMPF shuffler."""
         from rapidsmpf.integrations.cudf.partition import (
             unpack_and_concat,
             unspill_partitions,
         )
+        from rapidsmpf.integrations.dask.spilling import SpillableWrapper
 
         plc_table = unpack_and_concat(
             unspill_partitions(
@@ -112,10 +115,12 @@ class RMPFJoinIntegration:
             br=ctx.br,
             stream=DEFAULT_STREAM,
         )
-        return DataFrame.from_table(
-            plc_table,
-            options["column_names"],
-            options["dtypes"],
+        return SpillableWrapper(
+            on_device=DataFrame.from_table(
+                plc_table,
+                options["column_names"],
+                options["dtypes"],
+            )
         )
 
     @staticmethod
