@@ -92,7 +92,7 @@ class ChannelPair:
         if msg is None:
             return None
         payload = PyObjectPayload.from_message(msg)
-        return payload.get_object()
+        return payload.extract_object()
 
 
 def create_channel_pair() -> ChannelPair:
