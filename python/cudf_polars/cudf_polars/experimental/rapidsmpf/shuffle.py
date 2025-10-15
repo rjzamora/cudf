@@ -8,17 +8,22 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 from rapidsmpf.shuffler import Shuffler
+from rapidsmpf.streaming.coll.shuffler import shuffler
 from rapidsmpf.streaming.core.channel import Channel
+from rapidsmpf.streaming.core.node import define_py_node
 from rapidsmpf.streaming.cudf.partition import partition_and_pack, unpack_and_concat
-from rapidsmpf.streaming.cudf.shuffler import shuffler
 
 from cudf_polars.dsl.expr import Col
+from cudf_polars.experimental.rapidsmpf.channel_pair import ChannelPair
 from cudf_polars.experimental.rapidsmpf.dispatch import (
     generate_ir_sub_network,
 )
+from cudf_polars.experimental.rapidsmpf.nodes import shutdown_on_error
 from cudf_polars.experimental.shuffle import Shuffle
 
 if TYPE_CHECKING:
+    from rapidsmpf.streaming.core.context import Context
+
     from cudf_polars.dsl.ir import IR
     from cudf_polars.experimental.rapidsmpf.core import SubNetGenerator
 
@@ -37,6 +42,37 @@ def _get_new_shuffle_id() -> int:
             )
 
         return _shuffle_id_vacancy.pop()
+
+
+@define_py_node()
+async def metadata_passthrough_node(
+    ctx: Context,
+    ch_in: Channel,
+    ch_out: Channel,
+) -> None:
+    """
+    Pass through metadata from input to output.
+
+    This is used to route metadata around the shuffle operation,
+    since shuffle only operates on data chunks.
+
+    Parameters
+    ----------
+    ctx
+        The streaming context.
+    ch_in
+        Input metadata channel.
+    ch_out
+        Output metadata channel.
+    """
+    async with shutdown_on_error(ctx, ch_in, ch_out):
+        # Receive and forward metadata
+        msg = await ch_in.recv(ctx)
+        if msg is not None:
+            await ch_out.send(ctx, msg)
+
+        # Drain output
+        await ch_out.drain(ctx)
 
 
 @generate_ir_sub_network.register(Shuffle)
@@ -61,14 +97,27 @@ def _(
     num_partitions = rec.state["partition_info"][ir].count
     op_id = _get_new_shuffle_id()
 
-    # Partition and pack
-    ch1 = channels[child].pop()
-    ch2 = Channel()
+    # Get input ChannelPair
+    ch_in_pair = channels[child].pop()
+
+    # Metadata passthrough (around the shuffle)
+    ch_metadata_out = Channel()
     nodes[ir] = []
+    nodes[ir].append(
+        metadata_passthrough_node(
+            context,
+            ch_in=ch_in_pair.metadata,
+            ch_out=ch_metadata_out,
+        )
+    )
+
+    # Data shuffle pipeline
+    # Partition and pack
+    ch2 = Channel()
     nodes[ir].append(
         partition_and_pack(
             context,
-            ch_in=ch1,
+            ch_in=ch_in_pair.data,
             ch_out=ch2,
             columns_to_hash=columns_to_hash,
             num_partitions=num_partitions,
@@ -88,8 +137,10 @@ def _(
     )
 
     # Unpack and concat
-    ch4 = Channel()
-    nodes[ir].append(unpack_and_concat(context, ch_in=ch3, ch_out=ch4))
-    channels[ir] = [ch4]
+    ch_data_out = Channel()
+    nodes[ir].append(unpack_and_concat(context, ch_in=ch3, ch_out=ch_data_out))
+
+    # Create output ChannelPair combining metadata and shuffled data
+    channels[ir] = [ChannelPair(metadata=ch_metadata_out, data=ch_data_out)]
 
     return nodes, channels

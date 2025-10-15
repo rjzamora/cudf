@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from functools import reduce
 from typing import TYPE_CHECKING, Any
 
-from rapidsmpf.streaming.core.channel import Channel, Message
+from rapidsmpf.streaming.core.channel import Message
 from rapidsmpf.streaming.core.node import define_py_node
 from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
@@ -18,11 +18,13 @@ from rmm.pylibrmm.stream import DEFAULT_STREAM
 
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IR, Empty
+from cudf_polars.experimental.rapidsmpf.channel_pair import ChannelPair
 from cudf_polars.experimental.rapidsmpf.dispatch import generate_ir_sub_network
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
+    from rapidsmpf.streaming.core.channel import Channel
     from rapidsmpf.streaming.core.context import Context
 
     import pylibcudf as plc
@@ -56,8 +58,8 @@ async def shutdown_on_error(
 async def default_node_single(
     ctx: Context,
     ir: IR,
-    ch_out: Channel[TableChunk],
-    ch_in: Channel[TableChunk],
+    ch_out: ChannelPair,
+    ch_in: ChannelPair,
 ) -> None:
     """
     Single-channel default node for rapidsmpf.
@@ -69,16 +71,23 @@ async def default_node_single(
     ir
         The IR node.
     ch_out
-        The output channel.
+        The output ChannelPair.
     ch_in
-        The input channel.
+        The input ChannelPair.
 
     Notes
     -----
     Chunks are processed in the order they are received.
     """
-    async with shutdown_on_error(ctx, ch_in, ch_out):
-        while (msg := await ch_in.recv(ctx)) is not None:
+    async with shutdown_on_error(
+        ctx, ch_in.metadata, ch_in.data, ch_out.metadata, ch_out.data
+    ):
+        # Pass through metadata
+        metadata = await ch_in.recv_metadata(ctx)
+        await ch_out.send_metadata(ctx, metadata)
+
+        # Process data chunks
+        while (msg := await ch_in.data.recv(ctx)) is not None:
             chunk = TableChunk.from_message(msg)
             seq_num = chunk.sequence_number
             df = await asyncio.to_thread(
@@ -90,18 +99,20 @@ async def default_node_single(
                     list(ir.children[0].schema.values()),
                 ),
             )
-            chunk = TableChunk.from_pylibcudf_table(seq_num, df.table, chunk.stream)
-            await ch_out.send(ctx, Message(chunk))
+            chunk = TableChunk.from_pylibcudf_table(
+                seq_num, df.table, chunk.stream, exclusive_view=True
+            )
+            await ch_out.data.send(ctx, Message(chunk))
 
-        await ch_out.drain(ctx)
+        await ch_out.data.drain(ctx)
 
 
 @define_py_node()
 async def default_node_multi(
     ctx: Context,
     ir: IR,
-    ch_out: Channel[TableChunk],
-    *chs_in: Channel[TableChunk],
+    ch_out: ChannelPair,
+    *chs_in: ChannelPair,
     bcast_indices: list[int],
 ) -> None:
     """
@@ -114,9 +125,9 @@ async def default_node_multi(
     ir
         The IR node.
     ch_out
-        The output channel.
+        The output ChannelPair.
     chs_in
-        The input channels.
+        The input ChannelPairs.
     bcast_indices
         The indices of the broadcasted children.
 
@@ -125,7 +136,18 @@ async def default_node_multi(
     Input chunks are aligned for evaluation.
     """
     # TODO: Use multiple streams
-    async with shutdown_on_error(ctx, *chs_in, ch_out):
+    all_channels = [ch for pair in chs_in for ch in (pair.metadata, pair.data)]
+    async with shutdown_on_error(ctx, *all_channels, ch_out.metadata, ch_out.data):
+        # Receive metadata from all inputs and merge
+        # For now, just take the first non-None metadata
+        # TODO: May need a more sophisticated merge strategy
+        metadata = None
+        for ch_in in chs_in:
+            md = await ch_in.recv_metadata(ctx)
+            if md is not None and metadata is None:
+                metadata = md
+        await ch_out.send_metadata(ctx, metadata)
+
         seq_num = 0
         n_children = len(chs_in)
         accepting_data = True
@@ -140,7 +162,7 @@ async def default_node_multi(
                     zip(chs_in, ir.children, strict=True)
                 ):
                     if (ch_not_finished := ch_idx not in finished_channels) and (
-                        msg := await ch_in.recv(ctx)
+                        msg := await ch_in.data.recv(ctx)
                     ) is not None:
                         table_chunk = TableChunk.from_message(msg)
                         if ch_idx in bcast_indices and staged_chunks[ch_idx]:
@@ -182,13 +204,14 @@ async def default_node_multi(
                         for ch_idx in range(n_children)
                     ],
                 )
-                await ch_out.send(
+                await ch_out.data.send(
                     ctx,
                     Message(
                         TableChunk.from_pylibcudf_table(
                             seq_num,
                             df.table,
                             DEFAULT_STREAM,
+                            exclusive_view=True,
                         )
                     ),
                 )
@@ -204,75 +227,84 @@ async def default_node_multi(
                     )
                 break  # All channels have finished
 
-        # Drain the output channel
-        await ch_out.drain(ctx)
-
-
-async def forward_to_channel(
-    ctx: Context,
-    chunks: list[plc.Table],
-    ch_out: Channel[TableChunk],
-    channel_id: int = 0,
-) -> None:
-    """
-    Send all chunks to a single output channel, then drain it.
-
-    This ensures atomic processing: all sends to this channel complete
-    before the channel is drained.
-
-    Parameters
-    ----------
-    ctx
-        The context.
-    chunks
-        The chunks to send.
-    ch_out
-        The output channel.
-    channel_id
-        Identifier for debugging.
-    """
-    for seq_num, chunk in enumerate(chunks):
-        await ch_out.send(
-            ctx,
-            Message(TableChunk.from_pylibcudf_table(seq_num, chunk, DEFAULT_STREAM)),
-        )
-    await ch_out.drain(ctx)
+        # Drain the data channel
+        await ch_out.data.drain(ctx)
 
 
 @define_py_node()
 async def multicast_node(
     ctx: Context,
-    ch_in: Channel[TableChunk],
-    *chs_out: Channel[TableChunk],
+    ch_in: ChannelPair,
+    *chs_out: ChannelPair,
 ) -> None:
     """
-    Multicast node for rapidsmpf.
+    Multicast node for rapidsmpf - broadcasts both metadata and data.
 
     Parameters
     ----------
     ctx
         The context.
     ch_in
-        The input channel.
+        The input ChannelPair.
     chs_out
-        The output channels.
+        The output ChannelPairs.
     """
     # TODO: Use multiple streams
-    async with shutdown_on_error(ctx, ch_in, *chs_out):
-        # Collect all chunks from input channel
+    all_out_channels = [ch for pair in chs_out for ch in (pair.metadata, pair.data)]
+    async with shutdown_on_error(ctx, ch_in.metadata, ch_in.data, *all_out_channels):
+        # Receive metadata
+        metadata = await ch_in.recv_metadata(ctx)
+
+        # Collect all data chunks from input channel
         chunks: list[TableChunk] = []
-        while (msg := await ch_in.recv(ctx)) is not None:
+        while (msg := await ch_in.data.recv(ctx)) is not None:
             chunks.append(TableChunk.from_message(msg).table_view())
 
-        # Send chunks to all output channels using atomic per-channel processing
+        # Send metadata and data to all output channels using atomic per-channel processing
         # This ensures that channels consuming at different rates don't block each other
         # (e.g., streaming operations vs fallback repartition operations)
         await asyncio.gather(
             *(
-                forward_to_channel(ctx, chunks, ch_out, channel_id=i)
-                for i, ch_out in enumerate(chs_out)
+                _multicast_to_channel_pair(ctx, metadata, chunks, ch_out)
+                for ch_out in chs_out
             )
         )
+
+
+async def _multicast_to_channel_pair(
+    ctx: Context,
+    metadata: dict[str, Any] | None,
+    chunks: list[plc.Table],
+    ch_out: ChannelPair,
+) -> None:
+    """
+    Send metadata and data chunks to a single output ChannelPair, then drain it.
+
+    Parameters
+    ----------
+    ctx
+        The context.
+    metadata
+        The metadata to send (or None).
+    chunks
+        The data chunks to send.
+    ch_out
+        The output ChannelPair.
+    """
+    # Send metadata first
+    await ch_out.send_metadata(ctx, metadata)
+
+    # Send data chunks
+    for seq_num, chunk in enumerate(chunks):
+        await ch_out.data.send(
+            ctx,
+            Message(
+                TableChunk.from_pylibcudf_table(
+                    seq_num, chunk, DEFAULT_STREAM, exclusive_view=False
+                )
+            ),
+        )
+    await ch_out.data.drain(ctx)
 
 
 @generate_ir_sub_network.register(IR)
@@ -288,8 +320,8 @@ def _(ir: IR, rec: SubNetGenerator) -> tuple[dict[IR, list[Any]], dict[IR, Any]]
         nodes = reduce(operator.or_, _nodes)
         channels = reduce(operator.or_, _channels)
 
-    # Create output channel
-    channels[ir] = [Channel()]
+    # Create output ChannelPair
+    channels[ir] = [ChannelPair.create()]
 
     if len(ir.children) == 1:
         # Single-channel default node
@@ -326,7 +358,7 @@ def _(ir: IR, rec: SubNetGenerator) -> tuple[dict[IR, list[Any]], dict[IR, Any]]
 async def empty_node(
     ctx: Context,
     ir: Empty,
-    ch_out: Channel[TableChunk],
+    ch_out: ChannelPair,
 ) -> None:
     """
     Empty node for rapidsmpf - produces a single empty chunk.
@@ -338,24 +370,29 @@ async def empty_node(
     ir
         The Empty node.
     ch_out
-        The output channel.
+        The output ChannelPair.
     """
-    async with shutdown_on_error(ctx, ch_out):
+    async with shutdown_on_error(ctx, ch_out.metadata, ch_out.data):
+        # No metadata for empty node
+        await ch_out.send_metadata(ctx, None)
+
         # Evaluate the IR node to create an empty DataFrame
         df: DataFrame = ir.do_evaluate(*ir._non_child_args)
 
         # Return the output chunk (empty but with correct schema)
-        chunk = TableChunk.from_pylibcudf_table(0, df.table, DEFAULT_STREAM)
-        await ch_out.send(ctx, Message(chunk))
+        chunk = TableChunk.from_pylibcudf_table(
+            0, df.table, DEFAULT_STREAM, exclusive_view=True
+        )
+        await ch_out.data.send(ctx, Message(chunk))
 
-        await ch_out.drain(ctx)
+        await ch_out.data.drain(ctx)
 
 
 @generate_ir_sub_network.register(Empty)
 def _(ir: Empty, rec: SubNetGenerator) -> tuple[dict[IR, list[Any]], dict[IR, Any]]:
     """Generate network for Empty node - produces one empty chunk."""
     ctx = rec.state["ctx"]
-    ch_out = Channel()
+    ch_out = ChannelPair.create()
     nodes: dict[IR, list[Any]] = {ir: [empty_node(ctx, ir, ch_out)]}
     channels: dict[IR, list[Any]] = {ir: [ch_out]}
     return nodes, channels
@@ -385,7 +422,7 @@ def generate_ir_sub_network_wrapper(
     """
     nodes, channels = generate_ir_sub_network(ir, rec)
     if (count := rec.state["output_ch_count"][ir]) > 1:
-        output_chs = [Channel() for _ in range(count)]
+        output_chs = [ChannelPair.create() for _ in range(count)]
         nodes[ir].append(multicast_node(rec.state["ctx"], channels[ir][0], *output_chs))
         channels[ir] = output_chs
     return nodes, channels

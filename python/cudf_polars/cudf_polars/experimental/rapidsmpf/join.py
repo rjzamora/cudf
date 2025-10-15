@@ -10,7 +10,7 @@ from functools import reduce
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Literal
 
-from rapidsmpf.streaming.core.channel import Channel, Message
+from rapidsmpf.streaming.core.channel import Message
 from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
 import pylibcudf as plc
@@ -18,6 +18,7 @@ from rmm.pylibrmm.stream import DEFAULT_STREAM
 
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IR, Join
+from cudf_polars.experimental.rapidsmpf.channel_pair import ChannelPair
 from cudf_polars.experimental.rapidsmpf.dispatch import (
     generate_ir_sub_network,
 )
@@ -38,10 +39,10 @@ if TYPE_CHECKING:
 async def get_small_table(
     ctx: Context,
     small_child: IR,
-    ch_small: Channel[TableChunk],
+    ch_small: ChannelPair,
 ) -> list[DataFrame]:
     """
-    Get the small-table DataFrame partitions from the small-table channel.
+    Get the small-table DataFrame partitions from the small-table ChannelPair.
 
     Parameters
     ----------
@@ -50,7 +51,7 @@ async def get_small_table(
     small_child
         The small-table child IR node.
     ch_small
-        The small-table channel.
+        The small-table ChannelPair.
 
     Returns
     -------
@@ -58,7 +59,7 @@ async def get_small_table(
         The small-table DataFrame partitions.
     """
     small_chunks = []
-    while (msg := await ch_small.recv(ctx)) is not None:
+    while (msg := await ch_small.data.recv(ctx)) is not None:
         small_chunks.append(TableChunk.from_message(msg).table_view())
 
     if len(small_chunks) == 0:
@@ -78,9 +79,9 @@ async def get_small_table(
 async def broadcast_join_node(
     ctx: Context,
     ir: Join,
-    ch_out: Channel[TableChunk],
-    ch_left: Channel[TableChunk],
-    ch_right: Channel[TableChunk],
+    ch_out: ChannelPair,
+    ch_left: ChannelPair,
+    ch_right: ChannelPair,
     broadcast_side: Literal["left", "right"],
 ) -> None:
     """
@@ -93,15 +94,30 @@ async def broadcast_join_node(
     ir
         The Join IR node.
     ch_out
-        The output channel.
+        The output ChannelPair.
     ch_left
-        The left input channel.
+        The left input ChannelPair.
     ch_right
-        The right input channel.
+        The right input ChannelPair.
     broadcast_side
         The side to broadcast.
     """
-    async with shutdown_on_error(ctx, ch_left, ch_right, ch_out):
+    all_channels = [
+        ch_left.metadata,
+        ch_left.data,
+        ch_right.metadata,
+        ch_right.data,
+        ch_out.metadata,
+        ch_out.data,
+    ]
+    async with shutdown_on_error(ctx, *all_channels):
+        # Receive metadata from both sides, merge them
+        left_metadata = await ch_left.recv_metadata(ctx)
+        right_metadata = await ch_right.recv_metadata(ctx)
+        # TODO: May need a more sophisticated merge strategy
+        metadata = left_metadata if left_metadata is not None else right_metadata
+        await ch_out.send_metadata(ctx, metadata)
+
         if broadcast_side == "right":
             # Broadcast right, stream left
             small_ch = ch_right
@@ -122,7 +138,7 @@ async def broadcast_join_node(
         )
 
         # Stream through large side, joining with broadcast data
-        while (msg := await large_ch.recv(ctx)) is not None:
+        while (msg := await large_ch.data.recv(ctx)) is not None:
             large_chunk = TableChunk.from_message(msg)
             large_df = DataFrame.from_table(
                 large_chunk.table_view(),
@@ -156,7 +172,7 @@ async def broadcast_join_node(
 
             # Send output chunk
             build_stream = DEFAULT_STREAM
-            await ch_out.send(
+            await ch_out.data.send(
                 ctx,
                 Message(
                     TableChunk.from_pylibcudf_table(
@@ -167,12 +183,13 @@ async def broadcast_join_node(
                             else plc.concatenate.concatenate(results, build_stream)
                         ),
                         build_stream,
+                        exclusive_view=True,
                     )
                 ),
             )
 
-        # Drain the output channel
-        await ch_out.drain(ctx)
+        # Drain the output data channel
+        await ch_out.data.drain(ctx)
 
 
 @generate_ir_sub_network.register(Join)
@@ -202,8 +219,8 @@ def _(
         nodes = reduce(operator.or_, _nodes)
         channels = reduce(operator.or_, _channels)
 
-    # Create output channel
-    channels[ir] = [Channel()]
+    # Create output ChannelPair
+    channels[ir] = [ChannelPair.create()]
 
     if output_count == 1 or (left_partitioned and right_partitioned):
         # Partition-wise join (use default_node_multi)
