@@ -88,8 +88,10 @@ async def local_shuffle_node(
     async with shutdown_on_error(
         ctx, ch_in.metadata, ch_in.data, ch_out.metadata, ch_out.data
     ):
-        # Get resources from context
+        # Always use a single-process communicator for local shuffle
         comm = new_communicator(Options(get_environment_variables()))
+
+        # Get resources from context
         br = ctx.br()
         statistics = ctx.statistics()
 
