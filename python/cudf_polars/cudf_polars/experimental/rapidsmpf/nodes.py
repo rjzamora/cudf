@@ -27,8 +27,6 @@ if TYPE_CHECKING:
     from rapidsmpf.streaming.core.channel import Channel
     from rapidsmpf.streaming.core.context import Context
 
-    import pylibcudf as plc
-
     from cudf_polars.experimental.rapidsmpf.dispatch import SubNetGenerator
 
 
@@ -97,6 +95,7 @@ async def default_node_single(
                     chunk.table_view(),
                     list(ir.children[0].schema.keys()),
                     list(ir.children[0].schema.values()),
+                    chunk.stream,
                 ),
             )
             chunk = TableChunk.from_pylibcudf_table(
@@ -174,6 +173,7 @@ async def default_node_multi(
                                 table_chunk.table_view(),
                                 list(child.schema.keys()),
                                 list(child.schema.values()),
+                                table_chunk.stream,
                             )
                         )
                     elif ch_not_finished:
@@ -252,59 +252,76 @@ async def multicast_node(
     # TODO: Use multiple streams
     all_out_channels = [ch for pair in chs_out for ch in (pair.metadata, pair.data)]
     async with shutdown_on_error(ctx, ch_in.metadata, ch_in.data, *all_out_channels):
-        # Receive metadata
+        # Forward metadata
         metadata = await ch_in.recv_metadata(ctx)
-
-        # Collect all data chunks from input channel
-        chunks: list[TableChunk] = []
-        while (msg := await ch_in.data.recv(ctx)) is not None:
-            chunks.append(TableChunk.from_message(msg).table_view())
-
-        # Send metadata and data to all output channels using atomic per-channel processing
-        # This ensures that channels consuming at different rates don't block each other
-        # (e.g., streaming operations vs fallback repartition operations)
         await asyncio.gather(
             *(
-                _multicast_to_channel_pair(ctx, metadata, chunks, ch_out)
+                asyncio.create_task(ch_out.send_metadata(ctx, metadata))
                 for ch_out in chs_out
             )
         )
 
+        # Forward data chunks
+        while (msg := await ch_in.data.recv(ctx)) is not None:
+            table_chunk = TableChunk.from_message(msg)
+            for ch_out in chs_out:
+                await ch_out.data.send(
+                    ctx,
+                    Message(
+                        TableChunk.from_pylibcudf_table(
+                            table_chunk.sequence_number,
+                            table_chunk.table_view(),
+                            table_chunk.stream,
+                            # NOTE: Should we just copy the table chunk?
+                            exclusive_view=False,
+                        )
+                    ),
+                )
+        await asyncio.gather(*(ch.data.drain(ctx) for ch in chs_out))
 
-async def _multicast_to_channel_pair(
+
+@define_py_node()
+async def passthrough_node(
     ctx: Context,
-    metadata: dict[str, Any] | None,
-    chunks: list[plc.Table],
     ch_out: ChannelPair,
+    ch_in: ChannelPair,
+    *,
+    union_dependency: bool,
 ) -> None:
     """
-    Send metadata and data chunks to a single output ChannelPair, then drain it.
+    Passthrough node for rapidsmpf.
 
     Parameters
     ----------
     ctx
         The context.
-    metadata
-        The metadata to send (or None).
-    chunks
-        The data chunks to send.
     ch_out
         The output ChannelPair.
+    ch_in
+        The input ChannelPair.
+    union_dependency
+        Whether a Union node depends on this passthrough node.
+        If so, we must forward all chunks immediately
+        to avoid blocking progress in a multicast node.
     """
-    # Send metadata first
-    await ch_out.send_metadata(ctx, metadata)
+    async with shutdown_on_error(
+        ctx, ch_in.metadata, ch_in.data, ch_out.metadata, ch_out.data
+    ):
+        # Forward metadata
+        await ch_out.send_metadata(ctx, await ch_in.recv_metadata(ctx))
 
-    # Send data chunks
-    for seq_num, chunk in enumerate(chunks):
-        await ch_out.data.send(
-            ctx,
-            Message(
-                TableChunk.from_pylibcudf_table(
-                    seq_num, chunk, DEFAULT_STREAM, exclusive_view=False
-                )
-            ),
-        )
-    await ch_out.data.drain(ctx)
+        # Forward data chunks
+        sends = []
+        while (msg := await ch_in.data.recv(ctx)) is not None:
+            if union_dependency:
+                # Unfortunately, we must forward all chunks immediately.
+                # Otherwise, we may block progress in a multicast node.
+                sends.append(asyncio.create_task(ch_out.data.send(ctx, msg)))
+            else:
+                await ch_out.data.send(ctx, msg)
+        if sends:
+            await asyncio.gather(*sends)
+        await ch_out.data.drain(ctx)
 
 
 @generate_ir_sub_network.register(IR)
@@ -422,7 +439,17 @@ def generate_ir_sub_network_wrapper(
     """
     nodes, channels = generate_ir_sub_network(ir, rec)
     if (count := rec.state["output_ch_count"][ir]) > 1:
+        inter_chs = [ChannelPair.create() for _ in range(count)]
         output_chs = [ChannelPair.create() for _ in range(count)]
-        nodes[ir].append(multicast_node(rec.state["ctx"], channels[ir][0], *output_chs))
+        nodes[ir].append(multicast_node(rec.state["ctx"], channels[ir][0], *inter_chs))
+        for inter_ch, output_ch in zip(inter_chs, output_chs, strict=True):
+            nodes[ir].append(
+                passthrough_node(
+                    rec.state["ctx"],
+                    output_ch,
+                    inter_ch,
+                    union_dependency=rec.state["union_dependency"],
+                )
+            )
         channels[ir] = output_chs
     return nodes, channels

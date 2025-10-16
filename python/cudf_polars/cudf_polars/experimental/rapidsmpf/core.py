@@ -177,6 +177,7 @@ def combine_output_chunks(ir: IR, *chunks: TableChunk) -> DataFrame:
                 chunk.table_view(),
                 list(ir.schema.keys()),
                 list(ir.schema.values()),
+                stream=chunk.stream,
             )
             for chunk in sorted(chunks, key=lambda c: c.sequence_number)
         )
@@ -260,6 +261,7 @@ def generate_network(
         "config_options": config_options,
         "partition_info": partition_info,
         "output_ch_count": output_ch_count,
+        "union_dependency": False,
     }
     mapper: SubNetGenerator = CachingVisitor(
         generate_ir_sub_network_wrapper, state=state

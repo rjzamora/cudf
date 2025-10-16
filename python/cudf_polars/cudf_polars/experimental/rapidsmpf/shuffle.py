@@ -53,6 +53,12 @@ def _get_new_shuffle_id() -> int:
         return _shuffle_id_vacancy.pop()
 
 
+def _release_shuffle_id(op_id: int) -> None:
+    """Release a shuffle ID back to the vacancy set."""
+    with _shuffle_id_vacancy_lock:
+        _shuffle_id_vacancy.add(op_id)
+
+
 @define_py_node()
 async def local_shuffle_node(
     ctx: Context,
@@ -184,6 +190,9 @@ async def local_shuffle_node(
 
             # Shutdown the shuffler
             shuffler.shutdown()
+
+            # Release the shuffle ID
+            _release_shuffle_id(op_id)
 
             # Drain data output channel
             await ch_out.data.drain(ctx)
