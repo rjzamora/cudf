@@ -17,7 +17,7 @@ from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 from rmm.pylibrmm.stream import DEFAULT_STREAM
 
 from cudf_polars.containers import DataFrame
-from cudf_polars.dsl.ir import IR, Empty, Join
+from cudf_polars.dsl.ir import IR, Empty
 from cudf_polars.experimental.base import ChunkMetadata
 from cudf_polars.experimental.rapidsmpf.channel_pair import ChannelPair
 from cudf_polars.experimental.rapidsmpf.dispatch import generate_ir_sub_network
@@ -116,6 +116,112 @@ async def default_node_single(
         await ch_out.data.drain(ctx)
 
 
+async def _aligned_multi_input(
+    ctx: Context,
+    ir: IR,
+    ch_out: ChannelPair,
+    chs_in: tuple[ChannelPair, ...],
+    bcast_indices: list[int],
+) -> None:
+    """
+    Core logic for multi-input data chunk alignment and evaluation.
+
+    This function handles the data channel processing only. The caller
+    is responsible for receiving and sending metadata. It handles
+    out-of-order chunk arrival by staging chunks until matching
+    sequence numbers are available.
+
+    Parameters
+    ----------
+    ctx
+        The context.
+    ir
+        The IR node.
+    ch_out
+        The output ChannelPair (metadata already sent).
+    chs_in
+        Tuple of input ChannelPairs (metadata already received).
+    bcast_indices
+        The indices of the broadcasted children.
+    """
+    seq_num = 0
+    n_children = len(chs_in)
+    accepting_data = True
+    finished_channels: set[int] = set()
+    staged_chunks: dict[int, dict[int, DataFrame]] = {c: {} for c in range(n_children)}
+
+    while True:
+        if accepting_data:
+            for ch_idx, (ch_in, child) in enumerate(
+                zip(chs_in, ir.children, strict=True)
+            ):
+                if (ch_not_finished := ch_idx not in finished_channels) and (
+                    msg := await ch_in.data.recv(ctx)
+                ) is not None:
+                    table_chunk = TableChunk.from_message(msg)
+                    if ch_idx in bcast_indices and staged_chunks[ch_idx]:
+                        raise RuntimeError(
+                            f"Broadcasted chunk already staged for channel {ch_idx}."
+                        )
+                    staged_chunks[ch_idx][table_chunk.sequence_number] = (
+                        DataFrame.from_table(
+                            table_chunk.table_view(),
+                            list(child.schema.keys()),
+                            list(child.schema.values()),
+                            table_chunk.stream,
+                        )
+                    )
+                elif ch_not_finished:
+                    finished_channels.add(ch_idx)
+                    if all(ch_idx in finished_channels for ch_idx in range(n_children)):
+                        accepting_data = False
+
+        if all(
+            (
+                (seq_num in staged_chunks[ch_idx])
+                or (ch_idx in bcast_indices and 0 in staged_chunks[ch_idx])
+            )
+            for ch_idx in range(n_children)
+        ):
+            # Ready to produce the output chunk for seq_num.
+            # Evaluate and send.
+            df = await asyncio.to_thread(
+                ir.do_evaluate,
+                *ir._non_child_args,
+                *[
+                    (
+                        staged_chunks[ch_idx][0]
+                        if ch_idx in bcast_indices
+                        else staged_chunks[ch_idx].pop(seq_num)
+                    )
+                    for ch_idx in range(n_children)
+                ],
+            )
+            await ch_out.data.send(
+                ctx,
+                Message(
+                    TableChunk.from_pylibcudf_table(
+                        seq_num,
+                        df.table,
+                        DEFAULT_STREAM,
+                        exclusive_view=True,
+                    )
+                ),
+            )
+            seq_num += 1
+        elif not accepting_data:
+            if any(
+                staged_chunks[ch_idx]
+                for ch_idx in range(n_children)
+                if ch_idx not in bcast_indices
+            ):
+                raise RuntimeError(f"Leftover data in staged chunks: {staged_chunks}.")
+            break  # All channels have finished
+
+    # Drain the data channel
+    await ch_out.data.drain(ctx)
+
+
 @define_py_node()
 async def default_node_multi(
     ctx: Context,
@@ -151,104 +257,18 @@ async def default_node_multi(
         # For now, just take the first non-None metadata
         # TODO: May need a more sophisticated merge strategy
         metadata = ChunkMetadata(1)
-        for ch_idx, ch_in in enumerate(chs_in):
+        for ch_in in chs_in:
             md = await ch_in.recv_metadata(ctx)
             assert isinstance(md, ChunkMetadata), (
                 f"Expected ChunkMetadata, got {type(md)}."
             )
             metadata.local_count = max(md.local_count, metadata.local_count)
             metadata.duplicated = metadata.duplicated and md.duplicated
-            if isinstance(ir, Join) and (
-                (ch_idx == 0 and ir.options[0] != "right")
-                or (ch_idx == 1 and ir.options[0] == "right")
-            ):
-                metadata.local_partitioned_on = md.local_partitioned_on
-                metadata.global_partitioned_on = md.global_partitioned_on
 
         await ch_out.send_metadata(ctx, metadata)
 
-        seq_num = 0
-        n_children = len(chs_in)
-        accepting_data = True
-        finished_channels: set[int] = set()
-        staged_chunks: dict[int, dict[int, DataFrame]] = {
-            c: {} for c in range(n_children)
-        }
-
-        while True:
-            if accepting_data:
-                for ch_idx, (ch_in, child) in enumerate(
-                    zip(chs_in, ir.children, strict=True)
-                ):
-                    if (ch_not_finished := ch_idx not in finished_channels) and (
-                        msg := await ch_in.data.recv(ctx)
-                    ) is not None:
-                        table_chunk = TableChunk.from_message(msg)
-                        if ch_idx in bcast_indices and staged_chunks[ch_idx]:
-                            raise RuntimeError(
-                                f"Broadcasted chunk already staged for channel {ch_idx}."
-                            )
-                        staged_chunks[ch_idx][table_chunk.sequence_number] = (
-                            DataFrame.from_table(
-                                table_chunk.table_view(),
-                                list(child.schema.keys()),
-                                list(child.schema.values()),
-                                table_chunk.stream,
-                            )
-                        )
-                    elif ch_not_finished:
-                        finished_channels.add(ch_idx)
-                        if all(
-                            ch_idx in finished_channels for ch_idx in range(n_children)
-                        ):
-                            accepting_data = False
-
-            if all(
-                (
-                    (seq_num in staged_chunks[ch_idx])
-                    or (ch_idx in bcast_indices and 0 in staged_chunks[ch_idx])
-                )
-                for ch_idx in range(n_children)
-            ):
-                # Ready to produce the output chunk for seq_num.
-                # Evaluate and send.
-                df = await asyncio.to_thread(
-                    ir.do_evaluate,
-                    *ir._non_child_args,
-                    *[
-                        (
-                            staged_chunks[ch_idx][0]
-                            if ch_idx in bcast_indices
-                            else staged_chunks[ch_idx].pop(seq_num)
-                        )
-                        for ch_idx in range(n_children)
-                    ],
-                )
-                await ch_out.data.send(
-                    ctx,
-                    Message(
-                        TableChunk.from_pylibcudf_table(
-                            seq_num,
-                            df.table,
-                            DEFAULT_STREAM,
-                            exclusive_view=True,
-                        )
-                    ),
-                )
-                seq_num += 1
-            elif not accepting_data:
-                if any(
-                    staged_chunks[ch_idx]
-                    for ch_idx in range(n_children)
-                    if ch_idx not in bcast_indices
-                ):
-                    raise RuntimeError(
-                        f"Leftover data in staged chunks: {staged_chunks}."
-                    )
-                break  # All channels have finished
-
-        # Drain the data channel
-        await ch_out.data.drain(ctx)
+        # Process data chunks with alignment
+        await _aligned_multi_input(ctx, ir, ch_out, chs_in, bcast_indices)
 
 
 @define_py_node()

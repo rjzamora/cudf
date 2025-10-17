@@ -63,12 +63,11 @@ async def concatenate_node(
         assert isinstance(metadata_in, ChunkMetadata), (
             f"Expected ChunkMetadata, got {type(metadata_in)}."
         )
+        new_local_count = (
+            max(1, math.ceil(metadata_in.local_count / max_chunks)) if max_chunks else 1
+        )
         metadata_out = ChunkMetadata(
-            (
-                max(1, metadata_in.local_count // max_chunks)
-                if max_chunks
-                else metadata_in.local_count
-            ),
+            new_local_count,
             global_partitioned_on=metadata_in.global_partitioned_on,
             duplicated=metadata_in.duplicated,
         )
