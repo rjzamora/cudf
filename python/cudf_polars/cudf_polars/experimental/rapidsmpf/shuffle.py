@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from rapidsmpf.communicator.single import new_communicator
 from rapidsmpf.config import Options, get_environment_variables
@@ -31,7 +31,11 @@ from cudf_polars.experimental.rapidsmpf.nodes import shutdown_on_error
 from cudf_polars.experimental.shuffle import Shuffle
 
 if TYPE_CHECKING:
+    from types import TracebackType
+
     from rapidsmpf.streaming.core.context import Context
+
+    import pylibcudf as plc
 
     from cudf_polars.dsl.ir import IR
     from cudf_polars.experimental.rapidsmpf.core import SubNetGenerator
@@ -59,6 +63,108 @@ def _release_shuffle_id(op_id: int) -> None:
         _shuffle_id_vacancy.add(op_id)
 
 
+class LocalShuffle:
+    """
+    Local shuffle instance context manager.
+
+    Parameters
+    ----------
+    ctx: Context
+        The streaming context.
+    num_partitions: int
+        The number of partitions to shuffle into.
+    columns_to_hash: tuple[int, ...]
+        The columns to hash.
+    """
+
+    def __init__(
+        self,
+        ctx: Context,
+        num_partitions: int,
+        columns_to_hash: tuple[int, ...],
+    ):
+        self.ctx = ctx
+        self.br = ctx.br()
+        self.op_id = _get_new_shuffle_id()
+        self.num_partitions = num_partitions
+        self.columns_to_hash = columns_to_hash
+        self.stream = DEFAULT_STREAM
+        statistics = ctx.statistics()
+        comm = new_communicator(Options(get_environment_variables()))
+        progress_thread = ProgressThread(comm, statistics)
+        self.shuffler = Shuffler(
+            comm=comm,
+            progress_thread=progress_thread,
+            op_id=self.op_id,
+            total_num_partitions=self.num_partitions,
+            br=self.br,
+            statistics=statistics,
+        )
+        self._insertion_finished = False
+
+    def __enter__(self) -> LocalShuffle:
+        """Enter the local shuffle instance context manager."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type | None,
+        exc_val: Exception | None,
+        exc_tb: TracebackType | None,
+    ) -> Literal[False]:
+        """Exit the local shuffle instance context manager."""
+        self.shuffler.shutdown()
+        _release_shuffle_id(self.op_id)
+        return False
+
+    def insert_chunk(self, table: plc.Table) -> None:
+        """
+        Insert a chunk into the local shuffle instance.
+
+        Parameters
+        ----------
+        table: plc.Table
+            The table to insert.
+        """
+        # Partition and pack using the Python function
+        partitioned_chunks = py_partition_and_pack(
+            table=table,
+            columns_to_hash=self.columns_to_hash,
+            num_partitions=self.num_partitions,
+            stream=self.stream,
+            br=self.br,
+        )
+
+        # Insert into shuffler
+        self.shuffler.insert_chunks(partitioned_chunks)
+
+    def extract_chunk(self, sequence_number: int) -> plc.Table:
+        """
+        Extract a chunk from the local shuffle instance.
+
+        Parameters
+        ----------
+        sequence_number: int
+            The sequence number of the chunk to extract.
+
+        Returns
+        -------
+        plc.Table
+            The extracted table.
+        """
+        if not self._insertion_finished:
+            self.shuffler.insert_finished(list(range(self.num_partitions)))
+            self._insertion_finished = True
+
+        self.shuffler.wait_on(sequence_number)
+        partition_chunks = self.shuffler.extract(sequence_number)
+        return py_unpack_and_concat(
+            partitions=partition_chunks,
+            stream=self.stream,
+            br=self.br,
+        )
+
+
 @define_py_node()
 async def local_shuffle_node(
     ctx: Context,
@@ -67,7 +173,6 @@ async def local_shuffle_node(
     ch_out: ChannelPair,
     columns_to_hash: tuple[int, ...],
     num_partitions: int,
-    op_id: int,
 ) -> None:
     """
     Execute a local shuffle pipeline in a single node with metadata passthrough.
@@ -91,114 +196,54 @@ async def local_shuffle_node(
         Tuple of column indices to use for hashing.
     num_partitions
         Number of partitions to shuffle into.
-    op_id
-        Unique shuffle operation ID.
     """
     async with shutdown_on_error(
         ctx, ch_in.metadata, ch_in.data, ch_out.metadata, ch_out.data
     ):
-        # Always use a single-process communicator for local shuffle
-        comm = new_communicator(Options(get_environment_variables()))
-
-        # Get resources from context
-        br = ctx.br()
-        statistics = ctx.statistics()
-
-        # Create a progress thread for this shuffle
-        # Note: The C++ context has a progress_thread() method, but Python
-        # binding might not expose it, so we create a new one
-        progress_thread = ProgressThread(comm, statistics)
-
-        # Use the default CUDA stream for operations
-        stream = DEFAULT_STREAM
-
-        # Create the Shuffler instance
-        shuffler = Shuffler(
-            comm=comm,
-            progress_thread=progress_thread,
-            op_id=op_id,
-            total_num_partitions=num_partitions,
-            br=br,
-            statistics=statistics,
-        )
-
-        # Update metadata
-        names = list(ir.schema.keys())
-        metadata_in = await ch_in.recv_metadata(ctx)
-        assert isinstance(metadata_in, ChunkMetadata), (
-            f"Expected ChunkMetadata, got {type(metadata_in)}."
-        )
-        metadata_out = ChunkMetadata(
-            num_partitions,
-            local_partitioned_on=tuple(names[i] for i in columns_to_hash),
-            global_partitioned_on=metadata_in.global_partitioned_on,
-            duplicated=metadata_in.duplicated,
-        )
-        await ch_out.send_metadata(ctx, metadata_out)
-
-        # Process input chunks
-        while True:
-            msg = await ch_in.data.recv(ctx)
-            if msg is None:
-                break
-
-            # Extract TableChunk from message
-            chunk = TableChunk.from_message(msg)
-
-            # Get the table view
-            table = chunk.table_view()
-
-            # Partition and pack using the Python function
-            partitioned_chunks = py_partition_and_pack(
-                table=table,
-                columns_to_hash=columns_to_hash,
-                num_partitions=num_partitions,
-                stream=stream,
-                br=br,
+        # Create LocalShuffle context manager to handle shuffler lifecycle
+        with LocalShuffle(ctx, num_partitions, columns_to_hash) as local_shuffle:
+            # Update metadata
+            metadata_in = await ch_in.recv_metadata(ctx)
+            assert isinstance(metadata_in, ChunkMetadata), (
+                f"Expected ChunkMetadata, got {type(metadata_in)}."
             )
+            names = list(ir.schema.keys())
+            metadata_out = ChunkMetadata(
+                num_partitions,
+                local_partitioned_on=tuple(names[i] for i in columns_to_hash),
+                global_partitioned_on=metadata_in.global_partitioned_on,
+                duplicated=metadata_in.duplicated,
+            )
+            await ch_out.send_metadata(ctx, metadata_out)
 
-            # Insert into shuffler
-            shuffler.insert_chunks(partitioned_chunks)
+            # Process input chunks
+            while True:
+                msg = await ch_in.data.recv(ctx)
+                if msg is None:
+                    break
 
-        # Mark all partitions as finished for insertion
-        shuffler.insert_finished(list(range(num_partitions)))
+                # Extract TableChunk from message
+                chunk = TableChunk.from_message(msg)
 
-        # Extract shuffled partitions and send them out
-        # We need to maintain sequence ordering for output chunks
-        output_seq = 0
+                # Get the table view and insert into shuffler
+                table = chunk.table_view()
+                local_shuffle.insert_chunk(table)
 
-        while not shuffler.finished():
-            # Wait for any partition to be ready
-            pid = shuffler.wait_any()
-
-            # Extract the partition
-            partition_chunks = shuffler.extract(pid)
-
-            if partition_chunks:
-                # Unpack and concatenate the partition chunks
-                result_table = py_unpack_and_concat(
-                    partitions=partition_chunks,
-                    stream=stream,
-                    br=br,
-                )
+            # Extract shuffled partitions and send them out
+            # LocalShuffle.extract_chunk handles insert_finished, wait, extract, and unpack
+            for partition_id in range(num_partitions):
+                result_table = local_shuffle.extract_chunk(partition_id)
 
                 # Create a new TableChunk with the result
                 output_chunk = TableChunk.from_pylibcudf_table(
-                    sequence_number=output_seq,
+                    sequence_number=partition_id,
                     table=result_table,
-                    stream=stream,
+                    stream=local_shuffle.stream,
                     exclusive_view=True,
                 )
-                output_seq += 1
 
                 # Send the output chunk
                 await ch_out.data.send(ctx, Message(output_chunk))
-
-        # Shutdown the shuffler
-        shuffler.shutdown()
-
-        # Release the shuffle ID
-        _release_shuffle_id(op_id)
 
         # Drain data output channel
         await ch_out.data.drain(ctx)
@@ -224,13 +269,13 @@ def _(
     context = rec.state["ctx"]
     columns_to_hash = tuple(column_names.index(k.name) for k in keys)
     num_partitions = rec.state["partition_info"][ir].count
-    op_id = _get_new_shuffle_id()
 
     # Get input and create output ChannelPairs
     ch_in = channels[child].pop()
     ch_out = ChannelPair.create()
 
     # Complete shuffle pipeline with metadata passthrough in a single node
+    # LocalShuffle context manager handles shuffle ID lifecycle internally
     nodes[ir] = [
         local_shuffle_node(
             context,
@@ -239,7 +284,6 @@ def _(
             ch_out=ch_out,
             columns_to_hash=columns_to_hash,
             num_partitions=num_partitions,
-            op_id=op_id,
         )
     ]
 
