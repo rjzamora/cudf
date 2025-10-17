@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, TypeAlias
 
 from rapidsmpf.streaming.core.channel import Channel, Message
 from rapidsmpf.streaming.core.pyobject import PyObjectPayload
@@ -14,9 +14,11 @@ if TYPE_CHECKING:
     from rapidsmpf.streaming.core.context import Context
     from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
+    from cudf_polars.experimental.base import ChunkMetadata
+
 
 # Type alias for metadata payloads
-Metadata: TypeAlias = PyObjectPayload
+MetadataPayload: TypeAlias = PyObjectPayload
 
 
 @dataclass
@@ -29,13 +31,13 @@ class ChannelPair:
 
     Attributes
     ----------
-    metadata : Channel[Metadata]
+    metadata :
         Channel for metadata (PyObjectPayload).
-    data : Channel[TableChunk]
+    data :
         Channel for table data chunks.
     """
 
-    metadata: Channel[Metadata]
+    metadata: Channel[MetadataPayload]
     data: Channel[TableChunk]
 
     @classmethod
@@ -53,17 +55,15 @@ class ChannelPair:
         await self.metadata.shutdown(ctx)
         await self.data.shutdown(ctx)
 
-    async def send_metadata(
-        self, ctx: Context, metadata: dict[str, Any] | None
-    ) -> None:
+    async def send_metadata(self, ctx: Context, metadata: ChunkMetadata | None) -> None:
         """
         Send metadata if present, then drain metadata channel.
 
         Parameters
         ----------
-        ctx : Context
+        ctx :
             The streaming context.
-        metadata : dict | None
+        metadata :
             The metadata to send. If None, just drain.
         """
         if metadata is not None:
@@ -74,19 +74,19 @@ class ChannelPair:
             await self.metadata.send(ctx, Message(payload))
         await self.metadata.drain(ctx)
 
-    async def recv_metadata(self, ctx: Context) -> dict[str, Any] | None:
+    async def recv_metadata(self, ctx: Context) -> ChunkMetadata | None:
         """
         Receive metadata from the metadata channel.
 
         Parameters
         ----------
-        ctx : Context
+        ctx :
             The streaming context.
 
         Returns
         -------
-        dict | None
-            The metadata dictionary, or None if channel is drained.
+        ChunkMetadata | None
+            The metadata, or None if channel is drained.
         """
         msg = await self.metadata.recv(ctx)
         if msg is None:

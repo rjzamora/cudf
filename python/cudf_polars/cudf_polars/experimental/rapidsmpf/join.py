@@ -18,6 +18,7 @@ from rmm.pylibrmm.stream import DEFAULT_STREAM
 
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IR, Join
+from cudf_polars.experimental.base import ChunkMetadata
 from cudf_polars.experimental.rapidsmpf.channel_pair import ChannelPair
 from cudf_polars.experimental.rapidsmpf.dispatch import (
     generate_ir_sub_network,
@@ -115,9 +116,14 @@ async def broadcast_join_node(
         # Receive metadata from both sides, merge them
         left_metadata = await ch_left.recv_metadata(ctx)
         right_metadata = await ch_right.recv_metadata(ctx)
-        # TODO: May need a more sophisticated merge strategy
-        metadata = left_metadata if left_metadata is not None else right_metadata
-        await ch_out.send_metadata(ctx, metadata)
+        assert isinstance(left_metadata, ChunkMetadata), (
+            f"Expected ChunkMetadata, got {type(left_metadata)}."
+        )
+        assert isinstance(right_metadata, ChunkMetadata), (
+            f"Expected ChunkMetadata, got {type(right_metadata)}."
+        )
+        local_partitioned_on: tuple[str, ...] = ()
+        global_partitioned_on: tuple[str, ...] = ()
 
         if broadcast_side == "right":
             # Broadcast right, stream left
@@ -125,12 +131,27 @@ async def broadcast_join_node(
             large_ch = ch_left
             small_child = ir.children[1]
             large_child = ir.children[0]
+            local_count = left_metadata.local_count
+            local_partitioned_on = left_metadata.local_partitioned_on
+            global_partitioned_on = left_metadata.global_partitioned_on
         else:
             # Broadcast left, stream right
             small_ch = ch_left
             large_ch = ch_right
             small_child = ir.children[0]
             large_child = ir.children[1]
+            local_count = right_metadata.local_count
+            if ir.options[0] == "Right":
+                local_partitioned_on = right_metadata.local_partitioned_on
+                global_partitioned_on = right_metadata.global_partitioned_on
+
+        # Send output metadata
+        metadata = ChunkMetadata(
+            local_count,
+            local_partitioned_on=local_partitioned_on,
+            global_partitioned_on=global_partitioned_on,
+        )
+        await ch_out.send_metadata(ctx, metadata)
 
         # TODO: Build output partition incrementally?
         small_dfs: list[DataFrame] = []

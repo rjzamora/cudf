@@ -52,6 +52,66 @@ class PartitionInfo:
         yield "partitioned_on", self.partitioned_on
 
 
+class ChunkMetadata:  # pragma: no cover
+    """Chunk metadata."""
+
+    __slots__ = (
+        "duplicated",
+        "global_partitioned_on",
+        "local_count",
+        "local_partitioned_on",
+    )
+    local_count: int
+    """Local chunk-count estimate."""
+    local_partitioned_on: tuple[str, ...]
+    """Local partitioned-on columns."""
+    global_partitioned_on: tuple[str, ...]
+    """Global partitioned-on columns."""
+    duplicated: bool
+    """Whether the data is duplicated on all workers."""
+
+    def __init__(
+        self,
+        local_count: int,
+        *,
+        local_partitioned_on: tuple[str, ...] = (),
+        global_partitioned_on: tuple[str, ...] = (),
+        duplicated: bool = False,
+    ):
+        self.local_count = local_count
+        self.local_partitioned_on = local_partitioned_on
+        self.global_partitioned_on = global_partitioned_on
+        self.duplicated = duplicated
+
+    def copy(self, *, preserve_partitioning: bool = False) -> ChunkMetadata:
+        """
+        Copy the ChunkMetadata object.
+
+        Parameters
+        ----------
+        preserve_partitioning
+            If True, preserve the partitioning information.
+
+        Returns
+        -------
+        A new ChunkMetadata object.
+        """
+        if preserve_partitioning:
+            return ChunkMetadata(
+                self.local_count,
+                local_partitioned_on=self.local_partitioned_on,
+                global_partitioned_on=self.global_partitioned_on,
+                duplicated=self.duplicated,
+            )
+        else:
+            return ChunkMetadata(
+                self.local_count,
+                local_partitioned_on=(),
+                global_partitioned_on=(),
+                duplicated=self.duplicated,
+            )
+
+
 def get_key_name(node: Node) -> str:
     """Generate the key name for a Node."""
     return f"{type(node).__name__.lower()}-{hash(node)}"

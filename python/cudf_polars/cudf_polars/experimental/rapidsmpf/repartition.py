@@ -14,6 +14,7 @@ from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 import pylibcudf as plc
 from rmm.pylibrmm.stream import DEFAULT_STREAM
 
+from cudf_polars.experimental.base import ChunkMetadata
 from cudf_polars.experimental.rapidsmpf.channel_pair import ChannelPair
 from cudf_polars.experimental.rapidsmpf.dispatch import generate_ir_sub_network
 from cudf_polars.experimental.rapidsmpf.nodes import shutdown_on_error
@@ -58,8 +59,20 @@ async def concatenate_node(
         ctx, ch_in.metadata, ch_in.data, ch_out.metadata, ch_out.data
     ):
         # Pass through metadata
-        metadata = await ch_in.recv_metadata(ctx)
-        await ch_out.send_metadata(ctx, metadata)
+        metadata_in = await ch_in.recv_metadata(ctx)
+        assert isinstance(metadata_in, ChunkMetadata), (
+            f"Expected ChunkMetadata, got {type(metadata_in)}."
+        )
+        metadata_out = ChunkMetadata(
+            (
+                max(1, metadata_in.local_count // max_chunks)
+                if max_chunks
+                else metadata_in.local_count
+            ),
+            global_partitioned_on=metadata_in.global_partitioned_on,
+            duplicated=metadata_in.duplicated,
+        )
+        await ch_out.send_metadata(ctx, metadata_out)
 
         build_stream = DEFAULT_STREAM
 

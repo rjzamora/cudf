@@ -16,6 +16,7 @@ from rmm.pylibrmm.stream import DEFAULT_STREAM
 
 from cudf_polars.dsl.ir import IR, DataFrameScan, Scan
 from cudf_polars.experimental.base import (
+    ChunkMetadata,
     IOPartitionFlavor,
     IOPartitionPlan,
     PartitionInfo,
@@ -100,8 +101,8 @@ async def dataframescan_node(
         local_offset = local_count * ctx.comm().rank
 
     async with shutdown_on_error(ctx, ch_out.metadata, ch_out.data):
-        # No metadata for DataFrameScan (for now).
-        await ch_out.send_metadata(ctx, None)
+        # Forward simple metadata.
+        await ch_out.send_metadata(ctx, ChunkMetadata(local_count))
 
         io_throttle = asyncio.Semaphore(max_io_threads)
         for seq_num in range(local_count):
@@ -253,10 +254,6 @@ async def scan_node(
     """
     # TODO: Use multiple streams
     async with shutdown_on_error(ctx, ch_out.metadata, ch_out.data):
-        # No metadata for Scan (for now)
-        # TODO: Could send file-level metadata here
-        await ch_out.send_metadata(ctx, None)
-
         # Build a list of local Scan operations
         scans: list[Scan | SplitScan] = []
         if plan.flavor == IOPartitionFlavor.SPLIT_FILES:
@@ -319,6 +316,9 @@ async def scan_node(
                         parquet_options,
                     )
                 )
+
+        # Forward simple metadata.
+        await ch_out.send_metadata(ctx, ChunkMetadata(len(scans)))
 
         # Read data (using io_throttle).
         # In some cases, we may may be able to read data

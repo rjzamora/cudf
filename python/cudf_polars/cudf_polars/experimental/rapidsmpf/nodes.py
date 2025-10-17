@@ -17,7 +17,8 @@ from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 from rmm.pylibrmm.stream import DEFAULT_STREAM
 
 from cudf_polars.containers import DataFrame
-from cudf_polars.dsl.ir import IR, Empty
+from cudf_polars.dsl.ir import IR, Empty, Join
+from cudf_polars.experimental.base import ChunkMetadata
 from cudf_polars.experimental.rapidsmpf.channel_pair import ChannelPair
 from cudf_polars.experimental.rapidsmpf.dispatch import generate_ir_sub_network
 
@@ -58,6 +59,8 @@ async def default_node_single(
     ir: IR,
     ch_out: ChannelPair,
     ch_in: ChannelPair,
+    *,
+    preserve_partitioning: bool = False,
 ) -> None:
     """
     Single-channel default node for rapidsmpf.
@@ -72,6 +75,8 @@ async def default_node_single(
         The output ChannelPair.
     ch_in
         The input ChannelPair.
+    preserve_partitioning
+        Whether to preserve the partitioning metadata of the input chunks.
 
     Notes
     -----
@@ -82,7 +87,12 @@ async def default_node_single(
     ):
         # Pass through metadata
         metadata = await ch_in.recv_metadata(ctx)
-        await ch_out.send_metadata(ctx, metadata)
+        assert isinstance(metadata, ChunkMetadata), (
+            f"Expected ChunkMetadata, got {type(metadata)}."
+        )
+        await ch_out.send_metadata(
+            ctx, metadata.copy(preserve_partitioning=preserve_partitioning)
+        )
 
         # Process data chunks
         while (msg := await ch_in.data.recv(ctx)) is not None:
@@ -140,11 +150,21 @@ async def default_node_multi(
         # Receive metadata from all inputs and merge
         # For now, just take the first non-None metadata
         # TODO: May need a more sophisticated merge strategy
-        metadata = None
-        for ch_in in chs_in:
+        metadata = ChunkMetadata(1)
+        for ch_idx, ch_in in enumerate(chs_in):
             md = await ch_in.recv_metadata(ctx)
-            if md is not None and metadata is None:
-                metadata = md
+            assert isinstance(md, ChunkMetadata), (
+                f"Expected ChunkMetadata, got {type(md)}."
+            )
+            metadata.local_count = max(md.local_count, metadata.local_count)
+            metadata.duplicated = metadata.duplicated and md.duplicated
+            if isinstance(ir, Join) and (
+                (ch_idx == 0 and ir.options[0] != "right")
+                or (ch_idx == 1 and ir.options[0] == "right")
+            ):
+                metadata.local_partitioned_on = md.local_partitioned_on
+                metadata.global_partitioned_on = md.global_partitioned_on
+
         await ch_out.send_metadata(ctx, metadata)
 
         seq_num = 0
@@ -254,6 +274,9 @@ async def multicast_node(
     async with shutdown_on_error(ctx, ch_in.metadata, ch_in.data, *all_out_channels):
         # Forward metadata
         metadata = await ch_in.recv_metadata(ctx)
+        assert isinstance(metadata, ChunkMetadata), (
+            f"Expected ChunkMetadata, got {type(metadata)}."
+        )
         await asyncio.gather(
             *(
                 asyncio.create_task(ch_out.send_metadata(ctx, metadata))
@@ -391,7 +414,7 @@ async def empty_node(
     """
     async with shutdown_on_error(ctx, ch_out.metadata, ch_out.data):
         # No metadata for empty node
-        await ch_out.send_metadata(ctx, None)
+        await ch_out.send_metadata(ctx, ChunkMetadata(1))
 
         # Evaluate the IR node to create an empty DataFrame
         df: DataFrame = ir.do_evaluate(*ir._non_child_args)

@@ -12,6 +12,7 @@ from rapidsmpf.streaming.core.channel import Message
 from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
 from cudf_polars.dsl.ir import Union
+from cudf_polars.experimental.base import ChunkMetadata
 from cudf_polars.experimental.rapidsmpf.channel_pair import ChannelPair
 from cudf_polars.experimental.rapidsmpf.dispatch import (
     generate_ir_sub_network,
@@ -50,11 +51,18 @@ async def union_node(
     all_channels = [ch for pair in chs_in for ch in (pair.metadata, pair.data)]
     async with shutdown_on_error(ctx, *all_channels, ch_out.metadata, ch_out.data):
         # Receive metadata from all inputs, take the first non-None
-        metadata = None
+        metadata = ChunkMetadata(1)
+        global_partitioning: set[tuple[str, ...]] = set()
         for ch_in in chs_in:
             md = await ch_in.recv_metadata(ctx)
-            if md is not None and metadata is None:
-                metadata = md
+            assert isinstance(md, ChunkMetadata), (
+                f"Expected ChunkMetadata, got {type(md)}."
+            )
+            metadata.local_count += md.local_count
+            metadata.duplicated = metadata.duplicated and md.duplicated
+            global_partitioning.add(md.global_partitioned_on)
+        if len(global_partitioning) == 1:
+            metadata.global_partitioned_on = global_partitioning.pop()
         await ch_out.send_metadata(ctx, metadata)
 
         # Concatenate data from all inputs
