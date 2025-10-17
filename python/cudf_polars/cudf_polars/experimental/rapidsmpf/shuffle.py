@@ -136,17 +136,6 @@ async def local_shuffle_node(
         )
         await ch_out.send_metadata(ctx, metadata_out)
 
-        # # Handle metadata passthrough concurrently with data processing
-        # async def metadata_passthrough() -> None:
-        #     metadata_msg = await ch_in.metadata.recv(ctx)
-        #     if metadata_msg is not None:
-        #         await ch_out.metadata.send(ctx, metadata_msg)
-        #     await ch_out.metadata.drain(ctx)
-
-        # # Start metadata passthrough as a background task
-        # metadata_task = asyncio.create_task(metadata_passthrough())
-
-        # try:
         # Process input chunks
         while True:
             msg = await ch_in.data.recv(ctx)
@@ -213,10 +202,6 @@ async def local_shuffle_node(
 
         # Drain data output channel
         await ch_out.data.drain(ctx)
-
-        # finally:
-        #     # Wait for metadata passthrough to complete
-        #     await metadata_task
 
 
 @generate_ir_sub_network.register(Shuffle)
