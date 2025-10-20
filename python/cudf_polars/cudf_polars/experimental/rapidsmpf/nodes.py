@@ -81,6 +81,7 @@ async def default_node_single(
         while (msg := await ch_in.data.recv(ctx)) is not None:
             chunk = TableChunk.from_message(msg)
             seq_num = chunk.sequence_number
+            print(f"[A] seq_num: {seq_num}", flush=True)
             df = await asyncio.to_thread(
                 ir.do_evaluate,
                 *ir._non_child_args,
@@ -91,9 +92,19 @@ async def default_node_single(
                     chunk.stream,
                 ),
             )
+            # df = ir.do_evaluate(
+            #     *ir._non_child_args,
+            #     DataFrame.from_table(
+            #         chunk.table_view(),
+            #         list(ir.children[0].schema.keys()),
+            #         list(ir.children[0].schema.values()),
+            #         chunk.stream,
+            #     ),
+            # )
             chunk = TableChunk.from_pylibcudf_table(
                 seq_num, df.table, chunk.stream, exclusive_view=True
             )
+            print(f"[B] seq_num: {seq_num}", flush=True)
             await ch_out.data.send(ctx, Message(chunk))
 
         await ch_out.data.drain(ctx)
@@ -186,6 +197,17 @@ async def default_node_multi(
                         for ch_idx in range(n_children)
                     ],
                 )
+                # df = ir.do_evaluate(
+                #     *ir._non_child_args,
+                #     *[
+                #         (
+                #             staged_chunks[ch_idx][0]
+                #             if ch_idx in bcast_indices
+                #             else staged_chunks[ch_idx].pop(seq_num)
+                #         )
+                #         for ch_idx in range(n_children)
+                #     ],
+                # )
                 await ch_out.data.send(
                     ctx,
                     Message(

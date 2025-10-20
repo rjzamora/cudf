@@ -21,6 +21,13 @@ from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
 import rmm
 
+try:
+    import pynvml
+
+    HAVE_PYNVML = True
+except ImportError:
+    HAVE_PYNVML = False
+
 import cudf_polars.experimental.rapidsmpf.io
 import cudf_polars.experimental.rapidsmpf.join
 import cudf_polars.experimental.rapidsmpf.lower
@@ -48,6 +55,38 @@ if TYPE_CHECKING:
         LowerState,
         SubNetGenerator,
     )
+
+
+def get_gpu_memory_mb() -> float:
+    """Get current GPU memory usage in MB."""
+    if HAVE_PYNVML:
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            return info.used / (1024 * 1024)
+        except Exception:
+            pass
+    return 0.0
+
+
+def init_gpu_monitoring() -> bool:
+    """Initialize GPU monitoring. Returns True if successful."""
+    if HAVE_PYNVML:
+        try:
+            pynvml.nvmlInit()
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def shutdown_gpu_monitoring():
+    """Shutdown GPU monitoring."""
+    if HAVE_PYNVML:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
 
 
 def evaluate_logical_plan(ir: IR, config_options: ConfigOptions) -> DataFrame:
@@ -99,17 +138,24 @@ def evaluate_logical_plan(ir: IR, config_options: ConfigOptions) -> DataFrame:
     # TODO: Make this configurable.
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cpse")
 
-    # Generate network nodes
-    nodes, output = generate_network(ctx, ir, partition_info, config_options)
+    # Initialize GPU memory monitoring for I/O backpressure
+    init_gpu_monitoring()
 
-    # Run the network
-    run_streaming_pipeline(nodes=nodes, py_executor=executor)
+    try:
+        # Generate network nodes (with memory gate support)
+        nodes, output = generate_network(ctx, ir, partition_info, config_options)
 
-    # Extract/return the result
-    return combine_output_chunks(
-        ir,
-        *(TableChunk.from_message(msg) for msg in output.release()),
-    )
+        # Run the network
+        run_streaming_pipeline(nodes=nodes, py_executor=executor)
+
+        # Extract/return the result
+        return combine_output_chunks(
+            ir,
+            *(TableChunk.from_message(msg) for msg in output.release()),
+        )
+    finally:
+        # Clean up GPU monitoring
+        shutdown_gpu_monitoring()
 
 
 def combine_output_chunks(ir: IR, *chunks: TableChunk) -> DataFrame:
@@ -203,6 +249,8 @@ def generate_network(
     -------
     The network nodes and output hook.
     """
+    from cudf_polars.experimental.rapidsmpf.memory_gate import MemoryGate
+
     # Find IR nodes with multiple references.
     # We will need to multiply the output channel
     # for these nodes.
@@ -211,6 +259,27 @@ def generate_network(
         for child in node.children:
             output_ch_count[child] += 1
 
+    # Create memory gate for I/O backpressure
+    # TODO: Make thresholds configurable via environment variables or config options
+    memory_gate = None
+    if HAVE_PYNVML:
+        try:
+            # Get total GPU memory to set reasonable thresholds
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            total_memory_mb = info.total / (1024 * 1024)
+            
+            # Set thresholds at 80% and 60% of total memory
+            high_threshold = total_memory_mb * 0.80
+            low_threshold = total_memory_mb * 0.60
+            
+            memory_gate = MemoryGate()
+            # Note: MemoryMonitor will be started as a background task
+            # when the pipeline runs. For now, we just create the gate.
+        except Exception:
+            # If we can't get memory info, proceed without memory gate
+            pass
+
     # Generate the network
     state: GenState = {
         "ctx": ctx,
@@ -218,6 +287,7 @@ def generate_network(
         "partition_info": partition_info,
         "output_ch_count": output_ch_count,
         "union_dependency": False,
+        "memory_gate": memory_gate,
     }
     mapper: SubNetGenerator = CachingVisitor(
         generate_ir_sub_network_wrapper, state=state

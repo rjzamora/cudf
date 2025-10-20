@@ -26,6 +26,7 @@ from cudf_polars.experimental.rapidsmpf.dispatch import (
     generate_ir_sub_network,
     lower_ir_node,
 )
+from cudf_polars.experimental.rapidsmpf.memory_gate import MemoryGate
 from cudf_polars.experimental.rapidsmpf.nodes import define_py_node, shutdown_on_error
 
 if TYPE_CHECKING:
@@ -69,6 +70,7 @@ async def dataframescan_node(
     *,
     max_io_threads: int,
     rows_per_partition: int,
+    memory_gate: MemoryGate | None = None,
 ) -> None:
     """
     DataFrameScan node for rapidsmpf.
@@ -86,6 +88,9 @@ async def dataframescan_node(
         concurrently for a single DataFrameScan node.
     rows_per_partition
         The number of rows per partition.
+    memory_gate
+        Optional memory gate for dynamic I/O backpressure
+        based on GPU memory usage.
     """
     # TODO: Use multiple streams
     nrows = max(ir.df.shape()[0], 1)
@@ -111,7 +116,7 @@ async def dataframescan_node(
                 ir.df.slice(offset, rows_per_partition),
                 ir.projection,
             )
-            await read_chunk(ctx, io_throttle, ir_slice, seq_num, ch_out.data)
+            await read_chunk(ctx, io_throttle, ir_slice, seq_num, ch_out.data, memory_gate)
 
         # Drain data channel
         await ch_out.data.drain(ctx)
@@ -129,6 +134,7 @@ def _(
     max_io_threads = 1  # TODO: Make this configurable.
 
     ctx = rec.state["ctx"]
+    memory_gate = rec.state.get("memory_gate", None)
     ch_out = ChannelPair.create()
     nodes: dict[IR, list[Any]] = {
         ir: [
@@ -138,6 +144,7 @@ def _(
                 ch_out,
                 max_io_threads=max_io_threads,
                 rows_per_partition=rows_per_partition,
+                memory_gate=memory_gate,
             )
         ]
     }
@@ -183,6 +190,7 @@ async def read_chunk(
     scan: IR,
     seq_num: int,
     ch_out: Channel[TableChunk],
+    memory_gate: MemoryGate | None = None,
 ) -> None:
     """
     Read a chunk from disk and send it to the output channel.
@@ -192,31 +200,58 @@ async def read_chunk(
     ctx
         The context.
     io_throttle
-        The IO throttle.
+        The IO throttle (limits max concurrent I/O operations).
     scan
         The Scan or DataFrameScan node.
     seq_num
         The sequence number.
     ch_out
         The output channel.
+    memory_gate
+        Optional memory gate for dynamic backpressure based on
+        memory usage. If provided, I/O will pause when memory
+        pressure is high.
     """
-    async with io_throttle:
-        # Evaluate and send the Scan-node result
-        df = await asyncio.to_thread(
-            scan.do_evaluate,
-            *scan._non_child_args,
-        )
-        await ch_out.send(
-            ctx,
-            Message(
-                TableChunk.from_pylibcudf_table(
-                    seq_num,
-                    df.table,
-                    DEFAULT_STREAM,
-                    exclusive_view=True,
+    # First, wait for memory gate (if provided)
+    if memory_gate is not None:
+        async with memory_gate:
+            # Then acquire semaphore slot
+            async with io_throttle:
+                # Evaluate and send the Scan-node result
+                df = await asyncio.to_thread(
+                    scan.do_evaluate,
+                    *scan._non_child_args,
                 )
-            ),
-        )
+                await ch_out.send(
+                    ctx,
+                    Message(
+                        TableChunk.from_pylibcudf_table(
+                            seq_num,
+                            df.table,
+                            DEFAULT_STREAM,
+                            exclusive_view=True,
+                        )
+                    ),
+                )
+    else:
+        # Just use semaphore (existing behavior)
+        async with io_throttle:
+            # Evaluate and send the Scan-node result
+            df = await asyncio.to_thread(
+                scan.do_evaluate,
+                *scan._non_child_args,
+            )
+            await ch_out.send(
+                ctx,
+                Message(
+                    TableChunk.from_pylibcudf_table(
+                        seq_num,
+                        df.table,
+                        DEFAULT_STREAM,
+                        exclusive_view=True,
+                    )
+                ),
+            )
 
 
 @define_py_node()
@@ -228,6 +263,7 @@ async def scan_node(
     max_io_threads: int,
     plan: IOPartitionPlan,
     parquet_options: ParquetOptions,
+    memory_gate: MemoryGate | None = None,
 ) -> None:
     """
     Scan node for rapidsmpf.
@@ -247,6 +283,9 @@ async def scan_node(
         The partitioning plan.
     parquet_options
         The Parquet options.
+    memory_gate
+        Optional memory gate for dynamic I/O backpressure
+        based on GPU memory usage.
     """
     # TODO: Use multiple streams
     async with shutdown_on_error(ctx, ch_out.data):
@@ -321,7 +360,7 @@ async def scan_node(
         io_throttle = asyncio.Semaphore(max_io_threads)
         tasks = []
         for seq_num, scan in enumerate(scans):
-            tasks.append(read_chunk(ctx, io_throttle, scan, seq_num, ch_out.data))
+            tasks.append(read_chunk(ctx, io_throttle, scan, seq_num, ch_out.data, memory_gate))
 
         # Drain the output data channel
         await asyncio.gather(*tasks)
@@ -343,6 +382,7 @@ def _(ir: Scan, rec: SubNetGenerator) -> tuple[dict[IR, list[Any]], dict[IR, Any
     if plan.flavor == IOPartitionFlavor.SPLIT_FILES:
         parquet_options = dataclasses.replace(parquet_options, chunked=False)
 
+    memory_gate = rec.state.get("memory_gate", None)
     ch_out = ChannelPair.create()
     nodes: dict[IR, list[Any]] = {
         ir: [
@@ -353,6 +393,7 @@ def _(ir: Scan, rec: SubNetGenerator) -> tuple[dict[IR, list[Any]], dict[IR, Any
                 max_io_threads=max_io_threads,
                 plan=plan,
                 parquet_options=parquet_options,
+                memory_gate=memory_gate,
             )
         ]
     }
