@@ -140,7 +140,20 @@ def evaluate_logical_plan(
         )
         for chunk in chunks
     ]
-    return _concat(*dfs, context=ir_context)
+    result = _concat(*dfs, context=ir_context)
+
+    # Convert to polars DataFrame while the rapidsmpf context is still alive.
+    # This ensures stream pool and memory allocations remain valid during the
+    # device-to-host copy in to_polars().
+    polars_result = result.to_polars()
+
+    # Explicitly clean up GPU objects before the function returns and the
+    # rapidsmpf context is destroyed. This prevents use-after-free errors
+    # when Python's automatic cleanup tries to deallocate through the
+    # destroyed RmmResourceAdaptor.
+    del result, dfs, chunks
+
+    return polars_result
 
 
 def lower_ir_graph(
