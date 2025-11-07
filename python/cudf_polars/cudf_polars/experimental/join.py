@@ -274,6 +274,13 @@ def _(
             msg=f"Join({maintain_order=}) not supported for multiple partitions.",
         )
 
+    # Let RapidsMPF decide what kind of join to perform at runtime
+    if config_options.executor.runtime == "rapidsmpf":  # pragma: no cover
+        new_node = ir.reconstruct(children)
+        count = max(partition_info[left].count, partition_info[right].count)
+        partition_info[new_node] = PartitionInfo(count=count)
+        return new_node, partition_info
+
     if _should_bcast_join(
         ir,
         left,
