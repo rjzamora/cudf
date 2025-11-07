@@ -38,13 +38,15 @@ from cudf_polars.experimental.rapidsmpf.nodes import (
 )
 from cudf_polars.experimental.statistics import collect_statistics
 from cudf_polars.experimental.utils import _concat
-from cudf_polars.utils.config import CUDAStreamPolicy
+from cudf_polars.utils.config import CUDAStreamPoolConfig
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping
 
     from rapidsmpf.streaming.core.channel import Channel
     from rapidsmpf.streaming.core.leaf_node import DeferredMessages
+
+    import polars as pl
 
     from cudf_polars.dsl.ir import IR
     from cudf_polars.experimental.base import PartitionInfo
@@ -61,7 +63,7 @@ if TYPE_CHECKING:
 def evaluate_logical_plan(
     ir: IR,
     config_options: ConfigOptions,
-) -> tuple[DataFrame, list[Metadata]]:
+) -> tuple[pl.DataFrame, list[Metadata]]:
     """
     Evaluate a logical plan with the RapidsMPF streaming runtime.
 
@@ -74,7 +76,7 @@ def evaluate_logical_plan(
 
     Returns
     -------
-    The output DataFrame.
+    The output DataFrame and metadata collector.
     """
     assert config_options.executor.name == "streaming", "Executor must be streaming"
     assert config_options.executor.runtime == "rapidsmpf", "Runtime must be rapidsmpf"
@@ -107,12 +109,23 @@ def evaluate_logical_plan(
                 mr, limit=int(total_memory * single_spill_device)
             )
         }
-    br = BufferResource(mr, memory_available=memory_available)
+
+    # We have a couple of cases to consider here:
+    # 1: we want to use the same stream pool for cudf-polars and rapidsmpf
+    # 2: rapidsmpf uses its own pool and cudf-polars uses the default stream
+    if isinstance(config_options.cuda_stream_policy, CUDAStreamPoolConfig):
+        stream_pool = config_options.cuda_stream_policy.build()
+    else:
+        stream_pool = None
+
+    br = BufferResource(mr, memory_available=memory_available, stream_pool=stream_pool)
     rmpf_context = Context(comm, br, options)
+
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cpse")
 
     # Create the IR execution context.
-    if config_options.cuda_stream_policy == CUDAStreamPolicy.POOL:
+    if stream_pool is not None:
+        # both cudf-polars and rapidsmpf are using the same stream pool
         ir_context = IRExecutionContext(
             get_cuda_stream=rmpf_context.get_stream_from_pool
         )
@@ -147,7 +160,18 @@ def evaluate_logical_plan(
         )
         for chunk in chunks
     ]
-    return _concat(*dfs, context=ir_context), metadata_collector
+    df = _concat(*dfs, context=ir_context)
+    # We need to materialize the polars dataframe before we drop the rapidsmpf
+    # context, which keeps the CUDA streams alive.
+    stream = df.stream
+    result = df.to_polars()
+    stream.synchronize()
+
+    # Now we need to drop *all* GPU data. This ensures that no cudaFreeAsync runs
+    # before the Context, which ultimately contains the rmm MR, goes out of scope.
+    del nodes, output, messages, chunks, dfs, df
+
+    return result, metadata_collector
 
 
 def lower_ir_graph(
