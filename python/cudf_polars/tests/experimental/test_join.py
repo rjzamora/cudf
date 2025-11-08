@@ -17,6 +17,10 @@ from cudf_polars.testing.asserts import (
 )
 from cudf_polars.utils.config import ConfigOptions
 
+REQUIRE_TASKS_RUNTIME = pytest.mark.skipif(
+    DEFAULT_RUNTIME != "tasks", reason="Requires 'tasks' runtime."
+)
+
 
 @pytest.fixture(scope="module")
 def left():
@@ -77,6 +81,7 @@ def test_join(left, right, how, reverse, max_rows_per_partition, broadcast_join_
         assert_gpu_result_equal(q2, engine=engine, check_row_order=False)
 
 
+@REQUIRE_TASKS_RUNTIME
 @pytest.mark.parametrize("broadcast_join_limit", [1, 2, 3, 4])
 def test_broadcast_join_limit(left, right, broadcast_join_limit):
     engine = pl.GPUEngine(

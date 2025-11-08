@@ -206,42 +206,66 @@ async def local_shuffle_node(
     async with shutdown_on_error(
         context, ch_in.metadata, ch_in.data, ch_out.metadata, ch_out.data
     ):
-        # Receive and send metadata
-        _ = await ch_in.recv_metadata(context)
+        # Receive metadata and check if we need to shuffle
+        metadata = await ch_in.recv_metadata(context)
+        assert isinstance(metadata, Metadata), (
+            f"Expected Metadata, got {type(metadata)}."
+        )
+        partitioned_on_before = metadata.partitioned_on
         column_names = list(ir.schema.keys())
-        partitioned_on = tuple(column_names[i] for i in columns_to_hash)
-        new_metadata = Metadata(num_partitions, partitioned_on=partitioned_on)
-        await ch_out.send_metadata(context, new_metadata)
+        partitioned_on_needed = tuple(column_names[i] for i in columns_to_hash)
 
-        # Create LocalShuffle context manager to handle shuffler lifecycle
-        # TODO: Use ir_context to get the stream (not available yet)
-        with LocalShuffle(context, num_partitions, columns_to_hash) as local_shuffle:
-            # Process input chunks
-            while True:
-                msg = await ch_in.data.recv(context)
-                if msg is None:
-                    break
+        if (
+            partitioned_on_before == partitioned_on_needed
+            and metadata.count == num_partitions
+        ):
+            # Data is already shuffled.
+            # Pass through metadata and data as is
+            await ch_out.send_metadata(context, metadata)
+            while (msg := await ch_in.data.recv(context)) is not None:
+                await ch_out.data.send(context, msg)
 
-                # Extract TableChunk from message
-                chunk = TableChunk.from_message(msg)
+        else:
+            # Data needs to be shuffled
 
-                # Get the table view and insert into shuffler
-                local_shuffle.insert_chunk(chunk)
+            # Send updated metadata
+            new_metadata = Metadata(
+                num_partitions, partitioned_on=partitioned_on_needed
+            )
+            await ch_out.send_metadata(context, new_metadata)
 
-            # Extract shuffled partitions and send them out
-            # LocalShuffle.extract_chunk handles insert_finished, wait, extract, and unpack
-            stream = ir_context.get_cuda_stream()
-            for partition_id in range(num_partitions):
-                # Create a new TableChunk with the result
-                output_chunk = TableChunk.from_pylibcudf_table(
-                    table=local_shuffle.extract_chunk(partition_id, stream),
-                    stream=stream,
-                    exclusive_view=True,
-                )
+            # Create LocalShuffle context manager to handle shuffler lifecycle
+            # TODO: Use ir_context to get the stream (not available yet)
+            with LocalShuffle(
+                context, num_partitions, columns_to_hash
+            ) as local_shuffle:
+                # Process input chunks
+                while True:
+                    msg = await ch_in.data.recv(context)
+                    if msg is None:
+                        break
 
-                # Send the output chunk
-                await ch_out.data.send(context, Message(partition_id, output_chunk))
+                    # Extract TableChunk from message
+                    chunk = TableChunk.from_message(msg)
 
+                    # Get the table view and insert into shuffler
+                    local_shuffle.insert_chunk(chunk)
+
+                # Extract shuffled partitions and send them out
+                # LocalShuffle.extract_chunk handles insert_finished, wait, extract, and unpack
+                stream = ir_context.get_cuda_stream()
+                for partition_id in range(num_partitions):
+                    # Create a new TableChunk with the result
+                    output_chunk = TableChunk.from_pylibcudf_table(
+                        table=local_shuffle.extract_chunk(partition_id, stream),
+                        stream=stream,
+                        exclusive_view=True,
+                    )
+
+                    # Send the output chunk
+                    await ch_out.data.send(context, Message(partition_id, output_chunk))
+
+        # Drain the output channel
         await ch_out.data.drain(context)
 
 
