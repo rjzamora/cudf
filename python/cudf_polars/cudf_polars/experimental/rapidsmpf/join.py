@@ -243,44 +243,17 @@ async def _partition_wise_join(
 
     left_child, right_child = ir.children
 
-    # Process aligned chunks
-    staged_left: dict[int, TableChunk] = {}
-    staged_right: dict[int, TableChunk] = {}
-    left_finished = False
-    right_finished = False
-
-    for seq_num, partition_id in enumerate(range(num_partitions)):
+    # Process aligned chunks - Lineariser ensures in-order delivery
+    for seq_num in range(num_partitions):
         # Get left partition
-        while partition_id not in staged_left and not left_finished:
-            left_msg = await ch_left.data.recv(context)
-            if left_msg is None:
-                left_finished = True
-                break
-            left_chunk = TableChunk.from_message(left_msg)
-            staged_left[left_msg.sequence_number] = left_chunk
-
-        if partition_id not in staged_left:
-            raise ValueError(
-                f"Missing left partition {partition_id}, "
-                f"available: {list(staged_left.keys())}"
-            )
-        left_chunk = staged_left.pop(partition_id)
+        left_msg = await ch_left.data.recv(context)
+        assert left_msg is not None, f"Missing left partition {seq_num}"
+        left_chunk = TableChunk.from_message(left_msg)
 
         # Get right partition
-        while partition_id not in staged_right and not right_finished:
-            right_msg = await ch_right.data.recv(context)
-            if right_msg is None:
-                right_finished = True
-                break
-            right_chunk = TableChunk.from_message(right_msg)
-            staged_right[right_msg.sequence_number] = right_chunk
-
-        if partition_id not in staged_right:
-            raise ValueError(
-                f"Missing right partition {partition_id}, "
-                f"available: {list(staged_right.keys())}"
-            )
-        right_chunk = staged_right.pop(partition_id)
+        right_msg = await ch_right.data.recv(context)
+        assert right_msg is not None, f"Missing right partition {seq_num}"
+        right_chunk = TableChunk.from_message(right_msg)
 
         # Convert to DataFrames and join
         left_df = DataFrame.from_table(
@@ -315,13 +288,6 @@ async def _partition_wise_join(
                     exclusive_view=True,
                 ),
             ),
-        )
-
-    # Check for leftover staged chunks
-    if staged_left or staged_right:
-        raise RuntimeError(
-            f"Leftover staged chunks after join: "
-            f"left={list(staged_left.keys())}, right={list(staged_right.keys())}"
         )
 
     await ch_out.data.drain(context)
@@ -544,12 +510,7 @@ async def _shuffle_join(
                 right_input.insert_chunk(right_chunk)
 
         # Phase 2: Join partitions
-        # Only stage pre-partitioned chunks if they arrive out-of-order
-        staged_left: dict[int, TableChunk] = {}
-        staged_right: dict[int, TableChunk] = {}
-        left_finished = False
-        right_finished = False
-
+        # Lineariser ensures in-order delivery, so we can receive chunks directly
         for partition_id in range(num_partitions):
             # Get left partition
             if left_shuffle:
@@ -558,21 +519,10 @@ async def _shuffle_join(
                 left_table = left_input.extract_chunk(partition_id, stream)
                 left_stream = stream
             else:
-                # Pre-partitioned left - receive on-demand, stage if out-of-order
-                while partition_id not in staged_left and not left_finished:
-                    left_msg = await ch_left.data.recv(context)
-                    if left_msg is None:
-                        left_finished = True
-                        break
-                    left_chunk = TableChunk.from_message(left_msg)
-                    staged_left[left_msg.sequence_number] = left_chunk
-
-                if partition_id not in staged_left:
-                    raise ValueError(
-                        f"Missing left partition {partition_id}, "
-                        f"available: {list(staged_left.keys())}"
-                    )
-                left_chunk = staged_left.pop(partition_id)
+                # Pre-partitioned left - receive in order
+                left_msg = await ch_left.data.recv(context)
+                assert left_msg is not None, f"Missing left partition {partition_id}"
+                left_chunk = TableChunk.from_message(left_msg)
                 left_table = left_chunk.table_view()
                 left_stream = left_chunk.stream
 
@@ -583,21 +533,10 @@ async def _shuffle_join(
                 right_table = right_input.extract_chunk(partition_id, stream)
                 right_stream = stream
             else:
-                # Pre-partitioned right - receive on-demand, stage if out-of-order
-                while partition_id not in staged_right and not right_finished:
-                    right_msg = await ch_right.data.recv(context)
-                    if right_msg is None:
-                        right_finished = True
-                        break
-                    right_chunk = TableChunk.from_message(right_msg)
-                    staged_right[right_msg.sequence_number] = right_chunk
-
-                if partition_id not in staged_right:
-                    raise ValueError(
-                        f"Missing right partition {partition_id}, "
-                        f"available: {list(staged_right.keys())}"
-                    )
-                right_chunk = staged_right.pop(partition_id)
+                # Pre-partitioned right - receive in order
+                right_msg = await ch_right.data.recv(context)
+                assert right_msg is not None, f"Missing right partition {partition_id}"
+                right_chunk = TableChunk.from_message(right_msg)
                 right_table = right_chunk.table_view()
                 right_stream = right_chunk.stream
 
@@ -636,14 +575,7 @@ async def _shuffle_join(
                 ),
             )
 
-        # Check for leftover staged chunks
-        if staged_left or staged_right:
-            raise RuntimeError(
-                f"Leftover staged chunks after join: "
-                f"left={list(staged_left.keys())}, right={list(staged_right.keys())}"
-            )
-
-    await ch_out.data.drain(context)
+        await ch_out.data.drain(context)
 
 
 @define_py_node()
@@ -725,20 +657,7 @@ async def join_node(
         )
 
         # Decision logic
-        if num_partitions == 1:
-            # Single partition - use partition-wise join
-            await _partition_wise_join(
-                context,
-                ir,
-                ir_context,
-                ch_out,
-                ch_left,
-                ch_right,
-                left_metadata,
-                right_metadata,
-                num_partitions,
-            )
-        elif left_partitioned and right_partitioned:
+        if num_partitions == 1 or (left_partitioned and right_partitioned):
             # Both sides correctly partitioned - use partition-wise join
             await _partition_wise_join(
                 context,
@@ -761,11 +680,16 @@ async def join_node(
             can_broadcast_right = join_type in ("Inner", "Left", "Semi", "Anti")
 
             # Check if either side is small enough to broadcast
+            # Also ensure we only broadcast the SMALLER side to the LARGER side
             left_small_enough = (
-                can_broadcast_left and left_metadata.count <= broadcast_join_limit
+                can_broadcast_left
+                and left_metadata.count <= broadcast_join_limit
+                and left_metadata.count < right_metadata.count
             )
             right_small_enough = (
-                can_broadcast_right and right_metadata.count <= broadcast_join_limit
+                can_broadcast_right
+                and right_metadata.count <= broadcast_join_limit
+                and right_metadata.count < left_metadata.count
             )
 
             if left_small_enough and not right_small_enough:
