@@ -85,7 +85,7 @@ async def _partition_wise_join(
     left_metadata: Metadata,
     right_metadata: Metadata,
     num_partitions: int,
-    first_chunks: dict[int, TableChunk],
+    sampled_chunks: dict[str, TableChunk],
 ) -> None:
     """
     Perform a partition-wise join (both sides already correctly partitioned).
@@ -110,8 +110,8 @@ async def _partition_wise_join(
         The right input metadata.
     num_partitions
         The number of partitions.
-    first_chunks
-        Dictionary with keys 0 (left) and 1 (right) containing first chunks.
+    sampled_chunks
+        Dictionary with keys "left" and "right" containing sampled chunks.
     """
     # Send output metadata with partitioning preservation
     join_type = ir.options[0]
@@ -127,17 +127,17 @@ async def _partition_wise_join(
 
     # Process aligned chunks - Lineariser ensures in-order delivery
     for seq_num in range(num_partitions):
-        # Get left partition (use first chunk on first iteration)
+        # Get left partition (use sampled chunk on first iteration)
         if seq_num == 0:
-            left_chunk = first_chunks.pop(0)
+            left_chunk = sampled_chunks.pop("left")
         else:
             left_msg = await ch_left.data.recv(context)
             assert left_msg is not None, f"Missing left partition {seq_num}"
             left_chunk = TableChunk.from_message(left_msg)
 
-        # Get right partition (use first chunk on first iteration)
+        # Get right partition (use sampled chunk on first iteration)
         if seq_num == 0:
-            right_chunk = first_chunks.pop(1)
+            right_chunk = sampled_chunks.pop("right")
         else:
             right_msg = await ch_right.data.recv(context)
             assert right_msg is not None, f"Missing right partition {seq_num}"
@@ -188,10 +188,11 @@ async def _broadcast_join(
     ch_out: ChannelPair,
     ch_left: ChannelPair,
     ch_right: ChannelPair,
+    num_partitions: int,
     broadcast_side: Literal["left", "right"],
     left_metadata: Metadata,
     right_metadata: Metadata,
-    first_chunks: dict[int, TableChunk],
+    sampled_chunks: dict[str, TableChunk],
 ) -> None:
     """
     Perform a broadcast join (one side is broadcast to all partitions).
@@ -210,14 +211,16 @@ async def _broadcast_join(
         The left input ChannelPair.
     ch_right
         The right input ChannelPair.
+    num_partitions
+        The number of output partitions.
     broadcast_side
         The side to broadcast.
     left_metadata
         The left input metadata.
     right_metadata
         The right input metadata.
-    first_chunks
-        Dictionary with keys 0 (left) and 1 (right) containing first chunks.
+    sampled_chunks
+        Dictionary with keys "left" and "right" containing sampled chunks.
     """
     # Determine which side to broadcast and stream
     if broadcast_side == "right":
@@ -227,7 +230,7 @@ async def _broadcast_join(
         large_child = ir.children[0]
         chunk_count = left_metadata.count
         partitioned_on = left_metadata.partitioned_on
-        small_idx, large_idx = 1, 0
+        small_key, large_key = "right", "left"
     else:
         small_ch = ch_left
         large_ch = ch_right
@@ -237,14 +240,14 @@ async def _broadcast_join(
         partitioned_on = (
             right_metadata.partitioned_on if ir.options[0] == "Right" else ()
         )
-        small_idx, large_idx = 0, 1
+        small_key, large_key = "left", "right"
 
     # Send output metadata
     output_metadata = Metadata(chunk_count, partitioned_on=partitioned_on)
     await ch_out.send_metadata(context, output_metadata)
 
-    # Collect small-side chunks (including the first one we already received)
-    small_chunks = [first_chunks.pop(small_idx)]
+    # Collect small-side chunks (including sampled chunk)
+    small_chunks = [sampled_chunks.pop(small_key)]
     while (msg := await small_ch.data.recv(context)) is not None:
         small_chunks.append(TableChunk.from_message(msg))
 
@@ -262,53 +265,8 @@ async def _broadcast_join(
         # TODO: Use local repartitioning for non-inner joins
         small_dfs = [_concat(*small_dfs, context=ir_context)]
 
-    # Stream through large side, joining with the small-side
-    # Process the first large chunk we already received
-    first_large_chunk = first_chunks.pop(large_idx)
-    large_df = DataFrame.from_table(
-        first_large_chunk.table_view(),
-        list(large_child.schema.keys()),
-        list(large_child.schema.values()),
-        first_large_chunk.stream,
-    )
-
-    # Perform the join for first chunk
-    df = _concat(
-        *[
-            (
-                await asyncio.to_thread(
-                    ir.do_evaluate,
-                    *ir._non_child_args,
-                    *(
-                        [large_df, small_df]
-                        if broadcast_side == "right"
-                        else [small_df, large_df]
-                    ),
-                    context=ir_context,
-                )
-            )
-            for small_df in small_dfs
-        ],
-        context=ir_context,
-    )
-
-    # Send first output chunk
-    await ch_out.data.send(
-        context,
-        Message(
-            0,
-            TableChunk.from_pylibcudf_table(
-                df.table,
-                df.stream,
-                exclusive_view=True,
-            ),
-        ),
-    )
-
-    # Continue with remaining large chunks
-    seq_num = 1
-    while (msg := await large_ch.data.recv(context)) is not None:
-        large_chunk = TableChunk.from_message(msg)
+    # Helper to join one large chunk with all small chunks
+    async def join_and_send(seq_num: int, large_chunk: TableChunk) -> None:
         large_df = DataFrame.from_table(
             large_chunk.table_view(),
             list(large_child.schema.keys()),
@@ -348,7 +306,12 @@ async def _broadcast_join(
                 ),
             ),
         )
-        seq_num += 1
+
+    # Process sampled large chunk first, then stream remaining chunks
+    await join_and_send(0, sampled_chunks.pop(large_key))
+
+    while (msg := await large_ch.data.recv(context)) is not None:
+        await join_and_send(msg.sequence_number, TableChunk.from_message(msg))
 
     await ch_out.data.drain(context)
 
@@ -360,14 +323,12 @@ async def _shuffle_join(
     ch_out: ChannelPair,
     ch_left: ChannelPair,
     ch_right: ChannelPair,
-    left_metadata: Metadata,
-    right_metadata: Metadata,
     num_partitions: int,
     left_join_keys: tuple[str, ...],
     right_join_keys: tuple[str, ...],
     left_schema_keys: list[str],
     right_schema_keys: list[str],
-    first_chunks: dict[int, TableChunk],
+    sampled_chunks: dict[str, TableChunk],
     *,
     left_partitioned: bool,
     right_partitioned: bool,
@@ -389,10 +350,6 @@ async def _shuffle_join(
         The left input ChannelPair.
     ch_right
         The right input ChannelPair.
-    left_metadata
-        The left input metadata.
-    right_metadata
-        The right input metadata.
     num_partitions
         The number of partitions to shuffle into.
     left_join_keys
@@ -403,8 +360,8 @@ async def _shuffle_join(
         The left table schema column names.
     right_schema_keys
         The right table schema column names.
-    first_chunks
-        Dictionary with keys 0 (left) and 1 (right) containing first chunks.
+    sampled_chunks
+        Dictionary with keys "left" and "right" containing sampled chunks.
     left_partitioned
         Whether the left side is already correctly partitioned.
     right_partitioned
@@ -452,8 +409,8 @@ async def _shuffle_join(
         # Phase 1: Insert chunks into shuffles that need it
         if left_shuffle:
             assert left_input is not None  # Type narrowing
-            # Insert the first chunk we already received
-            left_input.insert_chunk(first_chunks.pop(0))
+            # Insert the sampled chunk we already received
+            left_input.insert_chunk(sampled_chunks.pop("left"))
             # Insert remaining chunks
             while (msg := await ch_left.data.recv(context)) is not None:
                 left_chunk = TableChunk.from_message(msg)
@@ -461,8 +418,8 @@ async def _shuffle_join(
 
         if right_shuffle:
             assert right_input is not None  # Type narrowing
-            # Insert the first chunk we already received
-            right_input.insert_chunk(first_chunks.pop(1))
+            # Insert the sampled chunk we already received
+            right_input.insert_chunk(sampled_chunks.pop("right"))
             # Insert remaining chunks
             while (msg := await ch_right.data.recv(context)) is not None:
                 right_chunk = TableChunk.from_message(msg)
@@ -478,9 +435,9 @@ async def _shuffle_join(
                 left_table = left_input.extract_chunk(partition_id, stream)
                 left_stream = stream
             else:
-                # Pre-partitioned left - receive in order (use first chunk on first iteration)
+                # Pre-partitioned left - receive in order (use sampled chunk on first iteration)
                 if partition_id == 0:
-                    left_chunk = first_chunks.pop(0)
+                    left_chunk = sampled_chunks.pop("left")
                 else:
                     left_msg = await ch_left.data.recv(context)
                     assert left_msg is not None, (
@@ -497,9 +454,9 @@ async def _shuffle_join(
                 right_table = right_input.extract_chunk(partition_id, stream)
                 right_stream = stream
             else:
-                # Pre-partitioned right - receive in order (use first chunk on first iteration)
+                # Pre-partitioned right - receive in order (use sampled chunk on first iteration)
                 if partition_id == 0:
-                    right_chunk = first_chunks.pop(1)
+                    right_chunk = sampled_chunks.pop("right")
                 else:
                     right_msg = await ch_right.data.recv(context)
                     assert right_msg is not None, (
@@ -551,7 +508,7 @@ def make_join_plan(
     ir: Join,
     left_metadata: Metadata,
     right_metadata: Metadata,
-    first_chunks: dict[int, TableChunk],
+    sampled_chunks: dict[str, TableChunk],
     broadcast_join_limit: int,
     target_partition_size: int,
 ) -> tuple[
@@ -594,9 +551,9 @@ def make_join_plan(
     can_broadcast_left = ir.options[0] in ("Inner", "Right")
     can_broadcast_right = ir.options[0] in ("Inner", "Left", "Semi", "Anti")
 
-    # Estimate total size of each side using first chunk as sample
-    size_left_first = first_chunks[0].data_alloc_size(MemoryType.DEVICE)
-    size_right_first = first_chunks[1].data_alloc_size(MemoryType.DEVICE)
+    # Estimate total size of each side using sampled chunk
+    size_left_first = sampled_chunks["left"].data_alloc_size(MemoryType.DEVICE)
+    size_right_first = sampled_chunks["right"].data_alloc_size(MemoryType.DEVICE)
     size_left_estimate = size_left_first * left_metadata.count
     size_right_estimate = size_right_first * right_metadata.count
 
@@ -718,15 +675,15 @@ async def join_node(
             f"Expected Metadata, got {type(right_metadata)}."
         )
 
-        # Receive first data chunk from both sides to make smart decisions
+        # Receive first data chunk from both sides to sample and make smart decisions
         # Store in dict for easy memory management (references cleared on pop)
         first_left_msg = await ch_left.data.recv(context)
         first_right_msg = await ch_right.data.recv(context)
         assert first_left_msg is not None, "Missing first left chunk"
         assert first_right_msg is not None, "Missing first right chunk"
-        first_chunks = {
-            0: TableChunk.from_message(first_left_msg),
-            1: TableChunk.from_message(first_right_msg),
+        sampled_chunks = {
+            "left": TableChunk.from_message(first_left_msg),
+            "right": TableChunk.from_message(first_right_msg),
         }
 
         (
@@ -738,7 +695,7 @@ async def join_node(
             ir,
             left_metadata,
             right_metadata,
-            first_chunks,
+            sampled_chunks,
             broadcast_join_limit,
             target_partition_size,
         )
@@ -755,7 +712,7 @@ async def join_node(
                 left_metadata,
                 right_metadata,
                 num_partitions,
-                first_chunks,
+                sampled_chunks,
             )
         elif join_type == "broadcast":
             assert broadcast_side is not None
@@ -766,10 +723,11 @@ async def join_node(
                 ch_out,
                 ch_left,
                 ch_right,
+                num_partitions,
                 broadcast_side,
                 left_metadata,
                 right_metadata,
-                first_chunks,
+                sampled_chunks,
             )
         elif join_type == "shuffle":
             await _shuffle_join(
@@ -779,14 +737,12 @@ async def join_node(
                 ch_out,
                 ch_left,
                 ch_right,
-                left_metadata,
-                right_metadata,
                 num_partitions,
                 left_join_keys,
                 right_join_keys,
                 left_schema_keys,
                 right_schema_keys,
-                first_chunks,
+                sampled_chunks,
                 left_partitioned=partitioned[0],
                 right_partitioned=partitioned[1],
             )
