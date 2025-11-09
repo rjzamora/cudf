@@ -628,9 +628,11 @@ async def join_node(
         left_join_keys = tuple(col.name for col in ir.left_on)
         right_join_keys = tuple(col.name for col in ir.right_on)
 
-        # Receive metadata to inspect it
-        left_metadata = await ch_left.recv_metadata(context)
-        right_metadata = await ch_right.recv_metadata(context)
+        # Receive metadata to inspect it (concurrently to avoid deadlock)
+        left_metadata, right_metadata = await asyncio.gather(
+            ch_left.recv_metadata(context),
+            ch_right.recv_metadata(context),
+        )
         assert isinstance(left_metadata, Metadata), (
             f"Expected Metadata, got {type(left_metadata)}."
         )
@@ -640,8 +642,11 @@ async def join_node(
 
         # Receive first data chunk from both sides to sample and make smart decisions
         # Store in dict for easy memory management (references cleared on pop)
-        first_left_msg = await ch_left.data.recv(context)
-        first_right_msg = await ch_right.data.recv(context)
+        # Receive concurrently to avoid deadlock in nested joins
+        first_left_msg, first_right_msg = await asyncio.gather(
+            ch_left.data.recv(context),
+            ch_right.data.recv(context),
+        )
         assert first_left_msg is not None, "Missing first left chunk"
         assert first_right_msg is not None, "Missing first right chunk"
         sampled_chunks = {
