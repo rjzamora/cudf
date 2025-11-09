@@ -37,44 +37,6 @@ if TYPE_CHECKING:
     from cudf_polars.experimental.rapidsmpf.utils import ChannelPair
 
 
-async def get_small_table(
-    context: Context,
-    small_child: IR,
-    ch_small: ChannelPair,
-) -> list[DataFrame]:
-    """
-    Get the small-table DataFrame partitions from the small-table ChannelPair.
-
-    Parameters
-    ----------
-    context
-        The rapidsmpf context.
-    small_child
-        The small-table child IR node.
-    ch_small
-        The small-table ChannelPair.
-
-    Returns
-    -------
-    list[DataFrame]
-        The small-table DataFrame partitions.
-    """
-    small_chunks = []
-    while (msg := await ch_small.data.recv(context)) is not None:
-        small_chunks.append(TableChunk.from_message(msg))
-    assert small_chunks, "Empty small side"
-
-    return [
-        DataFrame.from_table(
-            small_chunk.table_view(),
-            list(small_child.schema.keys()),
-            list(small_child.schema.values()),
-            small_chunk.stream,
-        )
-        for small_chunk in small_chunks
-    ]
-
-
 async def _partition_wise_join(
     context: Context,
     ir: Join,
@@ -188,7 +150,6 @@ async def _broadcast_join(
     ch_out: ChannelPair,
     ch_left: ChannelPair,
     ch_right: ChannelPair,
-    num_partitions: int,
     broadcast_side: Literal["left", "right"],
     left_metadata: Metadata,
     right_metadata: Metadata,
@@ -211,8 +172,6 @@ async def _broadcast_join(
         The left input ChannelPair.
     ch_right
         The right input ChannelPair.
-    num_partitions
-        The number of output partitions.
     broadcast_side
         The side to broadcast.
     left_metadata
@@ -560,48 +519,51 @@ def make_join_plan(
     # Check if either side is small enough to broadcast
     # We broadcast if:
     #   1. Join type allows broadcasting that side
-    #   2. Partition count is small (under broadcast_join_limit)
-    #   3. That side is SMALLER than the other side (by chunk count)
+    #   2. Estimated table size is small enough
+    #   3. Partition count is small enough
     left_small_enough = (
         can_broadcast_left
+        and size_left_estimate <= target_partition_size
         and left_metadata.count <= broadcast_join_limit
-        and left_metadata.count < right_metadata.count
     )
     right_small_enough = (
         can_broadcast_right
+        and size_right_estimate <= target_partition_size
         and right_metadata.count <= broadcast_join_limit
-        and right_metadata.count < left_metadata.count
     )
 
     if left_small_enough and not right_small_enough:
         # Broadcast left
-        return (
+        return (  # type: ignore[return-value]
             "broadcast",
             "left",
-            (left_partitioned, right_partitioned),
-            num_partitions,
+            ((), ()),
+            left_metadata.count,
         )
     elif right_small_enough and not left_small_enough:
         # Broadcast right
-        return (
+        return (  # type: ignore[return-value]
             "broadcast",
             "right",
-            (left_partitioned, right_partitioned),
-            num_partitions,
+            ((), ()),
+            right_metadata.count,
         )
     elif left_small_enough and right_small_enough:
         # Both sides small enough - broadcast the smaller one (by estimated size)
-        broadcast_side: Literal["left", "right"] = (
-            "left" if size_left_estimate <= size_right_estimate else "right"
-        )
-        return (
+        if size_left_estimate <= size_right_estimate:
+            broadcast_side = "left"
+            num_partitions = left_metadata.count
+        else:
+            broadcast_side = "right"
+            num_partitions = right_metadata.count
+        return (  # type: ignore[return-value]
             "broadcast",
             broadcast_side,
-            (left_partitioned, right_partitioned),
+            ((), ()),
             num_partitions,
         )
     else:
-        # Neither side is small enough or correctly partitioned - shuffle join
+        # Catch-all: shuffle join
         return (
             "shuffle",
             None,
@@ -723,7 +685,6 @@ async def join_node(
                 ch_out,
                 ch_left,
                 ch_right,
-                num_partitions,
                 broadcast_side,
                 left_metadata,
                 right_metadata,
