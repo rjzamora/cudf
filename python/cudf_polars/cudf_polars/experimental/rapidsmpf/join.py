@@ -534,32 +534,33 @@ def make_join_plan(
 
     if left_small_enough and not right_small_enough:
         # Broadcast left
-        return (  # type: ignore[return-value]
+        return (
             "broadcast",
             "left",
-            ((), ()),
+            (False, False),
             left_metadata.count,
         )
     elif right_small_enough and not left_small_enough:
         # Broadcast right
-        return (  # type: ignore[return-value]
+        return (
             "broadcast",
             "right",
-            ((), ()),
+            (False, False),
             right_metadata.count,
         )
     elif left_small_enough and right_small_enough:
         # Both sides small enough - broadcast the smaller one (by estimated size)
+        broadcast_side: Literal["left", "right"]
         if size_left_estimate <= size_right_estimate:
             broadcast_side = "left"
             num_partitions = left_metadata.count
         else:
             broadcast_side = "right"
             num_partitions = right_metadata.count
-        return (  # type: ignore[return-value]
+        return (
             "broadcast",
             broadcast_side,
-            ((), ()),
+            (False, False),
             num_partitions,
         )
     else:
