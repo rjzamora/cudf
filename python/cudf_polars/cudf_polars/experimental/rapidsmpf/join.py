@@ -523,12 +523,16 @@ def make_join_plan(
     #   3. Partition count is small enough
     left_small_enough = (
         can_broadcast_left
-        and size_left_estimate <= target_partition_size
+        # The estimated size must be small enough
+        and size_left_estimate <= 3 * target_partition_size
+        # And the partition count must be small enough
         and left_metadata.count <= broadcast_join_limit
     )
     right_small_enough = (
         can_broadcast_right
-        and size_right_estimate <= target_partition_size
+        # The estimated size must be small enough
+        and size_right_estimate <= 3 * target_partition_size
+        # And the partition count must be small enough
         and right_metadata.count <= broadcast_join_limit
     )
 
