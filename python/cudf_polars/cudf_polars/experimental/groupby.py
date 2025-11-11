@@ -225,11 +225,7 @@ def _(
     # Let the groupby node handle algorithm decisions at runtime.
     if config_options.executor.runtime == "rapidsmpf":
         smart_groupby_node = ir.reconstruct([child])
-        # The output will always be shuffled or single-partition
-        partition_info[smart_groupby_node] = PartitionInfo(
-            count=post_aggregation_count,
-            partitioned_on=ir.keys,
-        )
+        partition_info[smart_groupby_node] = PartitionInfo(count=post_aggregation_count)
         return smart_groupby_node, partition_info
 
     new_node: IR
