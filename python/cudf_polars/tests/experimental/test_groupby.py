@@ -16,6 +16,10 @@ from cudf_polars.testing.asserts import (
 )
 from cudf_polars.utils.versions import POLARS_VERSION_LT_130
 
+REQUIRE_TASKS_RUNTIME = pytest.mark.skipif(
+    DEFAULT_RUNTIME != "tasks", reason="Requires 'tasks' runtime."
+)
+
 
 @pytest.fixture(scope="module")
 def engine():
@@ -104,6 +108,7 @@ def test_groupby_agg_config_options(df, op, keys):
     assert_gpu_result_equal(q, engine=engine, check_row_order=False)
 
 
+@REQUIRE_TASKS_RUNTIME
 @pytest.mark.parametrize("fallback_mode", ["silent", "raise", "warn", "foo"])
 def test_groupby_fallback(df, engine, fallback_mode):
     engine = pl.GPUEngine(

@@ -173,10 +173,8 @@ async def groupby_node(
 
         # Outer pre-shuffle context.
         # This will be a null context unless we need to preshuffle.
-        schema_keys = list(ir.children[0].schema.keys())
-        groupby_key_indices = tuple(
-            schema_keys.index(key) for key in groupby_key_columns
-        )
+        schema_keys = list(ir.schema.keys())
+        groupby_key_indices = tuple(schema_keys.index(k.name) for k in ir.keys)
         pre_shuffle_ctx = (
             LocalShuffle(
                 context,
@@ -241,7 +239,7 @@ async def groupby_node(
             )
 
             # Shuffle-based groupby case.
-            if output_count > 1:
+            if output_count > 1 and not shuffled:
                 # Send output metadata
                 output_metadata = Metadata(
                     output_count,
