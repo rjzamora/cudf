@@ -397,7 +397,7 @@ async def groupby_node(
                                     )
                                     counts[level] -= 1
                                     seuence_num += 1
-                                elif counts[level] >= k:
+                                elif counts[level] >= k or done_receiving:
                                     # Reduction level with k or more chunks.
                                     # Reduce and move to the next level.
                                     df = ir_reduction.do_evaluate(
