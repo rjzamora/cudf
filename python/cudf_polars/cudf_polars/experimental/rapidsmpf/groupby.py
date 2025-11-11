@@ -1,0 +1,459 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
+"""GroupBy logic for the RapidsMPF streaming runtime."""
+
+from __future__ import annotations
+
+import asyncio
+import math
+from collections import defaultdict
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, Any
+
+from rapidsmpf.buffer.buffer import MemoryType
+from rapidsmpf.streaming.core.message import Message
+from rapidsmpf.streaming.cudf.table_chunk import TableChunk
+
+from cudf_polars.containers import DataFrame
+from cudf_polars.dsl.expr import Col, NamedExpr
+from cudf_polars.dsl.ir import IR, GroupBy, Select
+from cudf_polars.dsl.utils.naming import unique_names
+from cudf_polars.experimental.groupby import combine, decompose
+from cudf_polars.experimental.rapidsmpf.dispatch import (
+    generate_ir_sub_network,
+)
+from cudf_polars.experimental.rapidsmpf.nodes import (
+    define_py_node,
+    shutdown_on_error,
+)
+from cudf_polars.experimental.rapidsmpf.shuffle import LocalShuffle
+from cudf_polars.experimental.rapidsmpf.utils import (
+    ChannelManager,
+    Metadata,
+    process_children,
+)
+from cudf_polars.experimental.utils import _concat, _get_unique_fractions
+
+if TYPE_CHECKING:
+    from rapidsmpf.streaming.core.context import Context
+
+    from cudf_polars.dsl.ir import IR, IRExecutionContext
+    from cudf_polars.experimental.rapidsmpf.core import SubNetGenerator
+    from cudf_polars.experimental.rapidsmpf.utils import ChannelPair
+
+
+def apply_do_evaluate(
+    chunk: TableChunk, ir: GroupBy, ir_context: IRExecutionContext
+) -> TableChunk:
+    """Apply GroupBy evaluation to a chunk."""
+    df = ir.do_evaluate(
+        *ir._non_child_args,
+        DataFrame.from_table(
+            chunk.table_view(),
+            list(ir.children[0].schema.keys()),
+            list(ir.children[0].schema.values()),
+            chunk.stream,
+        ),
+        context=ir_context,
+    )
+    return TableChunk.from_pylibcudf_table(df.table, chunk.stream, exclusive_view=True)
+
+
+@define_py_node()
+async def groupby_node(
+    context: Context,
+    ir: GroupBy,
+    ir_context: IRExecutionContext,
+    ch_out: ChannelPair,
+    ch_in: ChannelPair,
+    user_unique_fraction: float | None,
+    groupby_n_ary: int,
+    target_partition_size: int,
+    output_count: int,
+) -> None:
+    """Unified  GroupBy node."""
+    async with shutdown_on_error(
+        context,
+        ch_in.metadata,
+        ch_in.data,
+        ch_out.metadata,
+        ch_out.data,
+    ):
+        # Get groupby key column names
+        groupby_key_columns = [ne.name for ne in ir.keys]
+
+        # Receive metadata to inspect it (concurrently to avoid deadlock)
+        metadata = await ch_in.recv_metadata(context)
+        assert isinstance(metadata, Metadata), (
+            f"Expected Metadata, got {type(metadata)}."
+        )
+        shuffled = metadata.partitioned_on == tuple(groupby_key_columns)
+
+        need_preshuffle = False
+        need_preconcat = ir.maintain_order and not shuffled
+        sample_first_chunk = output_count > 1
+        name_generator = unique_names(ir.schema.keys())
+        # Decompose the aggregation requests into three distinct phases
+        try:
+            selection_exprs, piecewise_exprs, reduction_exprs, need_preshuffle = (
+                combine(
+                    *(
+                        decompose(agg.name, agg.value, names=name_generator)
+                        for agg in ir.agg_requests
+                    )
+                )
+            )
+        except NotImplementedError:  # pragma: no cover
+            need_preconcat = not shuffled
+
+        # Simple single-partition or pre-concatenation case.
+        if need_preconcat or metadata.count == output_count == 1:
+            output_metadata = Metadata(output_count)
+            await ch_out.send_metadata(context, output_metadata)
+
+            chunks: list[TableChunk] = []
+            while (msg := await ch_in.data.recv(context)) is not None:
+                chunk = TableChunk.from_message(msg)
+                chunks.append(chunk)
+            assert chunks, "Missing chunks"
+            df = ir.do_evaluate(
+                *ir._non_child_args,
+                _concat(
+                    *(
+                        DataFrame.from_table(
+                            chunk.table_view(),
+                            list(ir.schema.keys()),
+                            list(ir.schema.values()),
+                            chunk.stream,
+                        )
+                        for chunk in chunks
+                    ),
+                    context=ir_context,
+                ),
+                context=ir_context,
+            )
+            await ch_out.data.send(
+                context,
+                Message(
+                    0,
+                    chunk=TableChunk.from_pylibcudf_table(
+                        df.table, df.stream, exclusive_view=True
+                    ),
+                ),
+            )
+            await ch_out.data.drain(context)
+            return
+
+        # Define the partition-wise groupby operation
+        pwise_schema = {k.name: k.value.dtype for k in ir.keys} | {
+            k.name: k.value.dtype for k in piecewise_exprs
+        }
+        ir_pwise = GroupBy(
+            pwise_schema,
+            ir.keys,
+            piecewise_exprs,
+            ir.maintain_order,
+            None,
+            ir.children[0],
+        )
+        grouped_keys = tuple(
+            NamedExpr(k.name, Col(k.value.dtype, k.name)) for k in ir.keys
+        )
+
+        # Define the select operation for the final output
+        ir_select = Select(
+            ir.schema,
+            [
+                *(NamedExpr(k.name, Col(k.value.dtype, k.name)) for k in grouped_keys),
+                *selection_exprs,
+            ],
+            False,  # noqa: FBT003
+            ir_pwise,
+        )
+
+        # Outer pre-shuffle context.
+        # This will be a null context unless we need to preshuffle.
+        schema_keys = list(ir.children[0].schema.keys())
+        groupby_key_indices = tuple(
+            schema_keys.index(key) for key in groupby_key_columns
+        )
+        pre_shuffle_ctx = (
+            LocalShuffle(
+                context,
+                metadata.count,
+                groupby_key_indices,
+            )
+            if need_preshuffle
+            else nullcontext()
+        )
+        with pre_shuffle_ctx as pre_shuffle:
+            # Insert all chunks into the pre-shuffle (if needed)
+            first_chunk: TableChunk | None = None
+            if need_preshuffle:
+                assert isinstance(pre_shuffle, LocalShuffle)
+                while (msg := await ch_in.data.recv(context)) is not None:
+                    chunk = TableChunk.from_message(msg)
+                    pre_shuffle.insert_chunk(chunk)
+
+                # Extract the first chunk from the pre-shuffle.
+                if sample_first_chunk:
+                    stream = ir_context.get_cuda_stream()
+                    first_chunk = TableChunk.from_pylibcudf_table(
+                        pre_shuffle.extract_chunk(0, stream),
+                        stream,
+                        exclusive_view=True,
+                    )
+            elif sample_first_chunk:
+                # Receive the first chunk from the input channel.
+                first_msg = await ch_in.data.recv(context)
+                assert first_msg is not None, "Missing first chunk"
+                first_chunk = TableChunk.from_message(first_msg)
+
+            # Apply the groupby operation to the first chunk.
+            first_result: TableChunk | None = None
+            first_result_size: int | None = None
+            if sample_first_chunk:
+                assert first_chunk is not None, "Missing first chunk"
+                first_result = await asyncio.to_thread(
+                    apply_do_evaluate,
+                    first_chunk,
+                    ir,
+                    ir_context,
+                )
+                assert first_result is not None
+                first_result_size = first_result.data_alloc_size(MemoryType.DEVICE)
+                assert first_result_size is not None
+                output_count = max(
+                    1, (first_result_size * metadata.count) // target_partition_size
+                )
+
+            # Define the reduction operation (used in both shuffle and tree cases)
+            reduction_schema = {k.name: k.value.dtype for k in grouped_keys} | {
+                k.name: k.value.dtype for k in reduction_exprs
+            }
+            ir_reduction = GroupBy(
+                reduction_schema,
+                grouped_keys,
+                reduction_exprs,
+                ir.maintain_order,
+                None,
+                ir_pwise,
+            )
+
+            # Shuffle-based groupby case.
+            if output_count > 1:
+                # Send output metadata
+                output_metadata = Metadata(
+                    output_count,
+                    partitioned_on=tuple(groupby_key_columns),
+                )
+                await ch_out.send_metadata(context, output_metadata)
+
+                # Inner shuffle context.
+                pwise_schema_keys = list(ir_pwise.schema.keys())
+                pwise_key_indices = tuple(
+                    pwise_schema_keys.index(key) for key in groupby_key_columns
+                )
+                with LocalShuffle(
+                    context,
+                    output_count,
+                    pwise_key_indices,
+                ) as shuffle:
+                    # Insert grouped data into shuffle
+                    if first_chunk is not None:
+                        pwise_chunk = await asyncio.to_thread(
+                            apply_do_evaluate,
+                            first_chunk,
+                            ir_pwise,
+                            ir_context,
+                        )
+                        shuffle.insert_chunk(pwise_chunk)
+                    while (msg := await ch_in.data.recv(context)) is not None:
+                        chunk = await asyncio.to_thread(
+                            apply_do_evaluate,
+                            TableChunk.from_message(msg),
+                            ir_pwise,
+                            ir_context,
+                        )
+                        shuffle.insert_chunk(chunk)
+
+                    # Extract shuffled chunks and apply the final select operation
+                    for partition_id in range(output_count):
+                        stream = ir_context.get_cuda_stream()
+                        reduction_chunk = TableChunk.from_pylibcudf_table(
+                            shuffle.extract_chunk(partition_id, stream),
+                            stream,
+                            exclusive_view=True,
+                        )
+                        # Apply reduction groupby
+                        reduced_chunk = await asyncio.to_thread(
+                            apply_do_evaluate,
+                            reduction_chunk,
+                            ir_reduction,
+                            ir_context,
+                        )
+                        # Apply final select
+                        df = ir_select.do_evaluate(
+                            *ir_select._non_child_args,
+                            DataFrame.from_table(
+                                reduced_chunk.table_view(),
+                                list(ir_reduction.schema.keys()),
+                                list(ir_reduction.schema.values()),
+                                reduced_chunk.stream,
+                            ),
+                            context=ir_context,
+                        )
+                        final_chunk = TableChunk.from_pylibcudf_table(
+                            df.table, df.stream, exclusive_view=True
+                        )
+                        await ch_out.data.send(
+                            context, Message(partition_id, final_chunk)
+                        )
+
+                    await ch_out.data.drain(context)
+
+            else:
+                # Tree-based groupby case.
+                # Send output metadata
+                output_metadata = Metadata(output_count)
+                await ch_out.send_metadata(context, output_metadata)
+
+                # Prepare for the tree reduction
+                n = metadata.count
+                if first_result_size is not None:
+                    k = max(2, target_partition_size // first_result_size)
+                else:
+                    k = groupby_n_ary
+                level_count = int(math.ceil(math.log(n * (k - 1) + 1) / math.log(k)))
+                done_receiving = False
+                counts: defaultdict[int, int] = defaultdict(int)
+                levels: defaultdict[int, list[DataFrame]] = defaultdict(list)
+                if first_chunk is not None:
+                    # Process the first (sampled) chunk
+                    pwise_chunk = await asyncio.to_thread(
+                        apply_do_evaluate,
+                        first_chunk,
+                        ir_pwise,
+                        ir_context,
+                    )
+                    counts[0] += 1
+                    levels[0].append(
+                        DataFrame.from_table(
+                            pwise_chunk.table_view(),
+                            list(ir_pwise.schema.keys()),
+                            list(ir_pwise.schema.values()),
+                            pwise_chunk.stream,
+                        )
+                    )
+
+                # Perform the tree reduction
+                seuence_num: int = 0
+                while seuence_num < output_count:
+                    if not done_receiving:
+                        msg = await ch_in.data.recv(context)
+                        if msg is None:
+                            done_receiving = True
+                        else:
+                            chunk = TableChunk.from_message(msg)
+                            chunk = await asyncio.to_thread(
+                                apply_do_evaluate,
+                                chunk,
+                                ir_pwise,
+                                ir_context,
+                            )
+                            counts[0] += 1
+                            levels[0].append(
+                                DataFrame.from_table(
+                                    chunk.table_view(),
+                                    list(ir_pwise.schema.keys()),
+                                    list(ir_pwise.schema.values()),
+                                    chunk.stream,
+                                )
+                            )
+
+                    need_loop: bool = True
+                    while need_loop:
+                        need_loop = False
+                        # Loop through all levels
+                        for level in range(level_count):
+                            if counts[level]:
+                                # Non-empty level
+                                if level == level_count - 1:
+                                    # Final output level.
+                                    # Apply final selection to any DataFrame we have at this level.
+                                    df = ir_select.do_evaluate(
+                                        *ir_select._non_child_args,
+                                        levels[level].pop(),
+                                        context=ir_context,
+                                    )
+                                    await ch_out.data.send(
+                                        context,
+                                        Message(
+                                            seuence_num,
+                                            TableChunk.from_pylibcudf_table(
+                                                df.table, df.stream, exclusive_view=True
+                                            ),
+                                        ),
+                                    )
+                                    counts[level] -= 1
+                                    seuence_num += 1
+                                elif counts[level] >= k:
+                                    # Reduction level with k or more chunks.
+                                    # Reduce and move to the next level.
+                                    df = ir_reduction.do_evaluate(
+                                        *ir_reduction._non_child_args,
+                                        _concat(
+                                            *levels[level],
+                                            context=ir_context,
+                                        ),
+                                        context=ir_context,
+                                    )
+                                    levels[level + 1].append(df)
+                                    counts[level + 1] += 1
+                                    levels[level] = []
+                                    counts[level] = 0
+                                    # Loop again in case we can push more data to
+                                    # the next level before receiving another msg.
+                                    need_loop = True
+
+                await ch_out.data.drain(context)
+
+
+@generate_ir_sub_network.register(GroupBy)
+def _(ir: GroupBy, rec: SubNetGenerator) -> tuple[list[Any], dict[IR, ChannelManager]]:
+    """Generate sub-network for GroupBy operation."""
+    # Process children
+    nodes, channels = process_children(ir, rec)
+
+    # Create output ChannelManager
+    channels[ir] = ChannelManager(rec.state["context"])
+
+    # Get user-specified unique fraction
+    config_options = rec.state["config_options"]
+    executor = config_options.executor
+    assert executor.name == "streaming", "Join node requires streaming executor"
+    user_unique_fraction: float | None = None
+    groupby_key_columns = [ne.name for ne in ir.keys]
+    if unique_fraction_dict := _get_unique_fractions(
+        groupby_key_columns,
+        executor.unique_fraction,
+    ):
+        # Use unique_fraction to determine output partitioning
+        user_unique_fraction = max(unique_fraction_dict.values())
+
+    # Use unified join_node that decides strategy based on metadata
+    nodes.append(
+        groupby_node(
+            rec.state["context"],
+            ir,
+            rec.state["ir_context"],
+            channels[ir].reserve_input_slot(),
+            channels[ir.children[0]].reserve_output_slot(),
+            user_unique_fraction,
+            executor.groupby_n_ary,
+            executor.target_partition_size,
+            rec.state["partition_info"][ir].count,
+        )
+    )
+
+    return nodes, channels
