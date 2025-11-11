@@ -91,7 +91,7 @@ async def groupby_node(
 
         need_preshuffle = False
         need_preconcat = ir.maintain_order and not shuffled
-        sample_first_chunk = output_count > 1
+        sample_first_chunk = True  # TODO: Do we ever want to use False?
         name_generator = unique_names(ir.schema.keys())
         # Decompose the aggregation requests into three distinct phases
         try:
@@ -334,8 +334,9 @@ async def groupby_node(
                 # Prepare for the tree reduction
                 n = metadata.count
                 if first_pwise_size is not None:
-                    k = max(2, target_partition_size // first_pwise_size)
-                else:
+                    # TODO: Using 1024 as an arbitrary limit.
+                    k = min(max(2, target_partition_size // first_pwise_size), 1024)
+                else:  # pragma: no cover
                     k = groupby_n_ary
                 level_count = int(math.ceil(math.log(n * (k - 1) + 1) / math.log(k)))
                 done_receiving = False
