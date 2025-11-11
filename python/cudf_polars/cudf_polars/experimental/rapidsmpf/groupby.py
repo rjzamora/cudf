@@ -122,8 +122,8 @@ async def groupby_node(
                     *(
                         DataFrame.from_table(
                             chunk.table_view(),
-                            list(ir.schema.keys()),
-                            list(ir.schema.values()),
+                            list(ir.children[0].schema.keys()),
+                            list(ir.children[0].schema.values()),
                             chunk.stream,
                         )
                         for chunk in chunks
@@ -136,7 +136,7 @@ async def groupby_node(
                 context,
                 Message(
                     0,
-                    chunk=TableChunk.from_pylibcudf_table(
+                    TableChunk.from_pylibcudf_table(
                         df.table, df.stream, exclusive_view=True
                     ),
                 ),
@@ -209,22 +209,22 @@ async def groupby_node(
                 assert first_msg is not None, "Missing first chunk"
                 first_chunk = TableChunk.from_message(first_msg)
 
-            # Apply the groupby operation to the first chunk.
-            first_result: TableChunk | None = None
-            first_result_size: int | None = None
+            # Apply the piecewise groupby operation to the first chunk for sampling.
+            first_pwise_chunk: TableChunk | None = None
+            first_pwise_size: int | None = None
             if sample_first_chunk:
                 assert first_chunk is not None, "Missing first chunk"
-                first_result = await asyncio.to_thread(
+                first_pwise_chunk = await asyncio.to_thread(
                     apply_do_evaluate,
                     first_chunk,
-                    ir,
+                    ir_pwise,
                     ir_context,
                 )
-                assert first_result is not None
-                first_result_size = first_result.data_alloc_size(MemoryType.DEVICE)
-                assert first_result_size is not None
+                assert first_pwise_chunk is not None
+                first_pwise_size = first_pwise_chunk.data_alloc_size(MemoryType.DEVICE)
+                assert first_pwise_size is not None
                 output_count = max(
-                    1, (first_result_size * metadata.count) // target_partition_size
+                    1, (first_pwise_size * metadata.count) // target_partition_size
                 )
 
             # Define the reduction operation (used in both shuffle and tree cases)
@@ -260,22 +260,37 @@ async def groupby_node(
                     pwise_key_indices,
                 ) as shuffle:
                     # Insert grouped data into shuffle
-                    if first_chunk is not None:
-                        pwise_chunk = await asyncio.to_thread(
-                            apply_do_evaluate,
-                            first_chunk,
-                            ir_pwise,
-                            ir_context,
-                        )
-                        shuffle.insert_chunk(pwise_chunk)
-                    while (msg := await ch_in.data.recv(context)) is not None:
-                        chunk = await asyncio.to_thread(
-                            apply_do_evaluate,
-                            TableChunk.from_message(msg),
-                            ir_pwise,
-                            ir_context,
-                        )
-                        shuffle.insert_chunk(chunk)
+                    if first_pwise_chunk is not None:
+                        shuffle.insert_chunk(first_pwise_chunk)
+
+                    if need_preshuffle:
+                        # Extract remaining chunks from pre-shuffle and process
+                        assert isinstance(pre_shuffle, LocalShuffle)
+                        start_idx = 1 if sample_first_chunk else 0
+                        for partition_id in range(start_idx, metadata.count):
+                            stream = ir_context.get_cuda_stream()
+                            input_chunk = TableChunk.from_pylibcudf_table(
+                                pre_shuffle.extract_chunk(partition_id, stream),
+                                stream,
+                                exclusive_view=True,
+                            )
+                            chunk = await asyncio.to_thread(
+                                apply_do_evaluate,
+                                input_chunk,
+                                ir_pwise,
+                                ir_context,
+                            )
+                            shuffle.insert_chunk(chunk)
+                    else:
+                        # Read remaining chunks from input channel
+                        while (msg := await ch_in.data.recv(context)) is not None:
+                            chunk = await asyncio.to_thread(
+                                apply_do_evaluate,
+                                TableChunk.from_message(msg),
+                                ir_pwise,
+                                ir_context,
+                            )
+                            shuffle.insert_chunk(chunk)
 
                     # Extract shuffled chunks and apply the final select operation
                     for partition_id in range(output_count):
@@ -320,47 +335,69 @@ async def groupby_node(
 
                 # Prepare for the tree reduction
                 n = metadata.count
-                if first_result_size is not None:
-                    k = max(2, target_partition_size // first_result_size)
+                if first_pwise_size is not None:
+                    k = max(2, target_partition_size // first_pwise_size)
                 else:
                     k = groupby_n_ary
                 level_count = int(math.ceil(math.log(n * (k - 1) + 1) / math.log(k)))
                 done_receiving = False
                 counts: defaultdict[int, int] = defaultdict(int)
                 levels: defaultdict[int, list[DataFrame]] = defaultdict(list)
-                if first_chunk is not None:
+                if first_pwise_chunk is not None:
                     # Process the first (sampled) chunk
-                    pwise_chunk = await asyncio.to_thread(
-                        apply_do_evaluate,
-                        first_chunk,
-                        ir_pwise,
-                        ir_context,
-                    )
                     counts[0] += 1
                     levels[0].append(
                         DataFrame.from_table(
-                            pwise_chunk.table_view(),
+                            first_pwise_chunk.table_view(),
                             list(ir_pwise.schema.keys()),
                             list(ir_pwise.schema.values()),
-                            pwise_chunk.stream,
+                            first_pwise_chunk.stream,
                         )
                     )
 
                 # Perform the tree reduction
                 seuence_num: int = 0
+                input_partition_idx = 1 if sample_first_chunk else 0
                 while seuence_num < output_count:
                     if not done_receiving:
-                        msg = await ch_in.data.recv(context)
-                        if msg is None:
-                            done_receiving = True
+                        if need_preshuffle:
+                            # Extract from pre-shuffle
+                            if input_partition_idx < metadata.count:
+                                assert isinstance(pre_shuffle, LocalShuffle)
+                                stream = ir_context.get_cuda_stream()
+                                input_chunk = TableChunk.from_pylibcudf_table(
+                                    pre_shuffle.extract_chunk(
+                                        input_partition_idx, stream
+                                    ),
+                                    stream,
+                                    exclusive_view=True,
+                                )
+                                chunk = await asyncio.to_thread(
+                                    apply_do_evaluate,
+                                    input_chunk,
+                                    ir_pwise,
+                                    ir_context,
+                                )
+                                input_partition_idx += 1
+                            else:
+                                done_receiving = True
+                                chunk = None
                         else:
-                            chunk = TableChunk.from_message(msg)
-                            chunk = await asyncio.to_thread(
-                                apply_do_evaluate,
-                                chunk,
-                                ir_pwise,
-                                ir_context,
-                            )
+                            # Read from input channel
+                            msg = await ch_in.data.recv(context)
+                            if msg is None:
+                                done_receiving = True
+                                chunk = None
+                            else:
+                                chunk = TableChunk.from_message(msg)
+                                chunk = await asyncio.to_thread(
+                                    apply_do_evaluate,
+                                    chunk,
+                                    ir_pwise,
+                                    ir_context,
+                                )
+
+                        if chunk is not None:
                             counts[0] += 1
                             levels[0].append(
                                 DataFrame.from_table(

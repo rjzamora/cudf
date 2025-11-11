@@ -22,6 +22,7 @@ from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
 import rmm
 
+import cudf_polars.experimental.rapidsmpf.groupby
 import cudf_polars.experimental.rapidsmpf.io
 import cudf_polars.experimental.rapidsmpf.join
 import cudf_polars.experimental.rapidsmpf.lower
