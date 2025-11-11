@@ -27,6 +27,10 @@ from cudf_polars.testing.asserts import (
 from cudf_polars.utils.config import ConfigOptions
 from cudf_polars.utils.versions import POLARS_VERSION_LT_130
 
+REQUIRE_TASKS_RUNTIME = pytest.mark.skipif(
+    DEFAULT_RUNTIME != "tasks", reason="Requires 'tasks' runtime."
+)
+
 
 def test_evaluate_streaming():
     df = pl.LazyFrame({"a": [1, 2, 3], "b": [3, 4, 5], "c": [5, 6, 7], "d": [7, 9, 8]})
@@ -123,6 +127,7 @@ def test_rename_multi(mapping, engine):
     assert_gpu_result_equal(q, engine=engine)
 
 
+@REQUIRE_TASKS_RUNTIME
 def test_preserve_partitioning():
     engine = pl.GPUEngine(
         raise_on_fail=True,
