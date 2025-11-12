@@ -720,7 +720,9 @@ async def join_node(
 
 
 @generate_ir_sub_network.register(Join)
-def _(ir: Join, rec: SubNetGenerator) -> tuple[list[Any], dict[IR, ChannelManager]]:
+def _(
+    ir: Join, rec: SubNetGenerator
+) -> tuple[dict[IR, list[Any]], dict[IR, ChannelManager]]:
     """
     Generate sub-network for Join operation using unified join_node.
 
@@ -745,7 +747,7 @@ def _(ir: Join, rec: SubNetGenerator) -> tuple[list[Any], dict[IR, ChannelManage
     target_partition_size = executor.target_partition_size
 
     # Use unified join_node that decides strategy based on metadata
-    nodes.append(
+    nodes[ir] = [
         join_node(
             rec.state["context"],
             ir,
@@ -756,6 +758,6 @@ def _(ir: Join, rec: SubNetGenerator) -> tuple[list[Any], dict[IR, ChannelManage
             broadcast_join_limit,
             target_partition_size,
         )
-    )
+    ]
 
     return nodes, channels

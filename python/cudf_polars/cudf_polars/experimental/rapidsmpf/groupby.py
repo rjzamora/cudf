@@ -456,7 +456,9 @@ async def groupby_node(
 
 
 @generate_ir_sub_network.register(GroupBy)
-def _(ir: GroupBy, rec: SubNetGenerator) -> tuple[list[Any], dict[IR, ChannelManager]]:
+def _(
+    ir: GroupBy, rec: SubNetGenerator
+) -> tuple[dict[IR, list[Any]], dict[IR, ChannelManager]]:
     """Generate sub-network for GroupBy operation."""
     # Process children
     nodes, channels = process_children(ir, rec)
@@ -478,7 +480,7 @@ def _(ir: GroupBy, rec: SubNetGenerator) -> tuple[list[Any], dict[IR, ChannelMan
         user_unique_fraction = max(unique_fraction_dict.values())
 
     # Use unified join_node that decides strategy based on metadata
-    nodes.append(
+    nodes[ir] = [
         groupby_node(
             rec.state["context"],
             ir,
@@ -490,6 +492,6 @@ def _(ir: GroupBy, rec: SubNetGenerator) -> tuple[list[Any], dict[IR, ChannelMan
             executor.target_partition_size,
             rec.state["partition_info"][ir].count,
         )
-    )
+    ]
 
     return nodes, channels

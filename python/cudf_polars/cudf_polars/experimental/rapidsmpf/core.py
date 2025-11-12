@@ -339,24 +339,25 @@ def generate_network(
     mapper: SubNetGenerator = CachingVisitor(
         generate_ir_sub_network_wrapper, state=state
     )
-    nodes, channels = mapper(ir)
+    nodes_dict, channels = mapper(ir)
     ch_out = channels[ir].reserve_output_slot()
 
     # Add node to drain metadata channel before pull_from_channel
     # (since pull_from_channel doesn't accept a ChannelPair)
     ch_final_data: Channel[TableChunk] = context.create_channel()
-    nodes.append(
-        metadata_drain_node(
-            context,
-            ch_out,
-            ch_final_data,
-            metadata_collector,
-        )
+    drain_node = metadata_drain_node(
+        context,
+        ch_out,
+        ch_final_data,
+        metadata_collector,
     )
 
     # Add final node to pull from the output data channel
     output_node, output = pull_from_channel(context, ch_in=ch_final_data)
-    nodes.append(output_node)
+
+    # Flatten the nodes dictionary into a list for run_streaming_pipeline
+    nodes: list[Any] = [node for node_list in nodes_dict.values() for node in node_list]
+    nodes.extend([drain_node, output_node])
 
     # Return network and output hook
     return nodes, output
