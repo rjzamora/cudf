@@ -91,19 +91,27 @@ async def _partition_wise_join(
     for seq_num in range(num_partitions):
         # Get left partition (use sampled chunk on first iteration)
         if seq_num == 0:
-            left_chunk = sampled_chunks.pop("left")
+            left_chunk = sampled_chunks.pop("left").make_available_and_spill(
+                context.br(), allow_overbooking=True
+            )
         else:
             left_msg = await ch_left.data.recv(context)
             assert left_msg is not None, f"Missing left partition {seq_num}"
-            left_chunk = TableChunk.from_message(left_msg)
+            left_chunk = TableChunk.from_message(left_msg).make_available_and_spill(
+                context.br(), allow_overbooking=True
+            )
 
         # Get right partition (use sampled chunk on first iteration)
         if seq_num == 0:
-            right_chunk = sampled_chunks.pop("right")
+            right_chunk = sampled_chunks.pop("right").make_available_and_spill(
+                context.br(), allow_overbooking=True
+            )
         else:
             right_msg = await ch_right.data.recv(context)
             assert right_msg is not None, f"Missing right partition {seq_num}"
-            right_chunk = TableChunk.from_message(right_msg)
+            right_chunk = TableChunk.from_message(right_msg).make_available_and_spill(
+                context.br(), allow_overbooking=True
+            )
 
         # Convert to DataFrames and join
         left_df = DataFrame.from_table(
@@ -206,9 +214,17 @@ async def _broadcast_join(
     await ch_out.send_metadata(context, output_metadata)
 
     # Collect small-side chunks (including sampled chunk)
-    small_chunks = [sampled_chunks.pop(small_key)]
+    small_chunks = [
+        sampled_chunks.pop(small_key).make_available_and_spill(
+            context.br(), allow_overbooking=True
+        )
+    ]
     while (msg := await small_ch.data.recv(context)) is not None:
-        small_chunks.append(TableChunk.from_message(msg))
+        small_chunks.append(
+            TableChunk.from_message(msg).make_available_and_spill(
+                context.br(), allow_overbooking=True
+            )
+        )
 
     small_dfs = [
         DataFrame.from_table(
@@ -267,10 +283,20 @@ async def _broadcast_join(
         )
 
     # Process sampled large chunk first, then stream remaining chunks
-    await join_and_send(0, sampled_chunks.pop(large_key))
+    await join_and_send(
+        0,
+        sampled_chunks.pop(large_key).make_available_and_spill(
+            context.br(), allow_overbooking=True
+        ),
+    )
 
     while (msg := await large_ch.data.recv(context)) is not None:
-        await join_and_send(msg.sequence_number, TableChunk.from_message(msg))
+        await join_and_send(
+            msg.sequence_number,
+            TableChunk.from_message(msg).make_available_and_spill(
+                context.br(), allow_overbooking=True
+            ),
+        )
 
     await ch_out.data.drain(context)
 
@@ -402,7 +428,9 @@ async def _shuffle_join(
                     assert left_msg is not None, (
                         f"Missing left partition {partition_id}"
                     )
-                    left_chunk = TableChunk.from_message(left_msg)
+                    left_chunk = TableChunk.from_message(
+                        left_msg
+                    ).make_available_and_spill(context.br(), allow_overbooking=True)
                 left_table = left_chunk.table_view()
                 left_stream = left_chunk.stream
 
@@ -421,7 +449,9 @@ async def _shuffle_join(
                     assert right_msg is not None, (
                         f"Missing right partition {partition_id}"
                     )
-                    right_chunk = TableChunk.from_message(right_msg)
+                    right_chunk = TableChunk.from_message(
+                        right_msg
+                    ).make_available_and_spill(context.br(), allow_overbooking=True)
                 right_table = right_chunk.table_view()
                 right_stream = right_chunk.stream
 

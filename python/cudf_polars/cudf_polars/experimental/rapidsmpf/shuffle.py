@@ -130,6 +130,7 @@ class LocalShuffle:
             The table chunk to insert.
         """
         # Partition and pack using the Python function
+        chunk = chunk.make_available_and_spill(self.br, allow_overbooking=True)
         partitioned_chunks = py_partition_and_pack(
             table=chunk.table_view(),
             columns_to_hash=self.columns_to_hash,
