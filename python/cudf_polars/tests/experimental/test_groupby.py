@@ -203,13 +203,7 @@ def test_groupby_then_slice(
         }
     )
     q = df.group_by("y", maintain_order=True).max().slice(*zlice)
-    if zlice in {(2, 2), (-2, None)}:
-        with pytest.warns(
-            UserWarning, match="This slice not supported for multiple partitions."
-        ):
-            assert_gpu_result_equal(q, engine=engine)
-    else:
-        assert_gpu_result_equal(q, engine=engine)
+    assert_gpu_result_equal(q, engine=engine)
 
 
 def test_groupby_on_equality(df: pl.LazyFrame, engine: pl.GPUEngine) -> None:

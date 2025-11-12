@@ -221,9 +221,7 @@ async def groupby_node(
                 assert first_pwise_chunk is not None
                 first_pwise_size = first_pwise_chunk.data_alloc_size(MemoryType.DEVICE)
                 assert first_pwise_size is not None
-                output_count = max(
-                    1, (first_pwise_size * metadata.count) // target_partition_size
-                )
+                # TODO: Update the output_count based on the first_pwise_size and metadata.count
 
             # Define the reduction operation (used in both shuffle and tree cases)
             reduction_schema = {k.name: k.value.dtype for k in grouped_keys} | {
