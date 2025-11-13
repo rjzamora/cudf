@@ -142,6 +142,8 @@ def _(
 
     # Process children
     nodes, channels = rec(ir.children[0])
+    if ir in nodes:
+        return nodes, channels
 
     # Create output ChannelManager
     channels[ir] = ChannelManager(rec.state["context"])

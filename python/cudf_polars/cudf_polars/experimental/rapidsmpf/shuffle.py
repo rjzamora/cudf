@@ -279,6 +279,8 @@ def _(
     # Process children
     (child,) = ir.children
     nodes, channels = rec(child)
+    if ir in nodes:
+        return nodes, channels
 
     keys: list[Col] = [ne.value for ne in ir.keys if isinstance(ne.value, Col)]
     if len(keys) != len(ir.keys):  # pragma: no cover

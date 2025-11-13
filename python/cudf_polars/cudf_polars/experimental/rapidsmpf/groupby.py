@@ -222,6 +222,10 @@ async def groupby_node(
                 first_pwise_size = first_pwise_chunk.data_alloc_size(MemoryType.DEVICE)
                 assert first_pwise_size is not None
                 # TODO: Update the output_count based on the first_pwise_size and metadata.count
+                ideal_output_count = max(
+                    1, (first_pwise_size * metadata.count) // target_partition_size
+                )
+                output_count = min(ideal_output_count, output_count)
 
             # Define the reduction operation (used in both shuffle and tree cases)
             reduction_schema = {k.name: k.value.dtype for k in grouped_keys} | {
@@ -355,7 +359,7 @@ async def groupby_node(
                 # Perform the tree reduction
                 seuence_num: int = 0
                 input_partition_idx = 1 if sample_first_chunk else 0
-                while seuence_num < output_count:
+                while seuence_num < output_count or not done_receiving:
                     if not done_receiving:
                         if need_preshuffle:
                             # Extract from pre-shuffle
@@ -460,6 +464,8 @@ def _(
     """Generate sub-network for GroupBy operation."""
     # Process children
     nodes, channels = process_children(ir, rec)
+    if ir in nodes:
+        return nodes, channels
 
     # Create output ChannelManager
     channels[ir] = ChannelManager(rec.state["context"])
