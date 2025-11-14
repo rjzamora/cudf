@@ -342,11 +342,9 @@ async def groupby_node(
                     k = groupby_n_ary
                 level_count = int(math.ceil(math.log(n * (k - 1) + 1) / math.log(k)))
                 done_receiving = False
-                counts: defaultdict[int, int] = defaultdict(int)
                 levels: defaultdict[int, list[DataFrame]] = defaultdict(list)
                 if first_pwise_chunk is not None:
                     # Process the first (sampled) chunk
-                    counts[0] += 1
                     levels[0].append(
                         DataFrame.from_table(
                             first_pwise_chunk.table_view(),
@@ -357,102 +355,103 @@ async def groupby_node(
                     )
 
                 # Perform the tree reduction
-                seuence_num: int = 0
+                sequence_num: int = 0
                 input_partition_idx = 1 if sample_first_chunk else 0
-                while seuence_num < output_count or not done_receiving:
-                    if not done_receiving:
-                        if need_preshuffle:
-                            # Extract from pre-shuffle
-                            if input_partition_idx < metadata.count:
-                                assert isinstance(pre_shuffle, LocalShuffle)
-                                stream = ir_context.get_cuda_stream()
-                                input_chunk = TableChunk.from_pylibcudf_table(
-                                    pre_shuffle.extract_chunk(
-                                        input_partition_idx, stream
-                                    ),
-                                    stream,
-                                    exclusive_view=True,
-                                )
-                                chunk = await asyncio.to_thread(
-                                    apply_do_evaluate,
-                                    input_chunk,
-                                    ir_pwise,
-                                    ir_context,
-                                )
-                                input_partition_idx += 1
-                            else:
-                                done_receiving = True
-                                chunk = None
-                        else:
-                            # Read from input channel
-                            msg = await ch_in.data.recv(context)
-                            if msg is None:
-                                done_receiving = True
-                                chunk = None
-                            else:
-                                chunk = TableChunk.from_message(msg)
-                                chunk = await asyncio.to_thread(
-                                    apply_do_evaluate,
-                                    chunk,
-                                    ir_pwise,
-                                    ir_context,
-                                )
-
-                        if chunk is not None:
-                            counts[0] += 1
-                            levels[0].append(
-                                DataFrame.from_table(
-                                    chunk.table_view(),
-                                    list(ir_pwise.schema.keys()),
-                                    list(ir_pwise.schema.values()),
-                                    chunk.stream,
-                                )
+                while not done_receiving:
+                    if need_preshuffle:
+                        # Extract from pre-shuffle
+                        if input_partition_idx < metadata.count:
+                            assert isinstance(pre_shuffle, LocalShuffle)
+                            stream = ir_context.get_cuda_stream()
+                            input_chunk = TableChunk.from_pylibcudf_table(
+                                pre_shuffle.extract_chunk(input_partition_idx, stream),
+                                stream,
+                                exclusive_view=True,
                             )
+                            chunk = await asyncio.to_thread(
+                                apply_do_evaluate,
+                                input_chunk,
+                                ir_pwise,
+                                ir_context,
+                            )
+                            input_partition_idx += 1
+                        else:
+                            done_receiving = True
+                            chunk = None
+                    else:
+                        # Read from input channel
+                        msg = await ch_in.data.recv(context)
+                        if msg is None:
+                            done_receiving = True
+                            chunk = None
+                        else:
+                            chunk = TableChunk.from_message(msg)
+                            chunk = await asyncio.to_thread(
+                                apply_do_evaluate,
+                                chunk,
+                                ir_pwise,
+                                ir_context,
+                            )
+                            input_partition_idx += 1
 
-                    need_loop: bool = True
-                    while need_loop:
-                        need_loop = False
-                        # Loop through all levels
-                        for level in range(level_count):
-                            if counts[level]:
-                                # Non-empty level
-                                if level == level_count - 1:
-                                    # Final output level.
-                                    # Apply final selection to any DataFrame we have at this level.
-                                    df = ir_select.do_evaluate(
-                                        *ir_select._non_child_args,
-                                        levels[level].pop(),
+                    if chunk is not None:
+                        levels[0].append(
+                            DataFrame.from_table(
+                                chunk.table_view(),
+                                list(ir_pwise.schema.keys()),
+                                list(ir_pwise.schema.values()),
+                                chunk.stream,
+                            )
+                        )
+
+                    # Loop through the levels to push chunks as far as possible
+                    for level in range(level_count):
+                        if levels[level]:
+                            count = len(levels[level])
+                            if count >= k or done_receiving:
+                                next_level = min(level + 1, level_count - 1)
+                                count = len(levels[level])
+                                if count > 1:
+                                    df = _concat(
+                                        *[levels[level].pop() for _ in range(count)],
                                         context=ir_context,
                                     )
-                                    await ch_out.data.send(
-                                        context,
-                                        Message(
-                                            seuence_num,
-                                            TableChunk.from_pylibcudf_table(
-                                                df.table, df.stream, exclusive_view=True
-                                            ),
-                                        ),
-                                    )
-                                    counts[level] -= 1
-                                    seuence_num += 1
-                                elif counts[level] >= k or done_receiving:
-                                    # Reduction level with k or more chunks.
-                                    # Reduce and move to the next level.
+                                    # print(f"concatenated result (dtypes): {df.dtypes}", flush=True)
+                                    # print(f"concatenated result polars: {df.to_polars()}", flush=True)
+                                    # print(f"Input df dtypes: {df.dtypes}", flush=True)
                                     df = ir_reduction.do_evaluate(
                                         *ir_reduction._non_child_args,
-                                        _concat(
-                                            *levels[level],
-                                            context=ir_context,
-                                        ),
+                                        df,
                                         context=ir_context,
                                     )
-                                    levels[level + 1].append(df)
-                                    counts[level + 1] += 1
-                                    levels[level] = []
-                                    counts[level] = 0
-                                    # Loop again in case we can push more data to
-                                    # the next level before receiving another msg.
-                                    need_loop = True
+                                    # for col in df.columns:
+                                    #     print(f"col (dtypes): {col.dtype}", flush=True)
+                                    # print(f"grouped result (dtypes): {df.dtypes}", flush=True)
+                                    # print(f"grouped result polars: {df.to_polars()}", flush=True)
+                                    levels[next_level].append(df)
+                                elif level != next_level:
+                                    levels[next_level].append(levels[level].pop())
+                            if level == level_count - 1 and (
+                                output_count > 1 or done_receiving
+                            ):
+                                assert len(levels[level]) == 1, (
+                                    "Expected 1 chunk at the last level"
+                                )
+                                df = ir_select.do_evaluate(
+                                    *ir_select._non_child_args,
+                                    levels[level].pop(),
+                                    context=ir_context,
+                                )
+                                await ch_out.data.send(
+                                    context,
+                                    Message(
+                                        sequence_num,
+                                        TableChunk.from_pylibcudf_table(
+                                            df.table, df.stream, exclusive_view=True
+                                        ),
+                                    ),
+                                )
+                                sequence_num += 1
 
                 await ch_out.data.drain(context)
 

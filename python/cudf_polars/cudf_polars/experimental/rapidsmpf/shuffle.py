@@ -216,7 +216,7 @@ async def local_shuffle_node(
         column_names = list(ir.schema.keys())
         partitioned_on_needed = tuple(column_names[i] for i in columns_to_hash)
 
-        if (
+        if (metadata.count == 1) or (
             partitioned_on_before == partitioned_on_needed
             and metadata.count == num_partitions
         ):
