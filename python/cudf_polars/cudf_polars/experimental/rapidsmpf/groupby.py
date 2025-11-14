@@ -410,33 +410,23 @@ async def groupby_node(
                             count = len(levels[level])
                             if count >= k or done_receiving:
                                 next_level = min(level + 1, level_count - 1)
-                                count = len(levels[level])
-                                if count > 1:
-                                    df = _concat(
+                                # NOTE: We must call do_evaluate to promote the
+                                # chunk(s) at this level, even if there is only
+                                # one chunk. Skipping that call can result in
+                                # mismatched dtypes in the next concatenation.
+                                df = ir_reduction.do_evaluate(
+                                    *ir_reduction._non_child_args,
+                                    _concat(
                                         *[levels[level].pop() for _ in range(count)],
                                         context=ir_context,
-                                    )
-                                    # print(f"concatenated result (dtypes): {df.dtypes}", flush=True)
-                                    # print(f"concatenated result polars: {df.to_polars()}", flush=True)
-                                    # print(f"Input df dtypes: {df.dtypes}", flush=True)
-                                    df = ir_reduction.do_evaluate(
-                                        *ir_reduction._non_child_args,
-                                        df,
-                                        context=ir_context,
-                                    )
-                                    # for col in df.columns:
-                                    #     print(f"col (dtypes): {col.dtype}", flush=True)
-                                    # print(f"grouped result (dtypes): {df.dtypes}", flush=True)
-                                    # print(f"grouped result polars: {df.to_polars()}", flush=True)
-                                    levels[next_level].append(df)
-                                elif level != next_level:
-                                    levels[next_level].append(levels[level].pop())
+                                    ),
+                                    context=ir_context,
+                                )
+                                levels[next_level].append(df)
                             if level == level_count - 1 and (
                                 output_count > 1 or done_receiving
                             ):
-                                assert len(levels[level]) == 1, (
-                                    "Expected 1 chunk at the last level"
-                                )
+                                assert count == 1, "Expected 1 chunk at the last level"
                                 df = ir_select.do_evaluate(
                                     *ir_select._non_child_args,
                                     levels[level].pop(),
