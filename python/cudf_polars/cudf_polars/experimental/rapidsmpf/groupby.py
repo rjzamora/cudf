@@ -426,7 +426,9 @@ async def groupby_node(
                             if level == level_count - 1 and (
                                 output_count > 1 or done_receiving
                             ):
-                                assert count == 1, "Expected 1 chunk at the last level"
+                                assert len(levels[level]) == 1, (
+                                    "Expected 1 chunk at the last level"
+                                )
                                 df = ir_select.do_evaluate(
                                     *ir_select._non_child_args,
                                     levels[level].pop(),
