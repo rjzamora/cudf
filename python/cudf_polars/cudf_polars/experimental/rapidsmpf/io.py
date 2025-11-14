@@ -523,7 +523,7 @@ def make_rapidsmpf_read_parquet_node(
                 break
     if estimated_row_count is not None and estimated_row_count.value is not None:
         num_rows_per_chunk = int(
-            max(1, estimated_row_count.value // partition_info.count)
+            max(1, math.ceil(estimated_row_count.value / partition_info.count))
         )
     else:
         # Fallback: use a default chunk size if statistics are not available
@@ -595,7 +595,8 @@ def _(
     nodes: dict[IR, list[Any]] = {}
     native_node: Any = None
     if (
-        partition_info.count > 1
+        parquet_options.use_rapidsmpf_native
+        and partition_info.count > 1
         and ir.typ == "parquet"
         and ir.row_index is None
         and ir.include_file_paths is None

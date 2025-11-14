@@ -256,6 +256,7 @@ class RunConfig:
     query_set: str
     collect_traces: bool = False
     stats_planning: bool
+    native_parquet: bool
 
     def __post_init__(self) -> None:  # noqa: D105
         if self.gather_shuffle_stats and self.shuffle != "rapidsmpf":
@@ -371,6 +372,7 @@ class RunConfig:
             query_set=args.query_set,
             collect_traces=args.collect_traces,
             stats_planning=args.stats_planning,
+            native_parquet=args.native_parquet,
         )
 
     def serialize(self, engine: pl.GPUEngine | None) -> dict:
@@ -400,6 +402,8 @@ class RunConfig:
                 print(f"shuffle_method: {self.shuffle}")
                 print(f"broadcast_join_limit: {self.broadcast_join_limit}")
                 print(f"stats_planning: {self.stats_planning}")
+                if self.runtime == "rapidsmpf":
+                    print(f"native_parquet: {self.native_parquet}")
                 if self.cluster == "distributed":
                     print(f"n_workers: {self.n_workers}")
                     print(f"threads: {self.threads}")
@@ -885,6 +889,13 @@ def parse_args(
         help="Enable statistics planning.",
     )
 
+    parser.add_argument(
+        "--native-parquet",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use C++ read_parquet nodes for the rapidsmpf runtime.",
+    )
+
     parsed_args = parser.parse_args(args)
 
     if parsed_args.rmm_pool_size is None and not parsed_args.rmm_async:
@@ -913,6 +924,12 @@ def run_polars(
 
     if run_config.executor != "cpu":
         executor_options = get_executor_options(run_config, benchmark=benchmark)
+        if run_config.runtime == "rapidsmpf":
+            parquet_options = {
+                "use_rapidsmpf_native": run_config.native_parquet,
+            }
+        else:
+            parquet_options = None
         engine = pl.GPUEngine(
             raise_on_fail=True,
             memory_resource=rmm.mr.CudaAsyncMemoryResource()
@@ -921,6 +938,7 @@ def run_polars(
             cuda_stream_policy=run_config.stream_policy,
             executor=run_config.executor,
             executor_options=executor_options,
+            parquet_options=parquet_options,
         )
 
     for q_id in run_config.queries:
