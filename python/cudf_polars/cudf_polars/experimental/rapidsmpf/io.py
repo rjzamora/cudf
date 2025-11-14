@@ -627,8 +627,7 @@ def _(
             "Scan node must have a partition plan"
         )
         plan: IOPartitionPlan = partition_info.io_plan
-        if plan.flavor == IOPartitionFlavor.SPLIT_FILES:
-            parquet_options = dataclasses.replace(parquet_options, chunked=False)
+        dataclasses.replace(parquet_options, chunked=False)
 
         nodes[ir] = [
             scan_node(
