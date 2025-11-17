@@ -398,7 +398,9 @@ async def _shuffle_join(
             left_input.insert_chunk(sampled_chunks.pop("left"))
             # Insert remaining chunks
             while (msg := await ch_left.data.recv(context)) is not None:
-                left_chunk = TableChunk.from_message(msg)
+                left_chunk = TableChunk.from_message(msg).make_available_and_spill(
+                    context.br(), allow_overbooking=True
+                )
                 left_input.insert_chunk(left_chunk)
 
         if right_shuffle:
@@ -407,7 +409,9 @@ async def _shuffle_join(
             right_input.insert_chunk(sampled_chunks.pop("right"))
             # Insert remaining chunks
             while (msg := await ch_right.data.recv(context)) is not None:
-                right_chunk = TableChunk.from_message(msg)
+                right_chunk = TableChunk.from_message(msg).make_available_and_spill(
+                    context.br(), allow_overbooking=True
+                )
                 right_input.insert_chunk(right_chunk)
 
         # Phase 2: Join partitions
@@ -422,7 +426,9 @@ async def _shuffle_join(
             else:
                 # Pre-partitioned left - receive in order (use sampled chunk on first iteration)
                 if partition_id == 0:
-                    left_chunk = sampled_chunks.pop("left")
+                    left_chunk = sampled_chunks.pop("left").make_available_and_spill(
+                        context.br(), allow_overbooking=True
+                    )
                 else:
                     left_msg = await ch_left.data.recv(context)
                     assert left_msg is not None, (
@@ -443,7 +449,9 @@ async def _shuffle_join(
             else:
                 # Pre-partitioned right - receive in order (use sampled chunk on first iteration)
                 if partition_id == 0:
-                    right_chunk = sampled_chunks.pop("right")
+                    right_chunk = sampled_chunks.pop("right").make_available_and_spill(
+                        context.br(), allow_overbooking=True
+                    )
                 else:
                     right_msg = await ch_right.data.recv(context)
                     assert right_msg is not None, (

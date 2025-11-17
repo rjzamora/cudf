@@ -113,7 +113,9 @@ async def groupby_node(
 
             chunks: list[TableChunk] = []
             while (msg := await ch_in.data.recv(context)) is not None:
-                chunk = TableChunk.from_message(msg)
+                chunk = TableChunk.from_message(msg).make_available_and_spill(
+                    context.br(), allow_overbooking=True
+                )
                 chunks.append(chunk)
             assert chunks, "Missing chunks"
             df = ir.do_evaluate(
@@ -190,7 +192,9 @@ async def groupby_node(
             if need_preshuffle:
                 assert isinstance(pre_shuffle, LocalShuffle)
                 while (msg := await ch_in.data.recv(context)) is not None:
-                    chunk = TableChunk.from_message(msg)
+                    chunk = TableChunk.from_message(msg).make_available_and_spill(
+                        context.br(), allow_overbooking=True
+                    )
                     pre_shuffle.insert_chunk(chunk)
 
                 # Extract the first chunk from the pre-shuffle.
@@ -205,7 +209,9 @@ async def groupby_node(
                 # Receive the first chunk from the input channel.
                 first_msg = await ch_in.data.recv(context)
                 assert first_msg is not None, "Missing first chunk"
-                first_chunk = TableChunk.from_message(first_msg)
+                first_chunk = TableChunk.from_message(
+                    first_msg
+                ).make_available_and_spill(context.br(), allow_overbooking=True)
 
             # Apply the piecewise groupby operation to the first chunk for sampling.
             first_pwise_chunk: TableChunk | None = None
@@ -286,7 +292,9 @@ async def groupby_node(
                         while (msg := await ch_in.data.recv(context)) is not None:
                             chunk = await asyncio.to_thread(
                                 apply_do_evaluate,
-                                TableChunk.from_message(msg),
+                                TableChunk.from_message(msg).make_available_and_spill(
+                                    context.br(), allow_overbooking=True
+                                ),
                                 ir_pwise,
                                 ir_context,
                             )
@@ -385,7 +393,11 @@ async def groupby_node(
                             done_receiving = True
                             chunk = None
                         else:
-                            chunk = TableChunk.from_message(msg)
+                            chunk = TableChunk.from_message(
+                                msg
+                            ).make_available_and_spill(
+                                context.br(), allow_overbooking=True
+                            )
                             chunk = await asyncio.to_thread(
                                 apply_do_evaluate,
                                 chunk,
