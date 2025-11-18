@@ -90,8 +90,38 @@ async def groupby_node(
         )
         shuffled = metadata.partitioned_on == tuple(groupby_key_columns)
 
+        # We are already shuffled - Partitionwise groupby
+        if shuffled:
+            # Forward metadata directly and perform partition-wise groupby
+            await ch_out.send_metadata(context, metadata)
+            while (msg := await ch_in.data.recv(context)) is not None:
+                chunk = TableChunk.from_message(msg).make_available_and_spill(
+                    context.br(), allow_overbooking=True
+                )
+                df = ir.do_evaluate(
+                    *ir._non_child_args,
+                    DataFrame.from_table(
+                        chunk.table_view(),
+                        list(ir.children[0].schema.keys()),
+                        list(ir.children[0].schema.values()),
+                        chunk.stream,
+                    ),
+                    context=ir_context,
+                )
+                await ch_out.data.send(
+                    context,
+                    Message(
+                        msg.sequence_number,
+                        TableChunk.from_pylibcudf_table(
+                            df.table, df.stream, exclusive_view=True
+                        ),
+                    ),
+                )
+            await ch_out.data.drain(context)
+            return
+
         need_preshuffle = False
-        need_preconcat = ir.maintain_order and not shuffled
+        need_preconcat = ir.maintain_order
         sample_first_chunk = True  # TODO: Do we ever want to use False?
         name_generator = unique_names(ir.schema.keys())
         # Decompose the aggregation requests into three distinct phases
@@ -105,7 +135,7 @@ async def groupby_node(
                 )
             )
         except NotImplementedError:  # pragma: no cover
-            need_preconcat = not shuffled
+            need_preconcat = True
 
         # Simple single-partition or pre-concatenation case.
         if need_preconcat or metadata.count == output_count == 1:
@@ -248,7 +278,7 @@ async def groupby_node(
             )
 
             # Shuffle-based groupby case.
-            if output_count > 1 and not shuffled:
+            if output_count > 1:
                 # Align partition count with the "expected"
                 # count for the closest dependent join node.
                 # TODO: Decide if this optimization makes sense:
