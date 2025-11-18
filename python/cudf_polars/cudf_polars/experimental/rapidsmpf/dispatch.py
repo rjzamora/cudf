@@ -75,6 +75,8 @@ class GenState(TypedDict):
         a single IO node.
     stats
         Statistics collector.
+    join_count
+        The partition count of the closest dependent join node.
     """
 
     context: Context
@@ -84,6 +86,7 @@ class GenState(TypedDict):
     ir_context: IRExecutionContext
     max_io_threads: int
     stats: StatsCollector
+    join_count: int
 
 
 SubNetGenerator: TypeAlias = GenericTransformer[

@@ -772,6 +772,7 @@ def _(
     left, right = ir.children
 
     # Process children
+    rec.state["join_count"] = rec.state["partition_info"][ir].count
     nodes, channels = process_children(ir, rec)
     if ir in nodes:
         return nodes, channels

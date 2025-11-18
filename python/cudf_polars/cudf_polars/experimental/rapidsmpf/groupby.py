@@ -70,6 +70,7 @@ async def groupby_node(
     groupby_n_ary: int,
     target_partition_size: int,
     output_count: int,
+    downstream_join_count: int,
 ) -> None:
     """Unified  GroupBy node."""
     async with shutdown_on_error(
@@ -248,6 +249,11 @@ async def groupby_node(
 
             # Shuffle-based groupby case.
             if output_count > 1 and not shuffled:
+                # Align partition count with the "expected"
+                # count for the closest dependent join node
+                if downstream_join_count > output_count and output_count > 4:
+                    output_count = downstream_join_count
+
                 # Send output metadata
                 output_metadata = Metadata(
                     output_count,
@@ -498,6 +504,7 @@ def _(
             executor.groupby_n_ary,
             executor.target_partition_size,
             rec.state["partition_info"][ir].count,
+            rec.state["join_count"],
         )
     ]
 

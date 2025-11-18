@@ -355,6 +355,7 @@ def generate_network(
         "ir_context": ir_context,
         "max_io_threads": max_io_threads_local,
         "stats": stats,
+        "join_count": 0,
     }
     mapper: SubNetGenerator = CachingVisitor(
         generate_ir_sub_network_wrapper, state=state

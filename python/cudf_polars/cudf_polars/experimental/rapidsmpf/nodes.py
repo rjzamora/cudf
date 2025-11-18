@@ -14,7 +14,8 @@ from rapidsmpf.streaming.core.spillable_messages import SpillableMessages
 from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
 from cudf_polars.containers import DataFrame
-from cudf_polars.dsl.ir import IR, Cache, Empty, Filter, Projection
+from cudf_polars.dsl.expr import Col
+from cudf_polars.dsl.ir import IR, Cache, Empty, Filter, Projection, Select
 from cudf_polars.experimental.rapidsmpf.dispatch import (
     generate_ir_sub_network,
 )
@@ -78,6 +79,15 @@ async def default_node_single(
         assert isinstance(metadata, Metadata), (
             f"Expected Metadata, got {type(metadata)}."
         )
+
+        # Preserve partitioning for some Select nodes
+        if isinstance(ir, Select) and metadata.partitioned_on:
+            preserve_partitioning = metadata.partitioned_on == tuple(
+                ne.name
+                for ne in ir.exprs
+                if (ne.name in metadata.partitioned_on) and isinstance(ne.value, Col)
+            )
+
         new_metadata = Metadata(metadata.count)
         if preserve_partitioning:
             new_metadata.partitioned_on = metadata.partitioned_on
