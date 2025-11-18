@@ -250,9 +250,10 @@ async def groupby_node(
             # Shuffle-based groupby case.
             if output_count > 1 and not shuffled:
                 # Align partition count with the "expected"
-                # count for the closest dependent join node
-                if downstream_join_count > output_count and output_count > 4:
-                    output_count = downstream_join_count
+                # count for the closest dependent join node.
+                # TODO: Decide if this optimization makes sense:
+                # if downstream_join_count > output_count and output_count > 4:
+                #     output_count = downstream_join_count
 
                 # Send output metadata
                 output_metadata = Metadata(
