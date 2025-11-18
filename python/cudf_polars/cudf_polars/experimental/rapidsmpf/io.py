@@ -9,6 +9,7 @@ import dataclasses
 import math
 from typing import TYPE_CHECKING, Any
 
+from rapidsmpf.buffer.buffer import MemoryType
 from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
@@ -138,6 +139,7 @@ async def dataframescan_node(
     *,
     num_producers: int,
     rows_per_partition: int,
+    target_partition_size: int,
 ) -> None:
     """
     DataFrameScan node for rapidsmpf.
@@ -156,6 +158,8 @@ async def dataframescan_node(
         The number of producers to use for the DataFrameScan node.
     rows_per_partition
         The number of rows per partition.
+    target_partition_size
+        The target partition size in bytes.
     """
     nrows = max(ir.df.shape()[0], 1)
     global_count = math.ceil(nrows / rows_per_partition)
@@ -206,6 +210,7 @@ async def dataframescan_node(
                     task_idx,
                     ch_out,
                     ir_context,
+                    target_partition_size,
                 )
             await ch_out.drain(context)
 
@@ -225,6 +230,7 @@ def _(
         "'in-memory' executor not supported in 'generate_ir_sub_network'"
     )
     rows_per_partition = config_options.executor.max_rows_per_partition
+    target_partition_size = config_options.executor.target_partition_size
     num_producers = rec.state["max_io_threads"]
 
     context = rec.state["context"]
@@ -239,6 +245,7 @@ def _(
                 channels[ir].reserve_input_slot(),
                 num_producers=num_producers,
                 rows_per_partition=rows_per_partition,
+                target_partition_size=target_partition_size,
             )
         ]
     }
@@ -283,6 +290,7 @@ async def read_chunk(
     seq_num: int,
     ch_out: Channel[TableChunk],
     ir_context: IRExecutionContext,
+    target_partition_size: int,
 ) -> None:
     """
     Read a chunk from disk and send it to the output channel.
@@ -299,7 +307,22 @@ async def read_chunk(
         The output channel.
     ir_context
         The execution context for the IR node.
+    target_partition_size
+        The target partition size in bytes.
     """
+    # Check for sufficient device memory before reading
+    # Wait for 2x target_partition_size to be available
+    required_memory = 2 * target_partition_size
+    max_wait_iterations = 1_000  # Avoid waiting forever to prevent deadlocks
+    wait_iterations = 0
+    while wait_iterations < max_wait_iterations:
+        available_device_mem = context.br().memory_available(MemoryType.DEVICE)
+        if available_device_mem >= required_memory:
+            break
+        # Yield event loop to allow other tasks to free memory
+        await asyncio.sleep(0.001)  # Small sleep to avoid busy waiting
+        wait_iterations += 1
+
     # Evaluate and send the Scan-node result
     df = await asyncio.to_thread(
         scan.do_evaluate,
@@ -329,6 +352,7 @@ async def scan_node(
     num_producers: int,
     plan: IOPartitionPlan,
     parquet_options: ParquetOptions,
+    target_partition_size: int,
 ) -> None:
     """
     Scan node for rapidsmpf.
@@ -349,6 +373,8 @@ async def scan_node(
         The partitioning plan.
     parquet_options
         The Parquet options.
+    target_partition_size
+        The target partition size in bytes.
     """
     async with shutdown_on_error(context, ch_out.metadata, ch_out.data):
         # Build a list of local Scan operations
@@ -437,6 +463,7 @@ async def scan_node(
                     task_idx,
                     ch_out,
                     ir_context,
+                    target_partition_size,
                 )
             await ch_out.drain(context)
 
@@ -586,6 +613,7 @@ def _(
         "'in-memory' executor not supported in 'generate_ir_sub_network'"
     )
     parquet_options = config_options.parquet_options
+    target_partition_size = config_options.executor.target_partition_size
     partition_info = rec.state["partition_info"][ir]
     num_producers = rec.state["max_io_threads"]
     channels: dict[IR, ChannelManager] = {ir: ChannelManager(rec.state["context"])}
@@ -638,6 +666,7 @@ def _(
                 num_producers=num_producers,
                 plan=plan,
                 parquet_options=parquet_options,
+                target_partition_size=target_partition_size,
             )
         ]
     return nodes, channels
