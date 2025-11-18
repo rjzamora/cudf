@@ -311,8 +311,8 @@ async def read_chunk(
         The target partition size in bytes.
     """
     # Check for sufficient device memory before reading
-    # Wait for 2x target_partition_size to be available
-    required_memory = 2 * target_partition_size
+    # Wait for `target_partition_size` to be available
+    required_memory = target_partition_size
     max_wait_iterations = 1_000  # Avoid waiting forever to prevent deadlocks
     wait_iterations = 0
     while wait_iterations < max_wait_iterations:
