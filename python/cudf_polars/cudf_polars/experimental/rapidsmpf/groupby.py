@@ -502,19 +502,25 @@ async def groupby_node(
                             assert len(levels[level]) == 1, (
                                 "Expected 1 chunk at the last level"
                             )
-                            df = ir_select.do_evaluate(
-                                *ir_select._non_child_args,
-                                levels[level].pop(),
-                                context=ir_context,
-                            )
-                            table_chunk = TableChunk.from_pylibcudf_table(
-                                df.table,
-                                df.stream,
-                                exclusive_view=True,
-                            )
+                            df = levels[level].pop()
                             if post_allgather is not None:
+                                table_chunk = TableChunk.from_pylibcudf_table(
+                                    df.table,
+                                    df.stream,
+                                    exclusive_view=True,
+                                )
                                 post_allgather.insert(sequence_num, table_chunk)
                             else:
+                                df = ir_select.do_evaluate(
+                                    *ir_select._non_child_args,
+                                    df,
+                                    context=ir_context,
+                                )
+                                table_chunk = TableChunk.from_pylibcudf_table(
+                                    df.table,
+                                    df.stream,
+                                    exclusive_view=True,
+                                )
                                 await ch_out.data.send(
                                     context, Message(sequence_num, table_chunk)
                                 )
@@ -523,8 +529,31 @@ async def groupby_node(
             if post_allgather is not None:
                 post_allgather.insert_finished()
                 stream = ir_context.get_cuda_stream()
-                final_chunk = await post_allgather.extract_concatenated(stream)
-                await ch_out.data.send(context, Message(0, final_chunk))
+                df = ir_select.do_evaluate(
+                    *ir_select._non_child_args,
+                    ir_reduction.do_evaluate(
+                        *ir_reduction._non_child_args,
+                        DataFrame.from_table(
+                            await post_allgather.extract_concatenated(stream),
+                            list(ir_reduction.schema.keys()),
+                            list(ir_reduction.schema.values()),
+                            stream,
+                        ),
+                        context=ir_context,
+                    ),
+                    context=ir_context,
+                )
+                await ch_out.data.send(
+                    context,
+                    Message(
+                        0,
+                        TableChunk.from_pylibcudf_table(
+                            df.table,
+                            df.stream,
+                            exclusive_view=True,
+                        ),
+                    ),
+                )
 
             await ch_out.data.drain(context)
 
