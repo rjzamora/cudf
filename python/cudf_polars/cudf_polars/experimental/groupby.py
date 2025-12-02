@@ -222,6 +222,14 @@ def _(
         unique_fraction = max(unique_fraction_dict.values())
         post_aggregation_count = max(int(unique_fraction * child_count), 1)
 
+    # Let the groupby node handle algorithm decisions at runtime.
+    if config_options.executor.runtime == "rapidsmpf":
+        smart_groupby_node = ir.reconstruct([child])
+        # TODO: Use child_count and allow join_node to modify the count.
+        # (Need AllReduce for GroupBy node to estimate the global output size)
+        partition_info[smart_groupby_node] = PartitionInfo(count=post_aggregation_count)
+        return smart_groupby_node, partition_info
+
     new_node: IR
     name_generator = unique_names(ir.schema.keys())
     # Decompose the aggregation requests into three distinct phases

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Literal
 
 from rapidsmpf.shuffler import Shuffler
 
+from cudf_polars.dsl.ir import GroupBy
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.experimental.join import Join
 from cudf_polars.experimental.repartition import Repartition
@@ -65,7 +66,7 @@ class ReserveOpIDs:
         self.collective_nodes: list[IR] = [
             node
             for node in traversal([ir])
-            if isinstance(node, (Shuffle, Join, Repartition))
+            if isinstance(node, (Shuffle, Join, Repartition, GroupBy))
         ]
         self.collective_id_map: dict[IR, int] = {}
 
