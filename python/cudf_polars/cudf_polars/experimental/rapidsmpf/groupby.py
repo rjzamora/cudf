@@ -71,7 +71,30 @@ async def groupby_node(
     output_count: int,
     collective_id: int,
 ) -> None:
-    """Unified  GroupBy node."""
+    """
+    Dynamic GroupBy node.
+
+    Parameters
+    ----------
+    context
+        The context of the node.
+    ir
+        The GroupBy IR node.
+    ir_context
+        The IR execution context.
+    ch_out
+        The output channel pair.
+    ch_in
+        The input channel pair.
+    groupby_n_ary
+        The groupby n-ary.
+    target_partition_size
+        The target partition size.
+    output_count
+        The output count.
+    collective_id
+        The collective ID.
+    """
     async with shutdown_on_error(
         context,
         ch_in.metadata,
