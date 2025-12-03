@@ -175,7 +175,13 @@ async def groupby_node(
                     allgather.insert(seq_num, TableChunk.from_message(msg))
                     seq_num += 1
                 allgather.insert_finished()
-                chunks.append(await allgather.extract_concatenated(stream))
+                chunks.append(
+                    TableChunk.from_pylibcudf_table(
+                        await allgather.extract_concatenated(stream),
+                        stream,
+                        exclusive_view=True,
+                    )
+                )
             else:
                 while (msg := await ch_in.data.recv(context)) is not None:
                     chunk = TableChunk.from_message(msg).make_available_and_spill(
@@ -244,6 +250,13 @@ async def groupby_node(
         groupby_key_indices = tuple(schema_keys.index(k.name) for k in ir.keys)
         first_chunk: TableChunk | None = None
         pre_shuffle: ShuffleManager | None = None
+        my_preshuffle_ids = list(
+            range(
+                context.comm().rank,
+                input_metadata.count,
+                context.comm().nranks,
+            )
+        )
         if need_preshuffle:
             # Insert all chunks into the pre-shuffle (if needed)
             pre_shuffle = ShuffleManager(
@@ -266,7 +279,7 @@ async def groupby_node(
             if sample_first_chunk:
                 stream = ir_context.get_cuda_stream()
                 first_chunk = TableChunk.from_pylibcudf_table(
-                    await pre_shuffle.extract_chunk(0, stream),
+                    await pre_shuffle.extract_chunk(my_preshuffle_ids[0], stream),
                     stream,
                     exclusive_view=True,
                 )
@@ -353,7 +366,12 @@ async def groupby_node(
             await shuffle.insert_finished()
 
             # Extract shuffled chunks and apply the final select operation
-            for partition_id in range(output_count):
+            for partition_id in range(
+                # Round-robin partition assignment
+                context.comm().rank,
+                output_count,
+                context.comm().nranks,
+            ):
                 stream = ir_context.get_cuda_stream()
                 reduction_chunk = TableChunk.from_pylibcudf_table(
                     await shuffle.extract_chunk(partition_id, stream),
@@ -429,12 +447,12 @@ async def groupby_node(
             while not done_receiving:
                 if need_preshuffle:
                     # Extract from pre-shuffle
-                    if input_partition_idx < input_metadata.count:
+                    if input_partition_idx < len(my_preshuffle_ids):
                         assert pre_shuffle is not None
                         stream = ir_context.get_cuda_stream()
                         input_chunk = TableChunk.from_pylibcudf_table(
                             await pre_shuffle.extract_chunk(
-                                input_partition_idx, stream
+                                my_preshuffle_ids[input_partition_idx], stream
                             ),
                             stream,
                             exclusive_view=True,
