@@ -95,6 +95,8 @@ async def groupby_node(
     collective_id
         The collective ID.
     """
+    collective_ids = [collective_id]
+
     async with shutdown_on_error(
         context,
         ch_in.metadata,
@@ -166,7 +168,7 @@ async def groupby_node(
             # Make sure data is duplicated
             chunks: list[TableChunk] = []
             if not duplicated and context.comm().nranks > 1:
-                allgather = AllGatherManager(context, collective_id)
+                allgather = AllGatherManager(context, collective_ids.pop())
                 stream = context.get_stream_from_pool()
                 seq_num = 0
                 while (msg := await ch_in.data.recv(context)) is not None:
@@ -248,7 +250,7 @@ async def groupby_node(
                 context,
                 input_metadata.count,
                 groupby_key_indices,
-                collective_id,
+                collective_ids.pop(),
             )
             while (msg := await ch_in.data.recv(context)) is not None:
                 chunk = TableChunk.from_message(msg).make_available_and_spill(
@@ -273,29 +275,28 @@ async def groupby_node(
             # Receive the first chunk from the input channel.
             first_msg = await ch_in.data.recv(context)
             assert first_msg is not None, "Missing first chunk"
-            first_chunk = TableChunk.from_message(first_msg).make_available_and_spill(
-                context.br(), allow_overbooking=True
-            )
+            first_chunk = TableChunk.from_message(first_msg)
 
         # Apply the piecewise groupby operation to the first chunk for sampling.
-        first_pwise_chunk: TableChunk | None = None
         first_pwise_size: int | None = None
         if sample_first_chunk:
             assert first_chunk is not None, "Missing first chunk"
-            first_pwise_chunk = await asyncio.to_thread(
+            first_chunk = await asyncio.to_thread(
                 apply_do_evaluate,
-                first_chunk,
+                first_chunk.make_available_and_spill(
+                    context.br(), allow_overbooking=True
+                ),
                 ir_pwise,
                 ir_context,
             )
-            assert first_pwise_chunk is not None
-            first_pwise_size = first_pwise_chunk.data_alloc_size(MemoryType.DEVICE)
+            assert first_chunk is not None
+            first_pwise_size = first_chunk.data_alloc_size(MemoryType.DEVICE)
             assert first_pwise_size is not None
-            # TODO: Update the output_count based on the first_pwise_size and metadata.count
-            ideal_output_count = max(
-                1, (first_pwise_size * input_metadata.count) // target_partition_size
-            )
-            output_count = min(ideal_output_count, output_count)
+            # # TODO: Update the output_count based on the first_pwise_size and metadata.count
+            # ideal_output_count = max(
+            #     1, (first_pwise_size * input_metadata.count) // target_partition_size
+            # )
+            # output_count = min(ideal_output_count, output_count)
 
         # Define the reduction operation (used in both shuffle and tree cases)
         reduction_schema = {k.name: k.value.dtype for k in grouped_keys} | {
@@ -328,26 +329,25 @@ async def groupby_node(
                 context,
                 output_count,
                 pwise_key_indices,
-                collective_id,
+                collective_ids.pop(),
             )
 
             # Insert grouped data into shuffle
-            if first_pwise_chunk is not None:
-                shuffle.insert_chunk(first_pwise_chunk)
-
-            await shuffle.insert_finished()
+            if first_chunk is not None:
+                shuffle.insert_chunk(first_chunk)
 
             # Read remaining chunks from input channel
             while (msg := await ch_in.data.recv(context)) is not None:
-                chunk = await asyncio.to_thread(
-                    apply_do_evaluate,
-                    TableChunk.from_message(msg).make_available_and_spill(
-                        context.br(), allow_overbooking=True
-                    ),
-                    ir_pwise,
-                    ir_context,
+                shuffle.insert_chunk(
+                    await asyncio.to_thread(
+                        apply_do_evaluate,
+                        TableChunk.from_message(msg).make_available_and_spill(
+                            context.br(), allow_overbooking=True
+                        ),
+                        ir_pwise,
+                        ir_context,
+                    )
                 )
-                shuffle.insert_chunk(chunk)
 
             # Insert finished
             await shuffle.insert_finished()
@@ -400,7 +400,7 @@ async def groupby_node(
                 and not shuffled
                 and context.comm().nranks > 1
             ):
-                post_allgather = AllGatherManager(context, collective_id)
+                post_allgather = AllGatherManager(context, collective_ids.pop())
 
             # Prepare for the tree reduction
             n = input_metadata.count
@@ -412,14 +412,14 @@ async def groupby_node(
             level_count = int(math.ceil(math.log(n * (k - 1) + 1) / math.log(k)))
             done_receiving = False
             levels: defaultdict[int, list[DataFrame]] = defaultdict(list)
-            if first_pwise_chunk is not None:
+            if first_chunk is not None:
                 # Process the first (sampled) chunk
                 levels[0].append(
                     DataFrame.from_table(
-                        first_pwise_chunk.table_view(),
+                        first_chunk.table_view(),
                         list(ir_pwise.schema.keys()),
                         list(ir_pwise.schema.values()),
-                        first_pwise_chunk.stream,
+                        first_chunk.stream,
                     )
                 )
 
