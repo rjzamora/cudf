@@ -499,6 +499,7 @@ def make_rapidsmpf_read_parquet_node(
     """
     from rapidsmpf.streaming.cudf.parquet import (
         Filter,
+        # read_parquet,
         read_parquet_uniform,
     )
 
