@@ -516,7 +516,10 @@ def make_rapidsmpf_read_parquet_node(
     The RapidsMPF read parquet node, or None if the predicate cannot be
     converted to a parquet filter (caller should fall back to scan_node).
     """
-    from rapidsmpf.streaming.cudf.parquet import Filter, read_parquet
+    from rapidsmpf.streaming.cudf.parquet import (
+        Filter,
+        read_parquet_uniform,
+    )
 
     # Build ParquetReaderOptions
     try:
@@ -574,12 +577,20 @@ def make_rapidsmpf_read_parquet_node(
         raise ValueError(f"Invalid num_producers: {num_producers}")
 
     try:
-        return read_parquet(
+        # return read_parquet(
+        #     context,
+        #     ch_out.data,
+        #     num_producers,
+        #     parquet_reader_options,
+        #     num_rows_per_chunk,
+        #     filter=filter_obj,
+        # )
+        return read_parquet_uniform(
             context,
             ch_out.data,
             num_producers,
             parquet_reader_options,
-            num_rows_per_chunk,
+            target_num_chunks=partition_info.count,
             filter=filter_obj,
         )
     except Exception as e:
@@ -610,23 +621,23 @@ def _(
     plan: IOPartitionPlan = partition_info.io_plan
 
     # Native node cannot split large files in distributed mode yet
-    distributed_split_files = (
-        plan.flavor == IOPartitionFlavor.SPLIT_FILES
-        and rec.state["context"].comm().nranks > 1
-    )
+    # distributed_split_files = (
+    #     plan.flavor == IOPartitionFlavor.SPLIT_FILES
+    #     and rec.state["context"].comm().nranks > 1
+    # )
 
     # Use rapidsmpf native read_parquet for multi-partition Parquet scans.
     ch_pair = channels[ir].reserve_input_slot()
     nodes: dict[IR, list[Any]] = {}
     native_node: Any = None
     if (
-        partition_info.count > 1
+        True  # partition_info.count > 1
         and ir.typ == "parquet"
         and ir.row_index is None
         and ir.include_file_paths is None
         and ir.n_rows == -1
         and ir.skip_rows == 0
-        and not distributed_split_files
+        # and not distributed_split_files
     ):
         native_node = make_rapidsmpf_read_parquet_node(
             rec.state["context"],
