@@ -363,7 +363,7 @@ async def _shuffle_groupby(
     output_count: int,
     collective_id: int,
     groupby_key_columns: list[str],
-    first_chunk: TableChunk | None = None,
+    initial_chunks: list[TableChunk],
 ) -> None:
     """
     Execute groupby using shuffle-based redistribution.
@@ -389,8 +389,8 @@ async def _shuffle_groupby(
         The collective ID for shuffle.
     groupby_key_columns
         The names of the groupby key columns.
-    first_chunk
-        Optional first chunk that was already read and processed.
+    initial_chunks
+        Pre-processed chunks to insert (list is cleared after consumption).
     """
     # Send output metadata
     output_metadata = Metadata(
@@ -411,9 +411,10 @@ async def _shuffle_groupby(
         collective_id,
     )
 
-    # Insert first chunk if available (already piecewise-grouped)
-    if first_chunk is not None:
-        shuffle.insert_chunk(first_chunk)
+    # Insert initial chunks (already piecewise-grouped) and release references
+    for chunk in initial_chunks:
+        shuffle.insert_chunk(chunk)
+    initial_chunks.clear()
 
     # Process remaining chunks: apply piecewise groupby and insert into shuffle
     while (msg := await ch_in.data.recv(context)) is not None:
@@ -478,8 +479,8 @@ async def _tree_groupby(
     collective_ids: list[int],
     groupby_n_ary: int,
     target_partition_size: int,
-    first_chunk: TableChunk | None,
-    first_pwise_size: int | None,
+    initial_chunks: list[TableChunk],
+    sample_pwise_size: int | None,
     shuffled: bool,  # noqa: FBT001
     pre_shuffle: ShuffleManager | None,
     my_preshuffle_ids: list[int],
@@ -512,10 +513,10 @@ async def _tree_groupby(
         The N-ary factor for tree reduction.
     target_partition_size
         Target partition size in bytes.
-    first_chunk
-        First chunk (already piecewise-grouped) for sampling.
-    first_pwise_size
-        Size of first chunk after piecewise groupby (for k estimation).
+    initial_chunks
+        Pre-processed chunks to start with (list is cleared after consumption).
+    sample_pwise_size
+        Average size of sampled chunks after piecewise groupby (for k estimation).
     shuffled
         Whether data was pre-shuffled.
     pre_shuffle
@@ -539,31 +540,21 @@ async def _tree_groupby(
 
     # Calculate tree parameters
     n = input_metadata.count
-    if first_pwise_size is not None:
-        k = min(max(2, target_partition_size // first_pwise_size), 1024)
+    if sample_pwise_size is not None:
+        k = min(max(2, target_partition_size // sample_pwise_size), 1024)
     else:  # pragma: no cover
         k = groupby_n_ary
     level_count = int(math.ceil(math.log(n * (k - 1) + 1) / math.log(k)))
 
-    # Tree reduction state
+    # Tree reduction state: store TableChunks directly (they own their memory)
+    # Level 0 chunks use piecewise_ir.schema, level 1+ use reduction_ir.schema
     done_receiving = False
-    levels: defaultdict[int, list[DataFrame]] = defaultdict(list)
-    # Keep chunks alive while their DataFrame views are stored in levels[0]
-    level0_chunks: list[TableChunk] = []
-    input_partition_idx = 0
+    levels: defaultdict[int, list[TableChunk]] = defaultdict(list)
 
-    # Process first chunk if available
-    if first_chunk is not None:
-        level0_chunks.append(first_chunk)
-        levels[0].append(
-            DataFrame.from_table(
-                first_chunk.table_view(),
-                list(decomposed.piecewise_ir.schema.keys()),
-                list(decomposed.piecewise_ir.schema.values()),
-                first_chunk.stream,
-            )
-        )
-        input_partition_idx = 1
+    # Process initial chunks (already piecewise-grouped) and release references
+    input_partition_idx = len(initial_chunks)
+    levels[0].extend(initial_chunks)
+    initial_chunks.clear()
 
     # Main tree reduction loop
     sequence_num: int = 0
@@ -609,16 +600,7 @@ async def _tree_groupby(
                 input_partition_idx += 1
 
         if chunk is not None:
-            # Store chunk to keep it alive while its DataFrame view is in levels[0]
-            level0_chunks.append(chunk)
-            levels[0].append(
-                DataFrame.from_table(
-                    chunk.table_view(),
-                    list(decomposed.piecewise_ir.schema.keys()),
-                    list(decomposed.piecewise_ir.schema.values()),
-                    chunk.stream,
-                )
-            )
+            levels[0].append(chunk)
 
         # Push chunks through tree levels
         for level in range(level_count):
@@ -626,42 +608,69 @@ async def _tree_groupby(
                 count = len(levels[level])
                 if count >= k or done_receiving:
                     next_level = min(level + 1, level_count - 1)
+                    # Get schema for this level's chunks
+                    level_schema = (
+                        decomposed.piecewise_ir.schema
+                        if level == 0
+                        else decomposed.reduction_ir.schema
+                    )
+                    # Pop chunks and convert to DataFrames for reduction
+                    chunks_to_reduce = [levels[level].pop() for _ in range(count)]
                     df = decomposed.reduction_ir.do_evaluate(
                         *decomposed.reduction_ir._non_child_args,
                         _concat(
-                            *[levels[level].pop() for _ in range(count)],
+                            *[
+                                DataFrame.from_table(
+                                    c.table_view(),
+                                    list(level_schema.keys()),
+                                    list(level_schema.values()),
+                                    c.stream,
+                                )
+                                for c in chunks_to_reduce
+                            ],
                             context=ir_context,
                         ),
                         context=ir_context,
                     )
-                    # After _concat, data is copied so we can release level 0 chunks
-                    if level == 0:
-                        level0_chunks.clear()
-                    levels[next_level].append(df)
+                    del chunks_to_reduce
+                    # Convert result back to TableChunk for storage
+                    levels[next_level].append(
+                        TableChunk.from_pylibcudf_table(
+                            df.table, df.stream, exclusive_view=True
+                        )
+                    )
+                    del df
 
                 if level == level_count - 1 and (output_count > 1 or done_receiving):
                     assert len(levels[level]) == 1, "Expected 1 chunk at the last level"
-                    df = levels[level].pop()
+                    chunk = levels[level].pop()
 
                     if post_allgather is not None:
-                        table_chunk = TableChunk.from_pylibcudf_table(
-                            df.table, df.stream, exclusive_view=True
-                        )
-                        post_allgather.insert(sequence_num, table_chunk)
-                        del df, table_chunk
+                        post_allgather.insert(sequence_num, chunk)
+                        del chunk
                     else:
+                        # Apply selection and send
                         df = decomposed.select_ir.do_evaluate(
                             *decomposed.select_ir._non_child_args,
-                            df,
+                            DataFrame.from_table(
+                                chunk.table_view(),
+                                list(decomposed.reduction_ir.schema.keys()),
+                                list(decomposed.reduction_ir.schema.values()),
+                                chunk.stream,
+                            ),
                             context=ir_context,
                         )
-                        table_chunk = TableChunk.from_pylibcudf_table(
-                            df.table, df.stream, exclusive_view=True
-                        )
+                        del chunk
                         await ch_out.data.send(
-                            context, Message(sequence_num, table_chunk)
+                            context,
+                            Message(
+                                sequence_num,
+                                TableChunk.from_pylibcudf_table(
+                                    df.table, df.stream, exclusive_view=True
+                                ),
+                            ),
                         )
-                        del df, table_chunk
+                        del df
                     sequence_num += 1
 
     # Handle post-allgather if needed
@@ -691,6 +700,7 @@ async def _tree_groupby(
                 ),
             ),
         )
+        del df
 
     await ch_out.data.drain(context)
 
@@ -792,7 +802,6 @@ async def groupby_node(
         # Pre-shuffle if needed (e.g., for n_unique)
         schema_keys = list(ir.schema.keys())
         groupby_key_indices = tuple(schema_keys.index(k.name) for k in ir.keys)
-        first_chunk: TableChunk | None = None
         pre_shuffle: ShuffleManager | None = None
         my_preshuffle_ids = list(
             range(
@@ -801,7 +810,7 @@ async def groupby_node(
                 context.comm().nranks,
             )
         )
-        sample_first_chunk = True
+        max_sample_chunks = 1  # TODO: Make configurable
 
         if decomposed.need_preshuffle:
             pre_shuffle = ShuffleManager(
@@ -820,37 +829,51 @@ async def groupby_node(
             shuffled = True
             await pre_shuffle.insert_finished()
 
-            # Sample first chunk from pre-shuffle
-            if sample_first_chunk and my_preshuffle_ids:
+        # Sample chunks for size estimation and pre-processing
+        initial_chunks: list[TableChunk] = []
+        sample_count = min(
+            max_sample_chunks,
+            len(my_preshuffle_ids) if pre_shuffle is not None else input_metadata.count,
+        )
+
+        if pre_shuffle is not None:
+            # Sample chunks from pre-shuffle
+            for i in range(sample_count):
                 stream = ir_context.get_cuda_stream()
-                first_chunk = TableChunk.from_pylibcudf_table(
-                    await pre_shuffle.extract_chunk(my_preshuffle_ids[0], stream),
+                chunk = TableChunk.from_pylibcudf_table(
+                    await pre_shuffle.extract_chunk(my_preshuffle_ids[i], stream),
                     stream,
                     exclusive_view=True,
                 )
-        elif sample_first_chunk:
-            # Sample first chunk from input channel
-            msg = await ch_in.data.recv(context)
-            if msg is not None:
-                first_chunk = TableChunk.from_message(msg)
+                initial_chunks.append(chunk)
+        else:
+            # Sample chunks from input channel
+            for _ in range(sample_count):
+                msg = await ch_in.data.recv(context)
+                if msg is None:
+                    break
+                initial_chunks.append(TableChunk.from_message(msg))
                 del msg
 
-        # Apply piecewise groupby to first chunk for size estimation
-        first_pwise_size: int | None = None
-        if first_chunk is not None:
-            first_chunk = first_chunk.make_available_and_spill(
+        # Apply piecewise groupby to sampled chunks for size estimation
+        sample_pwise_size: int | None = None
+        total_pwise_size = 0
+        for i in range(len(initial_chunks)):
+            initial_chunks[i] = initial_chunks[i].make_available_and_spill(
                 context.br(), allow_overbooking=True
             )
             with opaque_reservation(
-                context, first_chunk.data_alloc_size(MemoryType.DEVICE)
+                context, initial_chunks[i].data_alloc_size(MemoryType.DEVICE)
             ):
-                first_chunk = await asyncio.to_thread(
+                initial_chunks[i] = await asyncio.to_thread(
                     apply_do_evaluate,
-                    first_chunk,
+                    initial_chunks[i],
                     decomposed.piecewise_ir,
                     ir_context,
                 )
-            first_pwise_size = first_chunk.data_alloc_size(MemoryType.DEVICE)
+            total_pwise_size += initial_chunks[i].data_alloc_size(MemoryType.DEVICE)
+        if initial_chunks:
+            sample_pwise_size = total_pwise_size // len(initial_chunks)
 
         # Strategy 3: Shuffle-based groupby
         if output_count > 1 and not shuffled:
@@ -863,7 +886,7 @@ async def groupby_node(
                 output_count,
                 collective_ids.pop(),
                 groupby_key_columns,
-                first_chunk,
+                initial_chunks,
             )
             return
 
@@ -879,8 +902,8 @@ async def groupby_node(
             collective_ids,
             groupby_n_ary,
             target_partition_size,
-            first_chunk,
-            first_pwise_size,
+            initial_chunks,
+            sample_pwise_size,
             shuffled,
             pre_shuffle,
             my_preshuffle_ids,
