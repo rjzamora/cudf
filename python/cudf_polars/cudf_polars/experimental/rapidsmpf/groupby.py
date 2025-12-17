@@ -299,7 +299,13 @@ async def _allgather_groupby(
             allgather.insert(seq_num, TableChunk.from_message(msg))
             seq_num += 1
         allgather.insert_finished()
-        chunks.append(await allgather.extract_concatenated(stream))
+        chunks.append(
+            TableChunk.from_pylibcudf_table(
+                await allgather.extract_concatenated(stream),
+                stream,
+                exclusive_view=True,
+            )
+        )
         input_bytes += chunks[-1].data_alloc_size(MemoryType.DEVICE)
     else:
         while (msg := await ch_in.data.recv(context)) is not None:
@@ -335,7 +341,7 @@ async def _allgather_groupby(
                 Message(
                     0,
                     TableChunk.from_pylibcudf_table(
-                        df.table, chunk.stream, exclusive_view=True
+                        df.table, df.stream, exclusive_view=True
                     ),
                 ),
             )
