@@ -160,7 +160,7 @@ async def shuffle_node(
         context, ch_in.metadata, ch_in.data, ch_out.metadata, ch_out.data
     ):
         # Receive and send updated metadata.
-        _ = await ch_in.recv_metadata(context)
+        input_metadata = await ch_in.recv_metadata(context)
         column_names = list(ir.schema.keys())
         partitioned_on = tuple(column_names[i] for i in columns_to_hash)
         output_metadata = Metadata(
@@ -168,6 +168,17 @@ async def shuffle_node(
             partitioned_on=partitioned_on,
         )
         await ch_out.send_metadata(context, output_metadata)
+
+        # Handle case that we are already shuffled
+        if (
+            input_metadata.partitioned_on == partitioned_on
+            and input_metadata.count == output_metadata.count
+        ):
+            while (msg := await ch_in.data.recv(context)) is not None:
+                await ch_out.data.send(context, msg)
+                del msg
+            await ch_out.data.drain(context)
+            return
 
         # Create ShuffleManager instance
         shuffle = ShuffleManager(

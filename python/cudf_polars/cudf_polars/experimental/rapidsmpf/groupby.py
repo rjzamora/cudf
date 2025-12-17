@@ -473,7 +473,7 @@ async def _tree_groupby(
     ch_in: ChannelPair,
     input_metadata: Metadata,
     output_count: int,
-    collective_id: int | None,
+    collective_ids: list[int],
     groupby_n_ary: int,
     target_partition_size: int,
     first_chunk: TableChunk | None,
@@ -504,8 +504,8 @@ async def _tree_groupby(
         Metadata from the input channel.
     output_count
         The number of output partitions.
-    collective_id
-        The collective ID for optional post-allgather.
+    collective_ids
+        The collective IDs for optional post-allgather.
     groupby_n_ary
         The N-ary factor for tree reduction.
     target_partition_size
@@ -532,9 +532,8 @@ async def _tree_groupby(
         and not input_metadata.duplicated
         and not shuffled
         and context.comm().nranks > 1
-        and collective_id is not None
     ):
-        post_allgather = AllGatherManager(context, collective_id)
+        post_allgather = AllGatherManager(context, collective_ids.pop())
 
     # Calculate tree parameters
     n = input_metadata.count
@@ -638,6 +637,7 @@ async def _tree_groupby(
                             df.table, df.stream, exclusive_view=True
                         )
                         post_allgather.insert(sequence_num, table_chunk)
+                        del df, table_chunk
                     else:
                         df = decomposed.select_ir.do_evaluate(
                             *decomposed.select_ir._non_child_args,
@@ -650,6 +650,7 @@ async def _tree_groupby(
                         await ch_out.data.send(
                             context, Message(sequence_num, table_chunk)
                         )
+                        del df, table_chunk
                     sequence_num += 1
 
     # Handle post-allgather if needed
@@ -864,7 +865,7 @@ async def groupby_node(
             ch_in,
             input_metadata,
             output_count,
-            collective_ids.pop() if collective_ids else None,
+            collective_ids,
             groupby_n_ary,
             target_partition_size,
             first_chunk,
