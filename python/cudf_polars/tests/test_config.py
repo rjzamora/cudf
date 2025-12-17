@@ -13,8 +13,10 @@ from polars.testing.asserts import assert_frame_equal
 
 import pylibcudf as plc
 import rmm
+from rmm._cuda import gpu
 from rmm.pylibrmm import CudaStreamFlags
 
+import cudf_polars.callback
 import cudf_polars.utils.config
 from cudf_polars.callback import default_memory_resource, set_memory_resource
 from cudf_polars.dsl.ir import DataFrameScan, IRExecutionContext
@@ -79,8 +81,21 @@ def test_unsupported_config_raises():
         q.collect(engine=pl.GPUEngine(unknown_key=True))
 
 
+def test_use_device_not_current(monkeypatch):
+    # This is testing the set/restore device functionality in callback
+    # for the case where the device to use is not the current device and no
+    # previous query has used a device.
+    monkeypatch.setattr(cudf_polars.callback, "SEEN_DEVICE", None)
+    monkeypatch.setattr(gpu, "setDevice", lambda arg: None)
+    # Fake that the current device is 1.
+    monkeypatch.setattr(gpu, "getDevice", lambda: 1)
+    q = pl.LazyFrame({})
+    assert_gpu_result_equal(q, engine=pl.GPUEngine(device=0))
+
+
 @pytest.mark.parametrize("device", [-1, "foo"])
-def test_invalid_device_raises(device):
+def test_invalid_device_raises(device, monkeypatch):
+    monkeypatch.setattr(cudf_polars.callback, "SEEN_DEVICE", None)
     q = pl.LazyFrame({})
     if POLARS_VERSION_LT_130:
         with pytest.raises(pl.exceptions.ComputeError):
@@ -93,8 +108,21 @@ def test_invalid_device_raises(device):
             q.collect(engine=pl.GPUEngine(device=device))
 
 
+def test_multiple_devices_in_same_process_raise(monkeypatch):
+    # A device we haven't already seen
+    monkeypatch.setattr(cudf_polars.callback, "SEEN_DEVICE", 4)
+    q = pl.LazyFrame({})
+    if POLARS_VERSION_LT_130:
+        with pytest.raises(pl.exceptions.ComputeError):
+            q.collect(engine=pl.GPUEngine())
+    else:
+        with pytest.raises(RuntimeError):
+            q.collect(engine=pl.GPUEngine())
+
+
 @pytest.mark.parametrize("mr", [1, object()])
-def test_invalid_memory_resource_raises(mr):
+def test_invalid_memory_resource_raises(mr, monkeypatch):
+    monkeypatch.setattr(cudf_polars.callback, "SEEN_DEVICE", None)
     q = pl.LazyFrame({})
     if POLARS_VERSION_LT_130:
         with pytest.raises(pl.exceptions.ComputeError):
@@ -206,6 +234,16 @@ def test_parquet_options(executor: str) -> None:
     )
     assert config.parquet_options.chunked is False
     assert config.parquet_options.n_output_chunks == 16
+
+
+def test_parquet_options_from_none() -> None:
+    config = ConfigOptions.from_polars_engine(
+        pl.GPUEngine(
+            executor="streaming",
+            parquet_options=None,
+        )
+    )
+    assert config.parquet_options.chunked is True
 
 
 def test_validate_streaming_executor_shuffle_method(
@@ -385,6 +423,25 @@ def test_validate_shuffle_method_defaults(
         )
 
 
+def test_validate_shuffle_insertion_method() -> None:
+    config = ConfigOptions.from_polars_engine(
+        pl.GPUEngine(
+            executor="streaming",
+            executor_options={"shuffler_insertion_method": "concat_insert"},
+        )
+    )
+    assert config.executor.name == "streaming"
+    assert config.executor.shuffler_insertion_method == "concat_insert"
+
+    with pytest.raises(ValueError, match="is not a valid ShufflerInsertionMethod"):
+        ConfigOptions.from_polars_engine(
+            pl.GPUEngine(
+                executor="streaming",
+                executor_options={"shuffler_insertion_method": object()},
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "option",
     [
@@ -431,6 +488,7 @@ def test_parquet_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PASS_READ_LIMIT", "200")
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__MAX_FOOTER_SAMPLES", "0")
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__MAX_ROW_GROUP_SAMPLES", "0")
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__USE_RAPIDSMPF_NATIVE", "0")
 
         # Test default
         engine = pl.GPUEngine()
@@ -441,6 +499,7 @@ def test_parquet_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         assert config.parquet_options.pass_read_limit == 200
         assert config.parquet_options.max_footer_samples == 0
         assert config.parquet_options.max_row_group_samples == 0
+        assert config.parquet_options.use_rapidsmpf_native is False
 
     with monkeypatch.context() as m:
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__CHUNKED", "foo")
@@ -463,6 +522,7 @@ def test_config_option_from_env(
         m.setenv("CUDF_POLARS__EXECUTOR__RAPIDSMPF_SPILL", "1")
         m.setenv("CUDF_POLARS__EXECUTOR__SINK_TO_DIRECTORY", "1")
         m.setenv("CUDF_POLARS__CUDA_STREAM_POLICY", "new")
+        m.setenv("CUDF_POLARS__EXECUTOR__SHUFFLER_INSERTION_METHOD", "concat_insert")
 
         if rapidsmpf_distributed_available:
             m.setenv("CUDF_POLARS__EXECUTOR__SHUFFLE_METHOD", "rapidsmpf")
@@ -482,6 +542,7 @@ def test_config_option_from_env(
         assert config.executor.rapidsmpf_spill is True
         assert config.executor.sink_to_directory is True
         assert config.cuda_stream_policy == CUDAStreamPolicy.NEW
+        assert config.executor.shuffler_insertion_method == "concat_insert"
 
         if rapidsmpf_distributed_available:
             assert config.executor.shuffle_method == "rapidsmpf"
@@ -537,6 +598,7 @@ def test_cardinality_factor_compat() -> None:
         "pass_read_limit",
         "max_footer_samples",
         "max_row_group_samples",
+        "use_rapidsmpf_native",
     ],
 )
 def test_validate_parquet_options(option: str) -> None:

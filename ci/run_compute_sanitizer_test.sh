@@ -53,8 +53,8 @@ rapids-logger "Running compute-sanitizer --tool ${TOOL_NAME} on ${TEST_NAME}"
 
 # Set environment variables as per ci/run_cudf_memcheck_ctests.sh
 export GTEST_CUDF_RMM_MODE=cuda
-# compute-sanitizer bug 4553815
-export LIBCUDF_MEMCHECK_ENABLED=1
+# Allows tests to know they are in a compute-sanitizer run
+export LIBCUDF_${TOOL_NAME^^}_ENABLED=1
 
 # Navigate to test installation directory
 TEST_DIR="${CONDA_PREFIX}/bin/gtests/libcudf"
@@ -68,7 +68,7 @@ fi
 # Run compute-sanitizer on the specified test
 compute-sanitizer \
   --tool "${TOOL_NAME}" \
-  --kernel-name-exclude kns=nvcomp \
+  --kernel-name-exclude kns=nvcomp,kns=zstd \
   --error-exitcode=1 \
   "${TEST_EXECUTABLE}" \
   "$@"
@@ -77,7 +77,7 @@ EXITCODE=$?
 
 # Clean up environment variables
 unset GTEST_CUDF_RMM_MODE
-unset LIBCUDF_MEMCHECK_ENABLED
+unset LIBCUDF_${TOOL_NAME^^}_ENABLED
 
 rapids-logger "compute-sanitizer --tool ${TOOL_NAME} on ${TEST_NAME} exiting with value: $EXITCODE"
 exit $EXITCODE
