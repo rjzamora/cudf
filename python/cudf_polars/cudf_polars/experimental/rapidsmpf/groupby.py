@@ -241,12 +241,12 @@ async def _partitionwise_groupby(
         chunk = TableChunk.from_message(msg).make_available_and_spill(
             context.br(), allow_overbooking=True
         )
+        seq_num = msg.sequence_number
+        del msg
         with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
-            result_chunk = await asyncio.to_thread(
-                apply_do_evaluate, chunk, ir, ir_context
-            )
-            await ch_out.data.send(context, Message(msg.sequence_number, result_chunk))
-            del chunk, msg
+            chunk = await asyncio.to_thread(apply_do_evaluate, chunk, ir, ir_context)
+            await ch_out.data.send(context, Message(seq_num, chunk))
+            del chunk
 
     await ch_out.data.drain(context)
 
@@ -297,6 +297,7 @@ async def _allgather_groupby(
         seq_num = 0
         while (msg := await ch_in.data.recv(context)) is not None:
             allgather.insert(seq_num, TableChunk.from_message(msg))
+            del msg
             seq_num += 1
         allgather.insert_finished()
         chunks.append(
@@ -312,6 +313,7 @@ async def _allgather_groupby(
             chunk = TableChunk.from_message(msg).make_available_and_spill(
                 context.br(), allow_overbooking=True
             )
+            del msg
             chunks.append(chunk)
             input_bytes += chunk.data_alloc_size(MemoryType.DEVICE)
 
@@ -420,13 +422,13 @@ async def _shuffle_groupby(
         )
         del msg
         with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
-            pwise_chunk = await asyncio.to_thread(
+            chunk = await asyncio.to_thread(
                 apply_do_evaluate,
                 chunk,
                 decomposed.piecewise_ir,
                 ir_context,
             )
-            shuffle.insert_chunk(pwise_chunk)
+            shuffle.insert_chunk(chunk)
             del chunk
 
     await shuffle.insert_finished()
@@ -446,20 +448,20 @@ async def _shuffle_groupby(
 
         with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
             # Apply reduction then selection
-            reduced_chunk = await asyncio.to_thread(
+            chunk = await asyncio.to_thread(
                 apply_do_evaluate,
                 chunk,
                 decomposed.reduction_ir,
                 ir_context,
             )
-            final_chunk = await asyncio.to_thread(
+            chunk = await asyncio.to_thread(
                 apply_do_evaluate,
-                reduced_chunk,
+                chunk,
                 decomposed.select_ir,
                 ir_context,
                 input_schema=decomposed.reduction_ir.schema,
             )
-            await ch_out.data.send(context, Message(partition_id, final_chunk))
+            await ch_out.data.send(context, Message(partition_id, chunk))
             del chunk
 
     await ch_out.data.drain(context)
@@ -546,10 +548,13 @@ async def _tree_groupby(
     # Tree reduction state
     done_receiving = False
     levels: defaultdict[int, list[DataFrame]] = defaultdict(list)
+    # Keep chunks alive while their DataFrame views are stored in levels[0]
+    level0_chunks: list[TableChunk] = []
     input_partition_idx = 0
 
     # Process first chunk if available
     if first_chunk is not None:
+        level0_chunks.append(first_chunk)
         levels[0].append(
             DataFrame.from_table(
                 first_chunk.table_view(),
@@ -569,7 +574,7 @@ async def _tree_groupby(
             # Extract from pre-shuffle
             if input_partition_idx < len(my_preshuffle_ids):
                 stream = ir_context.get_cuda_stream()
-                input_chunk = TableChunk.from_pylibcudf_table(
+                chunk = TableChunk.from_pylibcudf_table(
                     await pre_shuffle.extract_chunk(
                         my_preshuffle_ids[input_partition_idx], stream
                     ),
@@ -578,7 +583,7 @@ async def _tree_groupby(
                 )
                 chunk = await asyncio.to_thread(
                     apply_do_evaluate,
-                    input_chunk,
+                    chunk,
                     decomposed.piecewise_ir,
                     ir_context,
                 )
@@ -591,18 +596,21 @@ async def _tree_groupby(
             if msg is None:
                 done_receiving = True
             else:
-                input_chunk = TableChunk.from_message(msg).make_available_and_spill(
+                chunk = TableChunk.from_message(msg).make_available_and_spill(
                     context.br(), allow_overbooking=True
                 )
+                del msg
                 chunk = await asyncio.to_thread(
                     apply_do_evaluate,
-                    input_chunk,
+                    chunk,
                     decomposed.piecewise_ir,
                     ir_context,
                 )
                 input_partition_idx += 1
 
         if chunk is not None:
+            # Store chunk to keep it alive while its DataFrame view is in levels[0]
+            level0_chunks.append(chunk)
             levels[0].append(
                 DataFrame.from_table(
                     chunk.table_view(),
@@ -626,6 +634,9 @@ async def _tree_groupby(
                         ),
                         context=ir_context,
                     )
+                    # After _concat, data is copied so we can release level 0 chunks
+                    if level == 0:
+                        level0_chunks.clear()
                     levels[next_level].append(df)
 
                 if level == level_count - 1 and (output_count > 1 or done_receiving):
