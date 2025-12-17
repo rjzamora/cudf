@@ -120,7 +120,12 @@ def test_groupby_fallback(df, engine, fallback_mode):
 
     q = df.group_by("y").median()
 
-    if fallback_mode == "silent":
+    if fallback_mode == "foo":
+        ctx = pytest.raises(
+            pl.exceptions.ComputeError,
+            match="'foo' is not a valid StreamingFallbackMode",
+        )
+    elif fallback_mode == "silent" or DEFAULT_RUNTIME == "rapidsmpf":
         ctx = contextlib.nullcontext()
     elif fallback_mode == "raise":
         ctx = pytest.raises(
@@ -128,11 +133,6 @@ def test_groupby_fallback(df, engine, fallback_mode):
             if POLARS_VERSION_LT_130
             else NotImplementedError,
             match=match,
-        )
-    elif fallback_mode == "foo":
-        ctx = pytest.raises(
-            pl.exceptions.ComputeError,
-            match="'foo' is not a valid StreamingFallbackMode",
         )
     else:
         ctx = pytest.warns(UserWarning, match=match)

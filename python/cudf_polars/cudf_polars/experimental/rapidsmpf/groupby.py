@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -287,6 +286,8 @@ async def _allgather_groupby(
     output_metadata = Metadata(1, duplicated=input_metadata.duplicated)
     await ch_out.send_metadata(context, output_metadata)
 
+    # Collect chunks (allgather if needed for multi-rank)
+    input_bytes = 0
     chunks: list[TableChunk] = []
     need_allgather = not input_metadata.duplicated and context.comm().nranks > 1
 
@@ -297,62 +298,50 @@ async def _allgather_groupby(
         while (msg := await ch_in.data.recv(context)) is not None:
             allgather.insert(seq_num, TableChunk.from_message(msg))
             seq_num += 1
-            del msg
         allgather.insert_finished()
-        chunks.append(
-            TableChunk.from_pylibcudf_table(
-                await allgather.extract_concatenated(stream),
-                stream,
-                exclusive_view=True,
-            )
-        )
+        chunks.append(await allgather.extract_concatenated(stream))
+        input_bytes += chunks[-1].data_alloc_size(MemoryType.DEVICE)
     else:
         while (msg := await ch_in.data.recv(context)) is not None:
             chunk = TableChunk.from_message(msg).make_available_and_spill(
                 context.br(), allow_overbooking=True
             )
             chunks.append(chunk)
+            input_bytes += chunk.data_alloc_size(MemoryType.DEVICE)
 
     if chunks:
-        estimated_size = sum(
-            chunk.data_alloc_size(MemoryType.DEVICE) for chunk in chunks
-        )
-        with opaque_reservation(context, estimated_size):
-            # Create DataFrames from chunks (these are views into chunk memory)
-            input_dfs = [
-                DataFrame.from_table(
-                    chunk.table_view(),
-                    list(ir.children[0].schema.keys()),
-                    list(ir.children[0].schema.values()),
-                    chunk.stream,
-                )
-                for chunk in chunks
-            ]
-            # Concatenate DataFrames.
-            # NOTE: When there's only one input, _concat returns it unchanged
-            # (no new memory allocated), so chunks must stay alive until after
-            # do_evaluate completes.
-            concat_df = _concat(*input_dfs, context=ir_context)
-            del input_dfs
-            # Apply groupby on concatenated data
+        with opaque_reservation(context, input_bytes):
+            multi_chunks = len(chunks) > 1
             df = ir.do_evaluate(
                 *ir._non_child_args,
-                concat_df,
+                _concat(
+                    *[
+                        DataFrame.from_table(
+                            chunk.table_view(),
+                            list(ir.children[0].schema.keys()),
+                            list(ir.children[0].schema.values()),
+                            chunk.stream,
+                        )
+                        for chunk in chunks
+                    ],
+                    context=ir_context,
+                ),
                 context=ir_context,
             )
-            # Safe to delete chunks after do_evaluate has produced the result
-            del concat_df
-            del chunks
+            if multi_chunks:
+                del chunks
             await ch_out.data.send(
                 context,
                 Message(
                     0,
                     TableChunk.from_pylibcudf_table(
-                        df.table, df.stream, exclusive_view=True
+                        df.table, chunk.stream, exclusive_view=True
                     ),
                 ),
             )
             del df
+            if not multi_chunks:
+                del chunks
 
     await ch_out.data.drain(context)
 
@@ -704,7 +693,6 @@ async def groupby_node(
     target_partition_size: int,
     output_count: int,
     collective_id: int,
-    fallback_mode: str,
 ) -> None:
     """
     Dynamic GroupBy node that selects the best strategy at runtime.
@@ -735,8 +723,6 @@ async def groupby_node(
         The output partition count.
     collective_id
         The collective ID for shuffle/allgather operations.
-    fallback_mode
-        The fallback mode for unsupported operations ("silent", "warn", or "raise").
     """
     collective_ids = [collective_id]
 
@@ -765,14 +751,7 @@ async def groupby_node(
         need_preconcat = ir.maintain_order
         try:
             decomposed = DecomposedGroupBy.from_groupby(ir)
-        except NotImplementedError as e:
-            # Inform user about fallback based on fallback_mode
-            msg = f"Failed to decompose groupby aggs for multiple partitions: {e}"
-            if fallback_mode == "raise":
-                raise NotImplementedError(msg) from e
-            elif fallback_mode == "warn":
-                warnings.warn(msg, stacklevel=2)
-            # Fall back to allgather strategy
+        except NotImplementedError:
             need_preconcat = True
             decomposed = None
 
@@ -923,7 +902,6 @@ def _(
             executor.target_partition_size,
             rec.state["partition_info"][ir].count,
             rec.state["collective_id_map"][ir],
-            executor.fallback_mode,
         )
     ]
 
