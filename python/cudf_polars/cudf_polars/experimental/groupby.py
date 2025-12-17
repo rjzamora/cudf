@@ -227,7 +227,10 @@ def _(
         smart_groupby_node = ir.reconstruct([child])
         # TODO: Use child_count and allow join_node to modify the count.
         # (Need AllReduce for GroupBy node to estimate the global output size)
-        partition_info[smart_groupby_node] = PartitionInfo(count=post_aggregation_count)
+        partition_info[smart_groupby_node] = PartitionInfo(
+            count=post_aggregation_count,
+            partitioned_on=ir.keys,
+        )
         return smart_groupby_node, partition_info
 
     new_node: IR
