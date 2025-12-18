@@ -543,7 +543,7 @@ async def _tree_groupby(
 
     # Calculate tree parameters
     n = input_metadata.count
-    if sample_pwise_size is not None:
+    if sample_pwise_size is not None and sample_pwise_size > 0:
         k = min(max(2, target_partition_size // sample_pwise_size), 1024)
     else:  # pragma: no cover
         k = groupby_n_ary
