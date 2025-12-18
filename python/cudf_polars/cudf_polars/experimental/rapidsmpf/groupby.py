@@ -283,13 +283,16 @@ async def _allgather_groupby(
     collective_id
         The collective ID for allgather.
     """
-    output_metadata = Metadata(1, duplicated=input_metadata.duplicated)
-    await ch_out.send_metadata(context, output_metadata)
-
     # Collect chunks (allgather if needed for multi-rank)
     input_bytes = 0
     chunks: list[TableChunk] = []
     need_allgather = not input_metadata.duplicated and context.comm().nranks > 1
+
+    # After allgather, all workers have identical data, so output is duplicated
+    output_metadata = Metadata(
+        1, duplicated=need_allgather or input_metadata.duplicated
+    )
+    await ch_out.send_metadata(context, output_metadata)
 
     if need_allgather:
         allgather = AllGatherManager(context, collective_id)
@@ -784,7 +787,7 @@ async def groupby_node(
             decomposed = None
 
         # Strategy 2: Allgather + local groupby
-        if need_preconcat or input_metadata.count == output_count == 1:
+        if need_preconcat:
             await _allgather_groupby(
                 context,
                 ir,
