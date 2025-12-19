@@ -180,7 +180,12 @@ async def dataframescan_node(
             local_offset = local_count * context.comm().rank
 
         # Send basic metadata
-        await ch_out.send_metadata(context, Metadata(max(1, local_count)))
+        await ch_out.send_metadata(
+            context,
+            Metadata(
+                local_count=max(1, local_count), global_count=max(1, global_count)
+            ),
+        )
 
         # Build list of IR slices to read
         ir_slices = []
@@ -461,7 +466,10 @@ async def scan_node(
                     )
 
         # Send basic metadata
-        await ch_out.send_metadata(context, Metadata(max(1, len(scans))))
+        await ch_out.send_metadata(
+            context,
+            Metadata(local_count=max(1, len(scans)), global_count=max(1, count)),
+        )
 
         # If there is nothing to scan, drain the channel and return
         if len(scans) == 0:
@@ -627,7 +635,8 @@ def _(
     ir: Scan, rec: SubNetGenerator
 ) -> tuple[dict[IR, list[Any]], dict[IR, ChannelManager]]:
     config_options = rec.state["config_options"]
-    assert config_options.executor.name == "streaming", (
+    executor = rec.state["config_options"].executor
+    assert executor.name == "streaming", (
         "'in-memory' executor not supported in 'generate_ir_sub_network'"
     )
     parquet_options = config_options.parquet_options
@@ -673,15 +682,14 @@ def _(
         metadata_node = metadata_feeder_node(
             rec.state["context"],
             ch_pair,
-            Metadata(partition_info.count),
+            Metadata(
+                local_count=partition_info.count, global_count=partition_info.count
+            ),
         )
         nodes[ir] = [metadata_node, native_node]
     else:
         # Fall back to scan_node (predicate not convertible, or other constraint)
         parquet_options = dataclasses.replace(parquet_options, chunked=False)
-        # Use target_partition_size as the estimated chunk size
-        executor = rec.state["config_options"].executor
-        estimated_chunk_bytes = getattr(executor, "target_partition_size", 1 << 28)
 
         nodes[ir] = [
             scan_node(
@@ -692,7 +700,7 @@ def _(
                 num_producers=num_producers,
                 plan=plan,
                 parquet_options=parquet_options,
-                estimated_chunk_bytes=estimated_chunk_bytes,
+                estimated_chunk_bytes=executor.target_partition_size,
             )
         ]
     return nodes, channels
