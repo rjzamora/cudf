@@ -6,11 +6,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from rapidsmpf.communicator.single import new_communicator as new_single_communicator
 from rapidsmpf.integrations.cudf.partition import (
     partition_and_pack as py_partition_and_pack,
     unpack_and_concat as py_unpack_and_concat,
 )
 from rapidsmpf.streaming.coll.shuffler import ShufflerAsync
+from rapidsmpf.streaming.core.context import Context
 from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.core.node import define_py_node
 from rapidsmpf.streaming.cudf.table_chunk import TableChunk
@@ -27,8 +29,6 @@ from cudf_polars.experimental.rapidsmpf.utils import (
 from cudf_polars.experimental.shuffle import Shuffle
 
 if TYPE_CHECKING:
-    from rapidsmpf.streaming.core.context import Context
-
     import pylibcudf as plc
     from rmm.pylibrmm.stream import Stream
 
@@ -51,6 +51,8 @@ class ShuffleManager:
         The columns to hash.
     collective_id: int
         The collective ID.
+    local: bool
+        Whether to use a single-rank communicator.
     """
 
     def __init__(
@@ -59,12 +61,26 @@ class ShuffleManager:
         num_partitions: int,
         columns_to_hash: tuple[int, ...],
         collective_id: int,
+        *,
+        local: bool = False,
     ):
         self.context = context
         self.num_partitions = num_partitions
         self.columns_to_hash = columns_to_hash
+
+        # For local shuffle, create a context with a single-rank communicator
+        if local:
+            local_comm = new_single_communicator(context.options())
+            self._local_context: Context | None = Context(
+                local_comm, context.br(), context.options()
+            )
+            shuffle_context = self._local_context
+        else:
+            self._local_context = None
+            shuffle_context = context
+
         self.shuffler = ShufflerAsync(
-            context,
+            shuffle_context,
             collective_id,
             num_partitions,
         )
@@ -170,10 +186,10 @@ async def shuffle_node(
         )
         await ch_out.send_metadata(context, output_metadata)
 
-        # Handle case that we are already shuffled
+        # Handle case that we are already shuffled on the same keys
         if (
-            input_metadata.partitioned_on == partitioned_on
-            and input_metadata.count == output_metadata.count
+            input_metadata.global_partitioned_on == global_partitioned_on
+            and input_metadata.global_count == output_metadata.global_count
         ):
             while (msg := await ch_in.data.recv(context)) is not None:
                 await ch_out.data.send(context, msg)
