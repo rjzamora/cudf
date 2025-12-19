@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any, cast
 
+from rapidsmpf.memory.buffer import MemoryType
 from rapidsmpf.streaming.core.fanout import FanoutPolicy, fanout
 from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.core.node import define_py_node
