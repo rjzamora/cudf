@@ -8,7 +8,7 @@ import asyncio
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from rapidsmpf.memory.buffer import MemoryType
 from rapidsmpf.streaming.core.message import Message
@@ -555,7 +555,6 @@ async def _tree_groupby(
     target_partition_size: int,
     initial_chunks: list[TableChunk],
     sample_pwise_size: int | None,
-    shuffled: bool,  # noqa: FBT001
     pre_shuffle: ShuffleManager | None,
     my_preshuffle_ids: list[int],
 ) -> None:
@@ -591,8 +590,6 @@ async def _tree_groupby(
         Pre-processed chunks to start with (list is cleared after consumption).
     sample_pwise_size
         Average size of sampled chunks after piecewise groupby (for k estimation).
-    shuffled
-        Whether data was pre-shuffled.
     pre_shuffle
         Optional pre-shuffle manager if data was pre-shuffled.
     my_preshuffle_ids
@@ -604,14 +601,10 @@ async def _tree_groupby(
     # Post-allgather is needed when:
     # - global_output_count == 1 (must produce single duplicated chunk)
     # - Data is NOT duplicated (each rank has different data)
-    # - Data is NOT shuffled on groupby keys (groups may span ranks)
     # - Multiple ranks exist
     post_allgather: AllGatherManager | None = None
     need_post_allgather = (
-        global_output_count == 1
-        and not input_metadata.duplicated
-        and not shuffled
-        and nranks > 1
+        global_output_count == 1 and not input_metadata.duplicated and nranks > 1
     )
 
     if need_post_allgather:
@@ -839,7 +832,7 @@ async def groupby_node(
     groupby_n_ary: int,
     target_partition_size: int,
     output_count: int,
-    collective_id: int,
+    collective_ids: list[int],
 ) -> None:
     """
     Dynamic GroupBy node that selects the best strategy at runtime.
@@ -868,11 +861,9 @@ async def groupby_node(
         The target partition size in bytes.
     output_count
         The output partition count.
-    collective_id
-        The collective ID for shuffle/allgather operations.
+    collective_ids
+        The collective IDs for shuffle/allgather operations.
     """
-    collective_ids = [collective_id]
-
     async with shutdown_on_error(
         context,
         ch_in.metadata,
@@ -899,6 +890,7 @@ async def groupby_node(
 
         # Try to decompose the aggregation for multi-phase execution
         need_preconcat = ir.maintain_order
+        need_preshuffle: Literal["local", "global", None] = None
         try:
             decomposed = DecomposedGroupBy.from_groupby(ir)
         except NotImplementedError:
@@ -909,7 +901,23 @@ async def groupby_node(
         # Algorithm Selection
         # =====================================================================
 
-        if can_skip_global_comm:
+        if (
+            input_metadata.global_count is not None
+            and input_metadata.global_count > 1
+            and decomposed
+            and decomposed.need_preshuffle
+        ):
+            # Update need_preshuffle based on the partitioning status
+            # and fall through to tree groupby below
+            if can_skip_global_comm:
+                if not locally_partitioned:
+                    need_preshuffle = "local"
+                # else: already locally partitioned, no preshuffle needed
+            elif not globally_partitioned:
+                need_preshuffle = "global"
+            # else: already globally partitioned, no preshuffle needed
+
+        if can_skip_global_comm and need_preshuffle is None:
             # No global communication needed
             if output_count == 1:
                 # Reduce to single chunk per rank
@@ -1046,23 +1054,35 @@ async def groupby_node(
             input_schema_keys.index(k) for k in shuffleable_keys
         )
         pre_shuffle: ShuffleManager | None = None
-        shuffled = globally_partitioned
-        my_preshuffle_ids = list(
-            range(
-                context.comm().rank,
-                input_metadata.local_count,
-                nranks,
-            )
-        )
         max_sample_chunks = 1  # TODO: Make configurable
 
-        # Can only pre-shuffle if we have keys that exist in the input schema
-        if decomposed.need_preshuffle and groupby_key_indices:
+        # Calculate partition IDs for this rank after preshuffle
+        global_count = input_metadata.global_count or input_metadata.local_count
+        if need_preshuffle == "local":
+            # Local preshuffle: each rank extracts all local partitions
+            my_preshuffle_ids = list(range(input_metadata.local_count))
+        elif need_preshuffle == "global":
+            # Global preshuffle: each rank extracts its share of global partitions
+            my_preshuffle_ids = list(
+                range(
+                    context.comm().rank,
+                    global_count,
+                    nranks,
+                )
+            )
+        else:
+            my_preshuffle_ids = []
+
+        # Set up pre-shuffle if needed and we have shuffleable keys
+        if need_preshuffle is not None and groupby_key_indices:
             pre_shuffle = ShuffleManager(
                 context,
-                input_metadata.local_count,
+                input_metadata.local_count
+                if need_preshuffle == "local"
+                else global_count,
                 groupby_key_indices,
                 collective_ids.pop(),
+                local=need_preshuffle == "local",
             )
             while (msg := await ch_in.data.recv(context)) is not None:
                 pre_shuffle.insert_chunk(
@@ -1071,7 +1091,6 @@ async def groupby_node(
                     )
                 )
                 del msg
-            shuffled = True
             await pre_shuffle.insert_finished()
 
         # Sample chunks for size estimation and pre-processing
@@ -1135,7 +1154,6 @@ async def groupby_node(
             target_partition_size,
             initial_chunks,
             sample_pwise_size,
-            shuffled,
             pre_shuffle,
             my_preshuffle_ids,
         )

@@ -134,7 +134,7 @@ def evaluate_pipeline(
     partition_info: MutableMapping[IR, PartitionInfo],
     config_options: ConfigOptions,
     stats: StatsCollector,
-    collective_id_map: dict[IR, int],
+    collective_id_map: dict[IR, list[int]],
     rmpf_context: Context | None = None,
     *,
     collect_metadata: bool = False,
@@ -401,7 +401,7 @@ def generate_network(
     stats: StatsCollector,
     *,
     ir_context: IRExecutionContext,
-    collective_id_map: dict[IR, int],
+    collective_id_map: dict[IR, list[int]],
     metadata_collector: list[Metadata] | None,
 ) -> tuple[list[Any], DeferredMessages]:
     """

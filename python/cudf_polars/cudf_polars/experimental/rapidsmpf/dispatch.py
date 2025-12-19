@@ -86,7 +86,7 @@ class GenState(TypedDict):
     ir_context: IRExecutionContext
     max_io_threads: int
     stats: StatsCollector
-    collective_id_map: dict[IR, int]
+    collective_id_map: dict[IR, list[int]]
 
 
 SubNetGenerator: TypeAlias = GenericTransformer[

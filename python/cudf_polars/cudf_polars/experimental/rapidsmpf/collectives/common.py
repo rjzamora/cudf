@@ -68,20 +68,29 @@ class ReserveOpIDs:
             for node in traversal([ir])
             if isinstance(node, (Shuffle, Join, Repartition, GroupBy))
         ]
-        self.collective_id_map: dict[IR, int] = {}
+        self.collective_id_map: dict[IR, list[int]] = {}
 
-    def __enter__(self) -> dict[IR, int]:
+    def __enter__(self) -> dict[IR, list[int]]:
         """
         Reserve collective IDs and return the mapping.
 
         Returns
         -------
-        collective_id_map : dict[IR, int]
+        collective_id_map : dict[IR, list[int]]
             Mapping from IR nodes to their reserved collective IDs.
+            GroupBy nodes get 2 IDs (for preshuffle + post-allgather),
+            other nodes get 1 ID.
         """
-        # Reserve IDs and map nodes directly to their IDs
+        # Reserve IDs and map nodes to their IDs
         for node in self.collective_nodes:
-            self.collective_id_map[node] = _get_new_collective_id()
+            if isinstance(node, GroupBy):
+                # GroupBy may need 2 IDs (preshuffle + post-allgather)
+                self.collective_id_map[node] = [
+                    _get_new_collective_id(),
+                    _get_new_collective_id(),
+                ]
+            else:
+                self.collective_id_map[node] = [_get_new_collective_id()]
 
         return self.collective_id_map
 
@@ -92,6 +101,7 @@ class ReserveOpIDs:
         exc_tb: TracebackType | None,
     ) -> Literal[False]:
         """Release all reserved collective IDs back to the vacancy pool."""
-        for collective_id in self.collective_id_map.values():
-            _release_collective_id(collective_id)
+        for collective_ids in self.collective_id_map.values():
+            for collective_id in collective_ids:
+                _release_collective_id(collective_id)
         return False
