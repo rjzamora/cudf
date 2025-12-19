@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from rapidsmpf.communicator.single import new_communicator as new_single_communicator
+from rapidsmpf.communicator.single import new_communicator
 from rapidsmpf.integrations.cudf.partition import (
     partition_and_pack as py_partition_and_pack,
     unpack_and_concat as py_unpack_and_concat,
@@ -70,7 +70,7 @@ class ShuffleManager:
 
         # For local shuffle, create a context with a single-rank communicator
         if local:
-            local_comm = new_single_communicator(context.options())
+            local_comm = new_communicator(context.options())
             self._local_context: Context | None = Context(
                 local_comm, context.br(), context.options()
             )
