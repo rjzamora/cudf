@@ -357,30 +357,29 @@ async def _concat_groupby(
     if chunks:
         with opaque_reservation(context, input_bytes):
             multi_chunks = len(chunks) > 1
-
-            def _do_concat_and_evaluate() -> DataFrame:
-                return ir.do_evaluate(
-                    *ir._non_child_args,
-                    _concat(
-                        *[
-                            DataFrame.from_table(
-                                chunk.table_view(),
-                                list(ir.children[0].schema.keys()),
-                                list(ir.children[0].schema.values()),
-                                chunk.stream,
-                            )
-                            for chunk in chunks
-                        ],
-                        context=ir_context,
-                    ),
-                    context=ir_context,
-                )
-
-            df = await asyncio.to_thread(_do_concat_and_evaluate)
+            input_schema = ir.children[0].schema
+            # Concat and evaluate
+            concatenated = await asyncio.to_thread(
+                _concat,
+                *[
+                    DataFrame.from_table(
+                        chunk.table_view(),
+                        list(input_schema.keys()),
+                        list(input_schema.values()),
+                        chunk.stream,
+                    )
+                    for chunk in chunks
+                ],
+                context=ir_context,
+            )
             # When multi_chunks, _concat creates a new table so we can release inputs.
-            # When single chunk, df may share memory with chunk, so wait until after send.
+            # When single chunk, concatenated may share memory with chunk.
             if multi_chunks:
                 del chunks
+            df = await asyncio.to_thread(
+                ir.do_evaluate, *ir._non_child_args, concatenated, context=ir_context
+            )
+            del concatenated
             await ch_out.data.send(
                 context,
                 Message(
@@ -709,39 +708,42 @@ async def _tree_groupby(
                         if level == 0
                         else decomposed.reduction_ir.schema
                     )
-                    # Pop chunks and convert to DataFrames for reduction
+                    # Pop chunks and build DataFrames for reduction
                     chunks_to_reduce = [levels[level].pop() for _ in range(count)]
+                    input_bytes = sum(
+                        c.data_alloc_size(MemoryType.DEVICE) for c in chunks_to_reduce
+                    )
 
-                    def _do_reduction(
-                        _schema: dict[str, Any] = level_schema,
-                        _chunks: list[TableChunk] = chunks_to_reduce,
-                    ) -> DataFrame:
-                        return decomposed.reduction_ir.do_evaluate(
-                            *decomposed.reduction_ir._non_child_args,
-                            _concat(
-                                *[
-                                    DataFrame.from_table(
-                                        c.table_view(),
-                                        list(_schema.keys()),
-                                        list(_schema.values()),
-                                        c.stream,
-                                    )
-                                    for c in _chunks
-                                ],
-                                context=ir_context,
-                            ),
+                    with opaque_reservation(context, input_bytes):
+                        concatenated = await asyncio.to_thread(
+                            _concat,
+                            *[
+                                DataFrame.from_table(
+                                    c.table_view(),
+                                    list(level_schema.keys()),
+                                    list(level_schema.values()),
+                                    c.stream,
+                                )
+                                for c in chunks_to_reduce
+                            ],
                             context=ir_context,
                         )
-
-                    df = await asyncio.to_thread(_do_reduction)
-                    del chunks_to_reduce
-                    # Convert result back to TableChunk for storage
-                    levels[next_level].append(
-                        TableChunk.from_pylibcudf_table(
-                            df.table, df.stream, exclusive_view=True
+                        del chunks_to_reduce
+                        df = await asyncio.to_thread(
+                            decomposed.reduction_ir.do_evaluate,
+                            *decomposed.reduction_ir._non_child_args,
+                            concatenated,
+                            context=ir_context,
                         )
-                    )
-                    del df
+                        del concatenated
+
+                        # Convert result back to TableChunk for storage
+                        levels[next_level].append(
+                            TableChunk.from_pylibcudf_table(
+                                df.table, df.stream, exclusive_view=True
+                            )
+                        )
+                        del df
 
                 if level == level_count - 1 and (
                     local_output_count > 1 or done_receiving
@@ -754,70 +756,53 @@ async def _tree_groupby(
                         del chunk
                     else:
                         # Apply selection and send
-                        def _do_selection(
-                            _chunk: TableChunk = chunk,
-                        ) -> DataFrame:
-                            return decomposed.select_ir.do_evaluate(
-                                *decomposed.select_ir._non_child_args,
-                                DataFrame.from_table(
-                                    _chunk.table_view(),
-                                    list(decomposed.reduction_ir.schema.keys()),
-                                    list(decomposed.reduction_ir.schema.values()),
-                                    _chunk.stream,
-                                ),
-                                context=ir_context,
+                        with opaque_reservation(
+                            context, chunk.data_alloc_size(MemoryType.DEVICE)
+                        ):
+                            chunk = await asyncio.to_thread(
+                                apply_do_evaluate,
+                                chunk,
+                                decomposed.select_ir,
+                                ir_context,
+                                input_schema=decomposed.reduction_ir.schema,
                             )
-
-                        df = await asyncio.to_thread(_do_selection)
-                        del chunk
-                        await ch_out.data.send(
-                            context,
-                            Message(
-                                sequence_num,
-                                TableChunk.from_pylibcudf_table(
-                                    df.table, df.stream, exclusive_view=True
-                                ),
-                            ),
-                        )
-                        del df
+                            await ch_out.data.send(
+                                context, Message(sequence_num, chunk)
+                            )
+                            del chunk
                     sequence_num += 1
 
     # Handle post-allgather if needed
     if post_allgather is not None:
         post_allgather.insert_finished()
         stream = ir_context.get_cuda_stream()
-        allgather_result = await post_allgather.extract_concatenated(stream)
-
-        def _do_final_reduction_and_selection(
-            _allgather_result: Any = allgather_result,
-        ) -> DataFrame:
-            return decomposed.select_ir.do_evaluate(
-                *decomposed.select_ir._non_child_args,
-                decomposed.reduction_ir.do_evaluate(
-                    *decomposed.reduction_ir._non_child_args,
-                    DataFrame.from_table(
-                        _allgather_result,
-                        list(decomposed.reduction_ir.schema.keys()),
-                        list(decomposed.reduction_ir.schema.values()),
-                        stream,
-                    ),
-                    context=ir_context,
-                ),
-                context=ir_context,
-            )
-
-        df = await asyncio.to_thread(_do_final_reduction_and_selection)
-        del allgather_result
-        await ch_out.data.send(
-            context,
-            Message(
-                0,
-                TableChunk.from_pylibcudf_table(
-                    df.table, df.stream, exclusive_view=True
-                ),
-            ),
+        allgather_chunk = TableChunk.from_pylibcudf_table(
+            await post_allgather.extract_concatenated(stream),
+            stream,
+            exclusive_view=True,
         )
-        del df
+
+        with opaque_reservation(
+            context, allgather_chunk.data_alloc_size(MemoryType.DEVICE)
+        ):
+            # Apply reduction
+            chunk = await asyncio.to_thread(
+                apply_do_evaluate,
+                allgather_chunk,
+                decomposed.reduction_ir,
+                ir_context,
+            )
+            del allgather_chunk
+            # Apply selection
+            chunk = await asyncio.to_thread(
+                apply_do_evaluate,
+                chunk,
+                decomposed.select_ir,
+                ir_context,
+                input_schema=decomposed.reduction_ir.schema,
+            )
+            await ch_out.data.send(context, Message(0, chunk))
+            del chunk
 
     await ch_out.data.drain(context)
 
