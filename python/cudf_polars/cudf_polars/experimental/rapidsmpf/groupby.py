@@ -472,16 +472,21 @@ async def _shuffle_groupby(
     ir_context: IRExecutionContext,
     ch_out: ChannelPair,
     ch_in: ChannelPair,
+    input_metadata: Metadata,
     output_count: int,
     collective_id: int,
     groupby_keys: tuple[str, ...],
-    initial_chunks: list[TableChunk],
+    initial_chunks: list[TableChunk] | None = None,
+    local: bool = False,  # noqa: FBT001, FBT002
 ) -> None:
     """
-    Execute groupby using shuffle-based redistribution.
+    Execute groupby using shuffle-based redistribution with decomposition.
 
-    Data is shuffled by groupby keys so that all rows with the same key
-    end up on the same partition, then a local groupby is applied.
+    Applies piecewise groupby before shuffle to minimize data transfer,
+    then applies reduction and selection after shuffle.
+
+    When local=True, uses a single-rank communicator for within-rank
+    repartitioning (data is already globally partitioned or duplicated).
 
     Parameters
     ----------
@@ -495,6 +500,8 @@ async def _shuffle_groupby(
         The output channel pair.
     ch_in
         The input channel pair.
+    input_metadata
+        Metadata from the input channel.
     output_count
         The global number of output partitions.
     collective_id
@@ -503,33 +510,55 @@ async def _shuffle_groupby(
         The groupby key column names.
     initial_chunks
         Pre-processed chunks to insert (list is cleared after consumption).
+    local
+        If True, use a local (single-rank) shuffle instead of global shuffle.
     """
     nranks = context.comm().nranks
 
-    # Send output metadata - after shuffle, data is globally partitioned on keys
-    output_metadata = Metadata(
-        local_count=max(1, math.ceil(output_count / nranks)),
-        global_count=output_count,
-        local_partitioned_on=groupby_keys,
-        global_partitioned_on=groupby_keys,
-        duplicated=False,
+    # Calculate local output count
+    local_output_count = (
+        output_count if local else max(1, math.ceil(output_count / nranks))
     )
+
+    # Send output metadata
+    if local:
+        # Local shuffle establishes local partitioning but preserves global partitioning
+        output_metadata = Metadata(
+            local_count=local_output_count,
+            global_count=output_count
+            if input_metadata.duplicated
+            else local_output_count * nranks,
+            local_partitioned_on=groupby_keys,
+            global_partitioned_on=input_metadata.global_partitioned_on,
+            duplicated=input_metadata.duplicated,
+        )
+    else:
+        # Global shuffle establishes both local and global partitioning
+        output_metadata = Metadata(
+            local_count=local_output_count,
+            global_count=output_count,
+            local_partitioned_on=groupby_keys,
+            global_partitioned_on=groupby_keys,
+            duplicated=False,
+        )
     await ch_out.send_metadata(context, output_metadata)
 
-    # Set up shuffle manager
+    # Set up shuffle manager using piecewise schema (we shuffle after piecewise groupby)
     pwise_schema_keys = list(decomposed.piecewise_ir.schema.keys())
     pwise_key_indices = tuple(pwise_schema_keys.index(key) for key in groupby_keys)
     shuffle = ShuffleManager(
         context,
-        output_count,
+        local_output_count if local else output_count,
         pwise_key_indices,
         collective_id,
+        local=local,
     )
 
     # Insert initial chunks (already piecewise-grouped) and release references
-    for chunk in initial_chunks:
-        shuffle.insert_chunk(chunk)
-    initial_chunks.clear()
+    if initial_chunks:
+        for chunk in initial_chunks:
+            shuffle.insert_chunk(chunk)
+        initial_chunks.clear()
 
     # Process remaining chunks: apply piecewise groupby and insert into shuffle
     while (msg := await ch_in.data.recv(context)) is not None:
@@ -550,11 +579,12 @@ async def _shuffle_groupby(
     await shuffle.insert_finished()
 
     # Extract shuffled chunks and apply reduction + selection
-    for partition_id in range(
-        context.comm().rank,
-        output_count,
-        context.comm().nranks,
-    ):
+    partition_range = (
+        range(local_output_count)
+        if local
+        else range(context.comm().rank, output_count, nranks)
+    )
+    for partition_id in partition_range:
         stream = ir_context.get_cuda_stream()
         chunk = TableChunk.from_pylibcudf_table(
             await shuffle.extract_chunk(partition_id, stream),
@@ -576,109 +606,6 @@ async def _shuffle_groupby(
                 decomposed.select_ir,
                 ir_context,
                 input_schema=decomposed.reduction_ir.schema,
-            )
-            await ch_out.data.send(context, Message(partition_id, chunk))
-            del chunk
-
-    await ch_out.data.drain(context)
-
-
-async def _local_shuffle_groupby(
-    context: Context,
-    ir: GroupBy,
-    ir_context: IRExecutionContext,
-    ch_out: ChannelPair,
-    ch_in: ChannelPair,
-    input_metadata: Metadata,
-    output_count: int,
-    collective_id: int,
-    groupby_keys: tuple[str, ...],
-) -> None:
-    """
-    Execute groupby using local shuffle-based redistribution.
-
-    Like _shuffle_groupby but uses a local (single-rank) communicator.
-    Used when data is already globally partitioned (or duplicated) but needs
-    local repartitioning by groupby keys to produce multiple output chunks.
-
-    Parameters
-    ----------
-    context
-        The rapidsmpf context.
-    ir
-        The GroupBy IR node.
-    ir_context
-        The IR execution context.
-    ch_out
-        The output channel pair.
-    ch_in
-        The input channel pair.
-    input_metadata
-        Metadata from the input channel.
-    output_count
-        The global number of output partitions.
-    collective_id
-        The collective ID for local shuffle.
-    groupby_keys
-        The groupby key column names.
-    """
-    nranks = context.comm().nranks
-
-    # Calculate local output count
-    local_output_count = max(1, math.ceil(output_count / nranks))
-
-    # Send output metadata - local shuffle establishes local partitioning
-    output_metadata = Metadata(
-        local_count=local_output_count,
-        global_count=output_count
-        if input_metadata.duplicated
-        else local_output_count * nranks,
-        local_partitioned_on=groupby_keys,
-        global_partitioned_on=input_metadata.global_partitioned_on,
-        duplicated=input_metadata.duplicated,
-    )
-    await ch_out.send_metadata(context, output_metadata)
-
-    # Set up local shuffle manager (single-rank communicator)
-    # Use INPUT schema (ir.children[0].schema) since we're shuffling input data
-    # Only include keys that exist in the input schema (exclude literal expressions)
-    input_schema_keys = list(ir.children[0].schema.keys())
-    shuffleable_keys = tuple(k for k in groupby_keys if k in input_schema_keys)
-    key_indices = tuple(input_schema_keys.index(key) for key in shuffleable_keys)
-    shuffle = ShuffleManager(
-        context,
-        local_output_count,
-        key_indices,
-        collective_id,
-        local=True,  # Use single-rank communicator
-    )
-
-    # Insert all input chunks into local shuffle
-    while (msg := await ch_in.data.recv(context)) is not None:
-        chunk = TableChunk.from_message(msg).make_available_and_spill(
-            context.br(), allow_overbooking=True
-        )
-        del msg
-        shuffle.insert_chunk(chunk)
-        del chunk
-
-    await shuffle.insert_finished()
-
-    # Extract shuffled chunks and apply groupby
-    for partition_id in range(local_output_count):
-        stream = ir_context.get_cuda_stream()
-        chunk = TableChunk.from_pylibcudf_table(
-            await shuffle.extract_chunk(partition_id, stream),
-            stream,
-            exclusive_view=True,
-        )
-
-        with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
-            chunk = await asyncio.to_thread(
-                apply_do_evaluate,
-                chunk,
-                ir,
-                ir_context,
             )
             await ch_out.data.send(context, Message(partition_id, chunk))
             del chunk
@@ -1082,17 +1009,25 @@ async def groupby_node(
                     return
                 else:
                     # D: Need local shuffle first
-                    await _local_shuffle_groupby(
-                        context,
-                        ir,
-                        ir_context,
-                        ch_out,
-                        ch_in,
-                        input_metadata,
-                        output_count,
-                        collective_ids.pop(),
-                        groupby_keys,
-                    )
+                    if decomposed is not None:
+                        # Use decomposed local shuffle
+                        await _shuffle_groupby(
+                            context,
+                            decomposed,
+                            ir_context,
+                            ch_out,
+                            ch_in,
+                            input_metadata,
+                            output_count,
+                            collective_ids.pop(),
+                            groupby_keys,
+                            local=True,
+                        )
+                    else:
+                        # Fall back to local concat (single output chunk)
+                        await _local_concat_groupby(
+                            context, ir, ir_context, ch_out, ch_in, input_metadata
+                        )
                     return
         else:
             # Need global communication
@@ -1148,6 +1083,7 @@ async def groupby_node(
                     ir_context,
                     ch_out,
                     ch_in,
+                    input_metadata,
                     output_count,
                     collective_ids.pop(),
                     groupby_keys,
