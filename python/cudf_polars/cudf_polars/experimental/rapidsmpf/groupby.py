@@ -377,6 +377,8 @@ async def _concat_groupby(
                 )
 
             df = await asyncio.to_thread(_do_concat_and_evaluate)
+            # When multi_chunks, _concat creates a new table so we can release inputs.
+            # When single chunk, df may share memory with chunk, so wait until after send.
             if multi_chunks:
                 del chunks
             await ch_out.data.send(
@@ -579,9 +581,9 @@ async def _tree_groupby(
     input_metadata
         Metadata from the input channel.
     global_output_count
-        The number of output chunks specified at the global planning stage.
+        The global output partition count from planning.
     collective_ids
-        The collective IDs for optional post-allgather.
+        Collective IDs for pre-shuffle and/or post-allgather (consumed as needed).
     groupby_n_ary
         The N-ary factor for tree reduction.
     target_partition_size
@@ -786,13 +788,15 @@ async def _tree_groupby(
         stream = ir_context.get_cuda_stream()
         allgather_result = await post_allgather.extract_concatenated(stream)
 
-        def _do_final_reduction_and_selection() -> DataFrame:
+        def _do_final_reduction_and_selection(
+            _allgather_result: Any = allgather_result,
+        ) -> DataFrame:
             return decomposed.select_ir.do_evaluate(
                 *decomposed.select_ir._non_child_args,
                 decomposed.reduction_ir.do_evaluate(
                     *decomposed.reduction_ir._non_child_args,
                     DataFrame.from_table(
-                        allgather_result,
+                        _allgather_result,
                         list(decomposed.reduction_ir.schema.keys()),
                         list(decomposed.reduction_ir.schema.values()),
                         stream,
@@ -803,6 +807,7 @@ async def _tree_groupby(
             )
 
         df = await asyncio.to_thread(_do_final_reduction_and_selection)
+        del allgather_result
         await ch_out.data.send(
             context,
             Message(
@@ -837,32 +842,11 @@ async def groupby_node(
     """
     Dynamic GroupBy node that selects the best strategy at runtime.
 
-    Chooses between four strategies based on input metadata:
-    1. Partition-wise: Data already shuffled on groupby keys
-    2. Allgather: Single output partition or maintain_order
-    3. Shuffle: Multiple output partitions, not already shuffled
-    4. Tree: N-ary tree reduction
-
-    Parameters
-    ----------
-    context
-        The context of the node.
-    ir
-        The GroupBy IR node.
-    ir_context
-        The IR execution context.
-    ch_out
-        The output channel pair.
-    ch_in
-        The input channel pair.
-    groupby_n_ary
-        The groupby n-ary factor for tree reduction.
-    target_partition_size
-        The target partition size in bytes.
-    output_count
-        The output partition count.
-    collective_ids
-        The collective IDs for shuffle/allgather operations.
+    Chooses between strategies based on input metadata:
+    - Partition-wise: Data already partitioned on groupby keys
+    - Concat: Concatenate all data (locally or via allgather) then groupby
+    - Shuffle: Redistribute data by groupby keys (locally or globally)
+    - Tree: N-ary tree reduction with optional pre-shuffle/post-allgather
     """
     async with shutdown_on_error(
         context,
