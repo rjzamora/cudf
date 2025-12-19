@@ -261,20 +261,25 @@ async def _partitionwise_groupby(
     await ch_out.data.drain(context)
 
 
-async def _allgather_groupby(
+async def _concat_groupby(
     context: Context,
     ir: GroupBy,
     ir_context: IRExecutionContext,
     ch_out: ChannelPair,
     ch_in: ChannelPair,
     input_metadata: Metadata,
-    collective_id: int,
+    collective_id: int | None = None,
+    local: bool = False,  # noqa: FBT001, FBT002
 ) -> None:
     """
-    Execute groupby by allgathering all data to each rank.
+    Execute groupby by concatenating all data first.
 
     Used when outputting a single partition or when data must be pre-concatenated
-    (e.g., maintain_order is True). Produces a single duplicated chunk.
+    (e.g., maintain_order is True or non-decomposable aggregation).
+
+    When local=False, uses allgather to collect data from all ranks first,
+    producing a single duplicated chunk. When local=True, only concatenates
+    local chunks without global communication.
 
     Parameters
     ----------
@@ -291,22 +296,38 @@ async def _allgather_groupby(
     input_metadata
         Metadata from the input channel.
     collective_id
-        The collective ID for allgather.
+        The collective ID for allgather (required when local=False).
+    local
+        If True, only concatenate local chunks without global communication.
     """
-    # Collect chunks (allgather if needed for multi-rank)
-    input_bytes = 0
-    chunks: list[TableChunk] = []
-    need_allgather = not input_metadata.duplicated and context.comm().nranks > 1
+    nranks = context.comm().nranks
 
-    # After allgather, all workers have identical data, so output is duplicated
-    output_metadata = Metadata(
-        local_count=1,
-        global_count=1,
-        duplicated=need_allgather or input_metadata.duplicated,
-    )
+    # Determine if allgather is needed (global concat with multi-rank non-duplicated data)
+    need_allgather = not local and not input_metadata.duplicated and nranks > 1
+
+    # Set output metadata
+    if need_allgather:
+        # After allgather, all workers have identical data
+        output_metadata = Metadata(
+            local_count=1,
+            global_count=1,
+            duplicated=True,
+        )
+    else:
+        # Local concat: single chunk per rank
+        output_metadata = Metadata(
+            local_count=1,
+            global_count=1 if input_metadata.duplicated else nranks,
+            duplicated=input_metadata.duplicated,
+        )
     await ch_out.send_metadata(context, output_metadata)
 
+    # Collect chunks
+    input_bytes = 0
+    chunks: list[TableChunk] = []
+
     if need_allgather:
+        assert collective_id is not None, "collective_id required for allgather"
         allgather = AllGatherManager(context, collective_id)
         stream = context.get_stream_from_pool()
         seq_num = 0
@@ -324,6 +345,7 @@ async def _allgather_groupby(
         )
         input_bytes += chunks[-1].data_alloc_size(MemoryType.DEVICE)
     else:
+        # Local collection only
         while (msg := await ch_in.data.recv(context)) is not None:
             chunk = TableChunk.from_message(msg).make_available_and_spill(
                 context.br(), allow_overbooking=True
@@ -331,99 +353,6 @@ async def _allgather_groupby(
             del msg
             chunks.append(chunk)
             input_bytes += chunk.data_alloc_size(MemoryType.DEVICE)
-
-    if chunks:
-        with opaque_reservation(context, input_bytes):
-            multi_chunks = len(chunks) > 1
-
-            def _do_concat_and_evaluate() -> DataFrame:
-                return ir.do_evaluate(
-                    *ir._non_child_args,
-                    _concat(
-                        *[
-                            DataFrame.from_table(
-                                chunk.table_view(),
-                                list(ir.children[0].schema.keys()),
-                                list(ir.children[0].schema.values()),
-                                chunk.stream,
-                            )
-                            for chunk in chunks
-                        ],
-                        context=ir_context,
-                    ),
-                    context=ir_context,
-                )
-
-            df = await asyncio.to_thread(_do_concat_and_evaluate)
-            if multi_chunks:
-                del chunks
-            await ch_out.data.send(
-                context,
-                Message(
-                    0,
-                    TableChunk.from_pylibcudf_table(
-                        df.table, df.stream, exclusive_view=True
-                    ),
-                ),
-            )
-            del df
-            if not multi_chunks:
-                del chunks
-
-    await ch_out.data.drain(context)
-
-
-async def _local_concat_groupby(
-    context: Context,
-    ir: GroupBy,
-    ir_context: IRExecutionContext,
-    ch_out: ChannelPair,
-    ch_in: ChannelPair,
-    input_metadata: Metadata,
-) -> None:
-    """
-    Execute groupby by concatenating all local data first.
-
-    Like _allgather_groupby but without allgather - used when data is already
-    confined to the rank (duplicated, globally partitioned, or single rank)
-    but we need to concatenate before groupby (e.g., maintain_order is True
-    or non-decomposable aggregation).
-
-    Parameters
-    ----------
-    context
-        The rapidsmpf context.
-    ir
-        The GroupBy IR node.
-    ir_context
-        The IR execution context.
-    ch_out
-        The output channel pair.
-    ch_in
-        The input channel pair.
-    input_metadata
-        Metadata from the input channel.
-    """
-    nranks = context.comm().nranks
-
-    # Output metadata: single chunk per rank
-    output_metadata = Metadata(
-        local_count=1,
-        global_count=1 if input_metadata.duplicated else nranks,
-        duplicated=input_metadata.duplicated,
-    )
-    await ch_out.send_metadata(context, output_metadata)
-
-    # Collect all local chunks
-    input_bytes = 0
-    chunks: list[TableChunk] = []
-    while (msg := await ch_in.data.recv(context)) is not None:
-        chunk = TableChunk.from_message(msg).make_available_and_spill(
-            context.br(), allow_overbooking=True
-        )
-        del msg
-        chunks.append(chunk)
-        input_bytes += chunk.data_alloc_size(MemoryType.DEVICE)
 
     if chunks:
         with opaque_reservation(context, input_bytes):
@@ -986,8 +915,14 @@ async def groupby_node(
                 # Reduce to single chunk per rank
                 if need_preconcat:
                     # B: Local concat + single groupby
-                    await _local_concat_groupby(
-                        context, ir, ir_context, ch_out, ch_in, input_metadata
+                    await _concat_groupby(
+                        context,
+                        ir,
+                        ir_context,
+                        ch_out,
+                        ch_in,
+                        input_metadata,
+                        local=True,
                     )
                     return
                 else:
@@ -1025,8 +960,14 @@ async def groupby_node(
                         )
                     else:
                         # Fall back to local concat (single output chunk)
-                        await _local_concat_groupby(
-                            context, ir, ir_context, ch_out, ch_in, input_metadata
+                        await _concat_groupby(
+                            context,
+                            ir,
+                            ir_context,
+                            ch_out,
+                            ch_in,
+                            input_metadata,
+                            local=True,
                         )
                     return
         else:
@@ -1034,7 +975,7 @@ async def groupby_node(
             if output_count == 1:
                 if need_preconcat:
                     # E: Allgather + local groupby
-                    await _allgather_groupby(
+                    await _concat_groupby(
                         context,
                         ir,
                         ir_context,
