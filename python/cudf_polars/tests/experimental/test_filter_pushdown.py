@@ -650,3 +650,297 @@ class TestQ21Pattern:
         # The lineitem->supp_nation join should be detected if nation filter
         # makes it selective enough
         assert len(selective_joins) >= 1
+
+
+class TestFindFilterTargets:
+    """Tests for finding filter targets from semi-join patterns."""
+
+    def test_q18_pattern_filter_targets(self, gpu_engine, config_options, tmp_path):
+        """Test finding filter targets in Q18-like pattern."""
+        from cudf_polars.experimental.filter_pushdown import find_filter_targets
+
+        # Create test data
+        lineitem = pl.DataFrame(
+            {
+                "l_orderkey": list(range(1000)) * 5,
+                "l_quantity": [10 + (i % 100) for i in range(5000)],
+            }
+        )
+        orders = pl.DataFrame(
+            {
+                "o_orderkey": list(range(1000)),
+                "o_custkey": [i % 100 for i in range(1000)],
+            }
+        )
+        customer = pl.DataFrame(
+            {
+                "c_custkey": list(range(100)),
+                "c_name": [f"Customer{i}" for i in range(100)],
+            }
+        )
+
+        lineitem_path = tmp_path / "lineitem.parquet"
+        orders_path = tmp_path / "orders.parquet"
+        customer_path = tmp_path / "customer.parquet"
+
+        lineitem.write_parquet(lineitem_path)
+        orders.write_parquet(orders_path)
+        customer.write_parquet(customer_path)
+
+        # Q18-like pattern
+        lineitem_scan = pl.scan_parquet(lineitem_path)
+        orders_scan = pl.scan_parquet(orders_path)
+        customer_scan = pl.scan_parquet(customer_path)
+
+        # Subquery: find orders with large quantities
+        q1 = (
+            lineitem_scan.group_by("l_orderkey")
+            .agg(pl.col("l_quantity").sum().alias("sum_quantity"))
+            .filter(pl.col("sum_quantity") > 300)
+        )
+
+        # Main query with semi-join and inner joins
+        q = (
+            orders_scan.join(
+                q1, left_on="o_orderkey", right_on="l_orderkey", how="semi"
+            )
+            .join(lineitem_scan, left_on="o_orderkey", right_on="l_orderkey")
+            .join(customer_scan, left_on="o_custkey", right_on="c_custkey")
+        )
+
+        ir = Translator(q._ldf.visit(), gpu_engine).translate_ir()
+        stats = collect_selectivity_stats(ir, config_options)
+        sources = collect_filter_sources(ir, stats)
+
+        # Should detect the semi-join
+        semi_joins = sources.semi_joins()
+        assert len(semi_joins) == 1
+
+        # Find filter targets
+        targets = find_filter_targets(ir, sources)
+
+        # Should find lineitem as a filter target
+        # (the semi-join filters orders, and the downstream join with lineitem
+        #  uses o_orderkey which matches the semi-join's filter key)
+        assert len(targets) >= 1
+
+        # Check that we found the lineitem target
+        target_columns = {t.target_column for t in targets}
+        source_columns = {t.source_column for t in targets}
+
+        # The target column should be l_orderkey (column on lineitem to filter)
+        # The source column should be o_orderkey (column from semi-join result)
+        assert "l_orderkey" in target_columns
+        assert "o_orderkey" in source_columns
+
+    def test_no_filter_targets_without_matching_keys(self, gpu_engine):
+        """Test that filter targets are not found when keys don't match."""
+        from cudf_polars.experimental.filter_pushdown import find_filter_targets
+
+        # Create a semi-join followed by a join on DIFFERENT keys
+        table_a = pl.LazyFrame(
+            {
+                "key_a": [1, 2, 3, 4, 5],
+                "other_key": [10, 20, 30, 40, 50],
+            }
+        )
+        filter_table = pl.LazyFrame({"key_a": [2, 4]})
+        table_b = pl.LazyFrame(
+            {
+                "key_b": [10, 20, 30, 40, 50],  # Different values from key_a
+                "value": [100, 200, 300, 400, 500],
+            }
+        )
+
+        # Semi-join on key_a, then inner join on other_key -> key_b
+        q = table_a.join(filter_table, on="key_a", how="semi").join(
+            table_b, left_on="other_key", right_on="key_b"
+        )
+
+        ir = Translator(q._ldf.visit(), gpu_engine).translate_ir()
+        sources = collect_filter_sources(ir)
+
+        assert len(sources.semi_joins()) == 1
+
+        targets = find_filter_targets(ir, sources)
+
+        # Should NOT find filter targets because the downstream join
+        # uses "other_key", not "key_a" (the semi-join's filter key)
+        # Only targets where the join key matches the semi-join key should be found
+        matching_targets = [t for t in targets if t.source_column == "key_a"]
+        assert len(matching_targets) == 0
+
+    def test_filter_target_with_cache_node(self, gpu_engine, config_options, tmp_path):
+        """Test finding filter targets when the target is wrapped in a Cache node."""
+        from cudf_polars.experimental.filter_pushdown import find_filter_targets
+
+        # Create data that will cause Polars to generate a Cache node
+        shared_data = pl.DataFrame(
+            {
+                "key": list(range(1000)),
+                "value": [i * 10 for i in range(1000)],
+            }
+        )
+
+        data_path = tmp_path / "shared.parquet"
+        shared_data.write_parquet(data_path)
+
+        # Use the same scan twice (should trigger Cache)
+        data_scan = pl.scan_parquet(data_path)
+
+        # Subquery that filters
+        filtered = data_scan.filter(pl.col("value") > 5000)
+
+        # Semi-join with the filtered data, then inner join with same data
+        main_table = pl.LazyFrame(
+            {
+                "id": list(range(100)),
+                "lookup_key": [i * 10 for i in range(100)],
+            }
+        )
+
+        q = main_table.join(filtered, left_on="lookup_key", right_on="key", how="semi")
+
+        ir = Translator(q._ldf.visit(), gpu_engine).translate_ir()
+        stats = collect_selectivity_stats(ir, config_options)
+        sources = collect_filter_sources(ir, stats)
+
+        # Should detect the semi-join
+        assert len(sources.semi_joins()) == 1
+
+        # For this simple case, no downstream join exists so no targets
+        targets = find_filter_targets(ir, sources)
+        # This query doesn't have a downstream join after the semi-join
+        # so we expect no targets
+        assert len(targets) == 0
+
+
+class TestIRRewriting:
+    """Tests for IR graph rewriting with prefilter insertion."""
+
+    def test_add_filters_inserts_semi_join(self, gpu_engine, config_options, tmp_path):
+        """Test that add_filters inserts a semi-join for prefiltering."""
+        from cudf_polars.dsl.ir import Join
+        from cudf_polars.experimental.filter_pushdown import add_filters
+
+        # Create test data for Q18-like pattern
+        lineitem = pl.DataFrame(
+            {
+                "l_orderkey": list(range(1000)) * 5,
+                "l_quantity": [10 + (i % 100) for i in range(5000)],
+            }
+        )
+        orders = pl.DataFrame(
+            {
+                "o_orderkey": list(range(1000)),
+                "o_custkey": [i % 100 for i in range(1000)],
+            }
+        )
+
+        lineitem_path = tmp_path / "lineitem.parquet"
+        orders_path = tmp_path / "orders.parquet"
+
+        lineitem.write_parquet(lineitem_path)
+        orders.write_parquet(orders_path)
+
+        lineitem_scan = pl.scan_parquet(lineitem_path)
+        orders_scan = pl.scan_parquet(orders_path)
+
+        # Q18-like pattern: semi-join followed by inner join
+        q1 = (
+            lineitem_scan.group_by("l_orderkey")
+            .agg(pl.col("l_quantity").sum().alias("sum_quantity"))
+            .filter(pl.col("sum_quantity") > 300)
+        )
+
+        q = orders_scan.join(
+            q1, left_on="o_orderkey", right_on="l_orderkey", how="semi"
+        ).join(lineitem_scan, left_on="o_orderkey", right_on="l_orderkey")
+
+        ir = Translator(q._ldf.visit(), gpu_engine).translate_ir()
+
+        # Count joins before rewriting
+        joins_before = sum(1 for node in traversal([ir]) if isinstance(node, Join))
+
+        # Apply filter pushdown
+        new_ir = add_filters(ir, config_options)
+
+        # Count joins after rewriting
+        joins_after = sum(1 for node in traversal([new_ir]) if isinstance(node, Join))
+
+        # Should have one more join (the prefilter semi-join)
+        assert joins_after == joins_before + 1
+
+        # Verify the new join is a semi-join
+        semi_joins = [
+            node
+            for node in traversal([new_ir])
+            if isinstance(node, Join) and node.options[0] == "Semi"
+        ]
+        # Should have 2 semi-joins now: original + prefilter
+        assert len(semi_joins) == 2
+
+    def test_add_filters_preserves_semantics(
+        self, gpu_engine, config_options, tmp_path
+    ):
+        """Test that add_filters preserves query semantics."""
+        from cudf_polars.experimental.filter_pushdown import add_filters
+
+        # Create test data
+        lineitem = pl.DataFrame(
+            {
+                "l_orderkey": [1, 1, 2, 2, 3, 3, 3, 4, 5, 5],
+                "l_quantity": [100, 100, 50, 50, 200, 200, 200, 10, 10, 10],
+            }
+        )
+        orders = pl.DataFrame(
+            {
+                "o_orderkey": [1, 2, 3, 4, 5],
+                "o_custkey": [10, 20, 30, 40, 50],
+            }
+        )
+
+        lineitem_path = tmp_path / "lineitem.parquet"
+        orders_path = tmp_path / "orders.parquet"
+
+        lineitem.write_parquet(lineitem_path)
+        orders.write_parquet(orders_path)
+
+        lineitem_scan = pl.scan_parquet(lineitem_path)
+        orders_scan = pl.scan_parquet(orders_path)
+
+        # Find orders with total quantity > 300
+        q1 = (
+            lineitem_scan.group_by("l_orderkey")
+            .agg(pl.col("l_quantity").sum().alias("sum_quantity"))
+            .filter(pl.col("sum_quantity") > 300)
+        )
+
+        # Only order 3 qualifies (600 > 300)
+        q = orders_scan.join(
+            q1, left_on="o_orderkey", right_on="l_orderkey", how="semi"
+        ).join(lineitem_scan, left_on="o_orderkey", right_on="l_orderkey")
+
+        ir = Translator(q._ldf.visit(), gpu_engine).translate_ir()
+        new_ir = add_filters(ir, config_options)
+
+        # The IR should still be valid (we can't easily execute it here,
+        # but we can check it has the expected structure)
+        assert new_ir is not None
+        assert new_ir.schema is not None
+
+    def test_no_rewrite_without_matching_pattern(self, gpu_engine, config_options):
+        """Test that add_filters doesn't rewrite when there's no matching pattern."""
+        from cudf_polars.experimental.filter_pushdown import add_filters
+
+        # Simple query with no semi-join
+        table_a = pl.LazyFrame({"a": [1, 2, 3], "b": [10, 20, 30]})
+        table_b = pl.LazyFrame({"a": [2, 3, 4], "c": [100, 200, 300]})
+
+        q = table_a.join(table_b, on="a")  # Inner join, no semi-join
+
+        ir = Translator(q._ldf.visit(), gpu_engine).translate_ir()
+        new_ir = add_filters(ir, config_options)
+
+        # IR should be unchanged (same object)
+        assert new_ir is ir

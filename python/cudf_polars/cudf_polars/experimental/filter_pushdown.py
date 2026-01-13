@@ -10,6 +10,7 @@ shuffles to reduce data movement.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import singledispatch
 from typing import TYPE_CHECKING, Literal
@@ -32,7 +33,7 @@ from cudf_polars.experimental.base import ColumnStat
 from cudf_polars.experimental.statistics import collect_base_stats
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterator, MutableMapping
 
     from cudf_polars.dsl.expr import NamedExpr
     from cudf_polars.dsl.ir import IR
@@ -125,6 +126,61 @@ class FilterSourceCollection:
     def selective_inner_joins(self) -> list[FilterSource]:
         """Return filter sources from selective inner joins."""
         return [s for s in self.sources if s.source_type == "selective_inner_join"]
+
+
+@dataclass
+class FilterTarget:
+    """
+    A target that can be prefiltered using a filter source.
+
+    This represents an opportunity to apply a filter to reduce data
+    movement before a shuffle or join operation.
+    """
+
+    source: FilterSource
+    """The filter source that provides the filter keys."""
+
+    target_scan: IR
+    """The Scan/Cache node that can be prefiltered."""
+
+    downstream_join: Join
+    """The join where the filtered data would be used."""
+
+    target_column: str
+    """The column on the target scan that should be filtered."""
+
+    source_column: str
+    """The column from the filter source that provides filter keys."""
+
+
+@dataclass
+class FilterTargetCollection:
+    """Collection of filter targets detected in an IR graph."""
+
+    targets: list[FilterTarget] = field(default_factory=list)
+    """List of detected filter targets."""
+
+    # Mapping from target scans to their filter targets for quick lookup
+    _scan_to_targets: dict[IR, list[FilterTarget]] = field(
+        default_factory=lambda: defaultdict(list), repr=False
+    )
+
+    def add(self, target: FilterTarget) -> None:
+        """Add a filter target to the collection."""
+        self.targets.append(target)
+        self._scan_to_targets[target.target_scan].append(target)
+
+    def get_by_scan(self, scan_node: IR) -> list[FilterTarget]:
+        """Get the filter targets associated with a scan node."""
+        return self._scan_to_targets.get(scan_node, [])
+
+    def __len__(self) -> int:
+        """Return the number of filter targets."""
+        return len(self.targets)
+
+    def __iter__(self) -> Iterator[FilterTarget]:
+        """Iterate over filter targets."""
+        return iter(self.targets)
 
 
 # -----------------------------------------------------------------------------
@@ -617,6 +673,360 @@ def collect_filter_sources(
     return collection
 
 
+def _build_parent_map(ir: IR) -> dict[IR, list[tuple[IR, int]]]:
+    """
+    Build a map from each node to its parent nodes.
+
+    Returns a dict where each key is a node and the value is a list of
+    (parent_node, child_index) tuples indicating which parents use this
+    node and at which child position.
+    """
+    parent_map: dict[IR, list[tuple[IR, int]]] = defaultdict(list)
+    for node in traversal([ir]):
+        for i, child in enumerate(node.children):
+            parent_map[child].append((node, i))
+    return parent_map
+
+
+def _find_scans_in_subtree(node: IR) -> list[tuple[IR, str | None]]:
+    """
+    Find all Scan/DataFrameScan/Cache nodes in a subtree.
+
+    Returns a list of (scan_node, None) tuples.
+    The second element is reserved for future use (e.g., column tracking).
+    """
+    scans: list[tuple[IR, str | None]] = []
+    for n in traversal([node]):
+        # Skip through Cache nodes to find the actual Scan
+        actual = n
+        while isinstance(actual, Cache) and actual.children:
+            actual = actual.children[0]
+        if isinstance(actual, (Scan, DataFrameScan)):
+            # Use the Cache node if present, otherwise the Scan
+            scans.append((n if isinstance(n, Cache) else actual, None))
+    return scans
+
+
+def find_filter_targets(
+    ir: IR,
+    filter_sources: FilterSourceCollection,
+) -> FilterTargetCollection:
+    """
+    Find filter targets for the detected filter sources.
+
+    For each semi-join filter source, this function traces downstream
+    to find joins that use the filtered keys, and identifies Scan nodes
+    that could be prefiltered.
+
+    Parameters
+    ----------
+    ir
+        Root of the IR graph.
+    filter_sources
+        Collection of detected filter sources.
+
+    Returns
+    -------
+    A collection of FilterTarget objects.
+
+    Notes
+    -----
+    For Q18 pattern:
+    - Semi-join: orders.join(q1, left_on="o_orderkey", right_on="l_orderkey", how="semi")
+    - Downstream: semi_result.join(lineitem, left_on="o_orderkey", right_on="l_orderkey")
+    - Target: lineitem Scan can be prefiltered on l_orderkey using filtered o_orderkey values
+
+    This function traces from the semi-join result to find such opportunities.
+    """
+    collection = FilterTargetCollection()
+
+    # Build parent map to trace from children to parents
+    parent_map = _build_parent_map(ir)
+
+    for source in filter_sources.semi_joins():
+        # The semi-join result flows to parent nodes
+        # Find parents of the semi-join node
+        semi_join = source.join_node
+        parents = parent_map.get(semi_join, [])
+
+        for parent, child_idx in parents:
+            # Skip through non-join nodes to find downstream joins
+            # (the semi-join result might flow through Select, Cache, etc.)
+            current: IR | None = parent
+            current_child_idx = child_idx
+
+            while current is not None and not isinstance(current, Join):
+                # Trace through the parent map
+                next_parents = parent_map.get(current, [])
+                if next_parents:
+                    current, current_child_idx = next_parents[0]
+                else:
+                    current = None
+
+            if current is None or not isinstance(current, Join):
+                continue
+
+            downstream_join = current
+            if downstream_join.options[0] not in ("Inner", "Left", "Right"):
+                continue
+
+            # Determine which side of the downstream join has the semi-join result
+            # and which side is the potential filter target
+            left_child, right_child = downstream_join.children
+
+            # Check if the semi-join result flows into the left or right side
+            semi_is_left = _is_ancestor_of(semi_join, left_child)
+            semi_is_right = _is_ancestor_of(semi_join, right_child)
+
+            if semi_is_left and not semi_is_right:
+                # Semi-join result is on the left, right side can be prefiltered
+                target_side = right_child
+                target_on = downstream_join.right_on
+                # The filter key column on the semi-join side
+                filter_on = downstream_join.left_on
+            elif semi_is_right and not semi_is_left:
+                # Semi-join result is on the right, left side can be prefiltered
+                target_side = left_child
+                target_on = downstream_join.left_on
+                filter_on = downstream_join.right_on
+            else:
+                # Both or neither - can't determine, skip
+                continue
+
+            # Check if the join key matches the semi-join's filtered key
+            # For Q18: semi-join filters on o_orderkey, downstream join uses o_orderkey
+            semi_key_names = source.target_key_names  # e.g., ("o_orderkey",)
+            filter_key_names = tuple(expr.name for expr in filter_on)
+
+            # Find matching columns
+            for i, filter_key in enumerate(filter_key_names):
+                if filter_key in semi_key_names:
+                    target_col = target_on[i].name
+
+                    # Find Scan nodes in the target side
+                    scans = _find_scans_in_subtree(target_side)
+                    for scan_node, _ in scans:
+                        target = FilterTarget(
+                            source=source,
+                            target_scan=scan_node,
+                            downstream_join=downstream_join,
+                            target_column=target_col,
+                            source_column=filter_key,
+                        )
+                        collection.add(target)
+
+    return collection
+
+
+def _is_ancestor_of(ancestor: IR, node: IR) -> bool:
+    """Check if `ancestor` is an ancestor of `node` (or is `node` itself)."""
+    return any(n is ancestor for n in traversal([node]))
+
+
+# -----------------------------------------------------------------------------
+# IR Rewriting for Filter Insertion
+# -----------------------------------------------------------------------------
+
+
+def _create_prefilter_semi_join(
+    target: FilterTarget,
+) -> Join:
+    """
+    Create a semi-join node to prefilter a target scan.
+
+    Parameters
+    ----------
+    target
+        The filter target containing all necessary information.
+
+    Returns
+    -------
+    A new Join node configured as a semi-join for prefiltering.
+    """
+    from cudf_polars.dsl.expr import Col, NamedExpr
+
+    source = target.source
+    target_scan = target.target_scan
+
+    # Find the provider key that corresponds to source_column
+    # source_column is in source.target_key_names, find corresponding provider key
+    source_key_names = source.target_key_names
+    provider_key_names = source.provider_key_names
+
+    # Find the index of source_column in target_key_names
+    try:
+        key_idx = source_key_names.index(target.source_column)
+    except ValueError:
+        # source_column not found, use the first key as fallback
+        key_idx = 0
+
+    provider_key = (
+        provider_key_names[key_idx]
+        if key_idx < len(provider_key_names)
+        else provider_key_names[0]
+    )
+
+    # Get the dtype for the target column from the target scan's schema
+    target_dtype = target_scan.schema[target.target_column]
+
+    # Get the dtype for the provider key from the filter_keys_provider's schema
+    filter_keys_provider = source.filter_keys_provider
+    # Handle Cache nodes
+    provider_for_schema = filter_keys_provider
+    while isinstance(provider_for_schema, Cache) and provider_for_schema.children:
+        provider_for_schema = provider_for_schema.children[0]
+    provider_dtype = provider_for_schema.schema[provider_key]
+
+    # Create the join key expressions
+    # Left side: target scan's column
+    left_col = Col(target_dtype, target.target_column)
+    left_on = (NamedExpr(target.target_column, left_col),)
+
+    # Right side: filter keys provider's column
+    right_col = Col(provider_dtype, provider_key)
+    right_on = (NamedExpr(provider_key, right_col),)
+
+    # Semi-join options: (how, nulls_equal, slice, suffix, coalesce, maintain_order)
+    options = ("Semi", True, None, "_right", True, "none")
+
+    # Schema for semi-join is same as left side (target scan)
+    schema = target_scan.schema
+
+    # Create the semi-join node
+    return Join(
+        schema,
+        left_on,
+        right_on,
+        options,
+        target_scan,  # left child: the scan to be filtered
+        filter_keys_provider,  # right child: provides the filter keys
+    )
+
+
+def _rebuild_ir_with_replacements(
+    ir: IR,
+    replacements: MutableMapping[IR, IR],
+) -> IR:
+    """
+    Rebuild an IR graph with node replacements.
+
+    This traverses the IR in post-order and rebuilds nodes that have
+    children that were replaced.
+
+    Parameters
+    ----------
+    ir
+        Root of the IR graph.
+    replacements
+        Mapping from old nodes to their replacements.
+
+    Returns
+    -------
+    The rebuilt IR graph with replacements applied.
+    """
+    # Memoization to avoid rebuilding the same subtree multiple times
+    rebuilt: dict[IR, IR] = {}
+
+    def rebuild(node: IR) -> IR:
+        if node in rebuilt:
+            return rebuilt[node]
+
+        # Check if this node should be replaced
+        if node in replacements:
+            result = replacements[node]
+            rebuilt[node] = result
+            return result
+
+        # Recursively rebuild children
+        new_children = tuple(rebuild(child) for child in node.children)
+
+        # If no children changed, keep the original node
+        if all(
+            new is old for new, old in zip(new_children, node.children, strict=False)
+        ):
+            rebuilt[node] = node
+            return node
+
+        # Reconstruct the node with new children
+        result = node.reconstruct(new_children)
+        rebuilt[node] = result
+        return result
+
+    return rebuild(ir)
+
+
+def _apply_semi_join_prefilters(
+    ir: IR,
+    filter_targets: FilterTargetCollection,
+) -> IR:
+    """
+    Apply semi-join prefilters to the IR graph.
+
+    For each filter target, this inserts a semi-join between the target
+    scan and its downstream join to prefilter the data.
+
+    Parameters
+    ----------
+    ir
+        Root of the IR graph.
+    filter_targets
+        Collection of filter targets to apply.
+
+    Returns
+    -------
+    The rewritten IR graph with prefilter semi-joins inserted.
+
+    Notes
+    -----
+    This function groups targets by downstream join to avoid inserting
+    multiple prefilters for the same target scan at the same join.
+    """
+    if len(filter_targets) == 0:
+        return ir
+
+    # Build replacements: map from (downstream_join, target_scan) to prefiltered version
+    # We replace at the downstream_join level to ensure the prefilter is applied
+    replacements: dict[IR, IR] = {}
+
+    # Group targets by downstream join
+    targets_by_join: dict[Join, list[FilterTarget]] = defaultdict(list)
+    for target in filter_targets:
+        targets_by_join[target.downstream_join].append(target)
+
+    for downstream_join, targets in targets_by_join.items():
+        # For now, apply the first target's prefilter
+        # TODO: Handle multiple targets for the same join
+        target = targets[0]
+
+        # Create the prefilter semi-join
+        prefilter = _create_prefilter_semi_join(target)
+
+        # Determine which child of the downstream join to replace
+        left_child, right_child = downstream_join.children
+
+        # Check which child contains the target scan
+        if _is_ancestor_of(target.target_scan, left_child):
+            # Replace in left subtree
+            # We need to replace target_scan with prefilter in the left subtree
+            # Then rebuild the downstream join with the new left child
+            left_replacements: dict[IR, IR] = {target.target_scan: prefilter}
+            new_left = _rebuild_ir_with_replacements(left_child, left_replacements)
+            new_join = downstream_join.reconstruct((new_left, right_child))
+            replacements[downstream_join] = new_join
+        elif _is_ancestor_of(target.target_scan, right_child):
+            # Replace in right subtree
+            right_replacements: dict[IR, IR] = {target.target_scan: prefilter}
+            new_right = _rebuild_ir_with_replacements(right_child, right_replacements)
+            new_join = downstream_join.reconstruct((left_child, new_right))
+            replacements[downstream_join] = new_join
+
+    if not replacements:
+        return ir
+
+    # Rebuild the entire IR with the join replacements
+    return _rebuild_ir_with_replacements(ir, replacements)
+
+
 def add_filters(
     ir: IR,
     config_options: ConfigOptions,
@@ -645,14 +1055,25 @@ def add_filters(
     if stats is None:
         stats = collect_selectivity_stats(ir, config_options)
 
-    # Detect filter opportunities
+    # Detect filter opportunities (semi-joins and selective inner joins)
     filter_sources = collect_filter_sources(ir, stats)
 
-    # TODO: Phase 2 - Identify filter targets (downstream scans/shuffles)
-    # TODO: Phase 3 - Rewrite graph to insert filter nodes
+    # Only process semi-joins for now
+    # (selective inner joins would need bloom filter support)
+    if not filter_sources.semi_joins():
+        return ir
 
-    # For now, just return the IR unchanged
-    # (the detected filter sources can be used for debugging/analysis)
-    _ = filter_sources
+    # Phase 2: Identify filter targets (downstream scans that can be prefiltered)
+    filter_targets = find_filter_targets(ir, filter_sources)
 
-    return ir
+    if len(filter_targets) == 0:
+        return ir
+
+    # Phase 3: Rewrite the IR graph to insert prefilter semi-joins
+    # This inserts semi-join nodes between target scans and their downstream joins
+    # to reduce data shuffled for the joins.
+    #
+    # NOTE: This does not reduce I/O if the scan is wrapped in a Cache node,
+    # because the Cache will still buffer all data. I/O reduction requires
+    # either bloom filter support in Scan, or making Scan nodes distinguishable.
+    return _apply_semi_join_prefilters(ir, filter_targets)

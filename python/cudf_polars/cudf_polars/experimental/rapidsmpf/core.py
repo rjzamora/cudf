@@ -93,14 +93,8 @@ def evaluate_logical_plan(
     assert config_options.executor.name == "streaming", "Executor must be streaming"
     assert config_options.executor.runtime == "rapidsmpf", "Runtime must be rapidsmpf"
 
-    # Collect lightweight statistics for selectivity estimation.
-    # This is used for detecting filter pushdown opportunities.
-    selectivity_stats = collect_selectivity_stats(ir, config_options)
-
-    # Re-write the IR graph to add additional filtering during/after IO.
-    ir = add_filters(ir, config_options, selectivity_stats)
-
     # Lower the IR graph on the client process (for now).
+    # This includes filter pushdown optimization and statistics collection.
     ir, partition_info, stats = lower_ir_graph(ir, config_options)
 
     # Reserve shuffle IDs for the entire pipeline execution
@@ -307,8 +301,6 @@ def lower_ir_graph(
         Root of the graph to rewrite.
     config_options
         GPUEngine configuration options.
-    stats
-        The statistics collector.
 
     Returns
     -------
@@ -324,11 +316,20 @@ def lower_ir_graph(
     - A distinct `lower_ir_node` function is used.
     - A `Repartition` node is added to ensure a single chunk is produced.
     - Statistics are returned.
+    - Filter pushdown optimization is applied before lowering.
 
     See Also
     --------
     lower_ir_node
     """
+    # Phase 1: Filter pushdown optimization
+    # Collect lightweight statistics for selectivity estimation,
+    # then rewrite the IR graph to add prefilter semi-joins.
+    # TODO: Add config option to enable/disable filter pushdown
+    selectivity_stats = collect_selectivity_stats(ir, config_options)
+    ir = add_filters(ir, config_options, selectivity_stats)
+
+    # Phase 2: Full statistics collection and IR lowering
     state: LowerState = {
         "config_options": config_options,
         "stats": collect_statistics(ir, config_options),
