@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -407,6 +407,22 @@ class StatsPlanningOptions:
     default_selectivity
         The default selectivity of a predicate.
         Default is 0.8.
+    use_filter_pushdown
+        Whether to use filter pushdown optimization to insert
+        semi-join prefilters before shuffle operations. This can
+        reduce data movement when join predicates are selective.
+        Default is False.
+    filter_selectivity_threshold
+        The selectivity threshold for considering a join branch
+        "selective" for filter pushdown. A value of 0.5 means
+        the output should be at most 50% of the input.
+        Default is 0.5.
+    max_filter_keys_row_count
+        Maximum estimated row count for filter keys to enable
+        the filter pushdown optimization. If the filter keys
+        exceed this threshold, the optimization is skipped
+        because the broadcast cost would be too high.
+        Default is 100,000,000 (100 million rows).
     """
 
     _env_prefix = "CUDF_POLARS__EXECUTOR__STATS_PLANNING"
@@ -436,6 +452,21 @@ class StatsPlanningOptions:
             f"{_env_prefix}__DEFAULT_SELECTIVITY", float, default=0.8
         )
     )
+    use_filter_pushdown: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__USE_FILTER_PUSHDOWN", _bool_converter, default=False
+        )
+    )
+    filter_selectivity_threshold: float = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__FILTER_SELECTIVITY_THRESHOLD", float, default=0.5
+        )
+    )
+    max_filter_keys_row_count: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__MAX_FILTER_KEYS_ROW_COUNT", int, default=100_000_000
+        )
+    )
 
     def __post_init__(self) -> None:  # noqa: D105
         if not isinstance(self.use_io_partitioning, bool):
@@ -448,6 +479,12 @@ class StatsPlanningOptions:
             raise TypeError("use_sampling must be a bool")
         if not isinstance(self.default_selectivity, float):
             raise TypeError("default_selectivity must be a float")
+        if not isinstance(self.use_filter_pushdown, bool):
+            raise TypeError("use_filter_pushdown must be a bool")
+        if not isinstance(self.filter_selectivity_threshold, float):
+            raise TypeError("filter_selectivity_threshold must be a float")
+        if not isinstance(self.max_filter_keys_row_count, int):
+            raise TypeError("max_filter_keys_row_count must be an int")
 
 
 @dataclasses.dataclass(frozen=True, eq=True)

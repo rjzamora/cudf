@@ -42,19 +42,14 @@ if TYPE_CHECKING:
 
 
 # Default selectivity for filter operations (0.0 = filters everything, 1.0 = keeps all)
+# This is more aggressive than the config's default_selectivity (0.8) because
+# filter pushdown needs to detect optimization opportunities, not avoid memory blowups.
+# TODO: Replace with predicate analysis or sampling-based estimates.
 DEFAULT_FILTER_SELECTIVITY = 0.3
 
-# Default selectivity for GroupBy/Distinct operations
+# Default selectivity for GroupBy/Distinct operations.
+# GroupBy typically has higher selectivity reduction than filters.
 DEFAULT_GROUPBY_SELECTIVITY = 0.1
-
-# Threshold for considering a branch "selective" (output/input ratio)
-DEFAULT_SELECTIVITY_THRESHOLD = 0.5
-
-# Maximum row count estimate for filter keys to enable prefilter optimization.
-# If the filter_keys_provider has more estimated rows than this, the optimization
-# is skipped because the broadcast cost would be too high.
-# Default: 10 million rows
-MAX_FILTER_KEYS_ROW_COUNT = 100_000_000
 
 
 @dataclass
@@ -418,6 +413,9 @@ def collect_selectivity_stats(
     -------
     A StatsCollector with row count estimates for each node.
     """
+    assert config_options.executor.name == "streaming", (
+        "Only streaming executor is supported in collect_selectivity_stats"
+    )
     # Start with base stats (parquet metadata, source row counts)
     stats = collect_base_stats(ir, config_options)
 
@@ -495,7 +493,7 @@ def compute_selectivity_ratio(ir: IR, stats: StatsCollector) -> float | None:
 def is_selective(
     ir: IR,
     stats: StatsCollector,
-    threshold: float = DEFAULT_SELECTIVITY_THRESHOLD,
+    threshold: float = 0.5,
 ) -> bool:
     """
     Check if an IR subtree is selective based on row count estimates.
@@ -528,7 +526,7 @@ def is_selective(
 def collect_filter_sources(
     ir: IR,
     stats: StatsCollector | None = None,
-    selectivity_threshold: float = DEFAULT_SELECTIVITY_THRESHOLD,
+    selectivity_threshold: float = 0.5,
 ) -> FilterSourceCollection:
     """
     Detect join patterns that can be used for dynamic filter pushdown.
@@ -1040,6 +1038,7 @@ def _apply_semi_join_prefilters(
     ir: IR,
     filter_targets: FilterTargetCollection,
     stats: StatsCollector,
+    config_options: ConfigOptions,
 ) -> IR:
     """
     Apply semi-join prefilters to the IR graph.
@@ -1055,6 +1054,8 @@ def _apply_semi_join_prefilters(
         Collection of filter targets to apply.
     stats
         Statistics collector with row count estimates.
+    config_options
+        GPUEngine configuration options.
 
     Returns
     -------
@@ -1071,11 +1072,16 @@ def _apply_semi_join_prefilters(
     nodes from the original graph.
 
     The optimization only applies when the filter_keys_provider has
-    an estimated row count below MAX_FILTER_KEYS_ROW_COUNT. This ensures
-    the broadcast cost (from Repartition) is acceptable.
+    an estimated row count below the configured max_filter_keys_row_count.
+    This ensures the broadcast cost (from Repartition) is acceptable.
     """
     if len(filter_targets) == 0:
         return ir
+
+    assert config_options.executor.name == "streaming", (
+        "Only streaming executor is supported in filter pushdown"
+    )
+    max_filter_keys = config_options.executor.stats_planning.max_filter_keys_row_count
 
     # Build wrap instructions: map from downstream_join to instruction
     # We key by the join node (not the child to wrap) because:
@@ -1104,7 +1110,7 @@ def _apply_semi_join_prefilters(
 
         if (
             filter_keys_row_count is not None
-            and filter_keys_row_count > MAX_FILTER_KEYS_ROW_COUNT
+            and filter_keys_row_count > max_filter_keys
         ):
             # Filter keys too large for broadcast - skip this target
             continue
@@ -1176,13 +1182,23 @@ def add_filters(
     -------
     The potentially rewritten IR graph.
     """
+    # Filter pushdown only applies to streaming executor
+    if config_options.executor.name != "streaming":
+        return ir
+
+    # Check if filter pushdown is enabled in config
+    stats_planning = config_options.executor.stats_planning
+    if not stats_planning.use_filter_pushdown:
+        return ir
+
     # Collect lightweight statistics if not provided
-    # TODO: Add config option to enable/disable filter pushdown
     if stats is None:
         stats = collect_selectivity_stats(ir, config_options)
 
     # Detect filter opportunities (semi-joins and selective inner joins)
-    filter_sources = collect_filter_sources(ir, stats)
+    # Use the configured selectivity threshold
+    selectivity_threshold = stats_planning.filter_selectivity_threshold
+    filter_sources = collect_filter_sources(ir, stats, selectivity_threshold)
 
     # Only process semi-joins for now
     # (selective inner joins would need bloom filter support)
@@ -1206,4 +1222,4 @@ def add_filters(
     # NOTE: This does not reduce I/O if the scan is wrapped in a Cache node,
     # because the Cache will still buffer all data. I/O reduction requires
     # either bloom filter support in Scan, or making Scan nodes distinguishable.
-    return _apply_semi_join_prefilters(ir, filter_targets, stats)
+    return _apply_semi_join_prefilters(ir, filter_targets, stats, config_options)

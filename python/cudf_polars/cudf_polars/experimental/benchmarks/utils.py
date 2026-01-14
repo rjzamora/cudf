@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
 """Utility functions/classes for running the PDS-H and PDS-DS benchmarks."""
@@ -256,6 +256,7 @@ class RunConfig:
     query_set: str
     collect_traces: bool = False
     stats_planning: bool
+    filter_pushdown: bool
     max_io_threads: int
     native_parquet: bool
 
@@ -373,6 +374,7 @@ class RunConfig:
             query_set=args.query_set,
             collect_traces=args.collect_traces,
             stats_planning=args.stats_planning,
+            filter_pushdown=args.filter_pushdown,
             max_io_threads=args.max_io_threads,
             native_parquet=args.native_parquet,
         )
@@ -462,6 +464,7 @@ def get_executor_options(
                 # Always allow row-group sampling for rapidsmpf runtime
                 run_config.stats_planning or run_config.runtime == "rapidsmpf"
             ),
+            "use_filter_pushdown": run_config.filter_pushdown,
         }
         executor_options["client_device_threshold"] = run_config.spill_device
         executor_options["runtime"] = run_config.runtime
@@ -890,6 +893,12 @@ def parse_args(
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Enable statistics planning.",
+    )
+    parser.add_argument(
+        "--filter-pushdown",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable filter pushdown optimization (semi-join prefiltering).",
     )
     parser.add_argument(
         "--max-io-threads",
