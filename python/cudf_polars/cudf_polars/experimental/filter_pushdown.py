@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import singledispatch
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from cudf_polars.dsl.ir import (
     Cache,
@@ -28,7 +28,7 @@ from cudf_polars.dsl.ir import (
     Sort,
     Union,
 )
-from cudf_polars.dsl.traversal import post_traversal, traversal
+from cudf_polars.dsl.traversal import CachingVisitor, post_traversal, traversal
 from cudf_polars.experimental.base import ColumnStat
 from cudf_polars.experimental.statistics import collect_base_stats
 
@@ -49,6 +49,12 @@ DEFAULT_GROUPBY_SELECTIVITY = 0.1
 
 # Threshold for considering a branch "selective" (output/input ratio)
 DEFAULT_SELECTIVITY_THRESHOLD = 0.5
+
+# Maximum row count estimate for filter keys to enable prefilter optimization.
+# If the filter_keys_provider has more estimated rows than this, the optimization
+# is skipped because the broadcast cost would be too high.
+# Default: 10 million rows
+MAX_FILTER_KEYS_ROW_COUNT = 100_000_000
 
 
 @dataclass
@@ -828,142 +834,218 @@ def _is_ancestor_of(ancestor: IR, node: IR) -> bool:
 # -----------------------------------------------------------------------------
 
 
-def _create_prefilter_semi_join(
-    target: FilterTarget,
-) -> Join:
+@dataclass
+class WrapWithSemiJoin:
     """
-    Create a semi-join node to prefilter a target scan.
+    Instruction to wrap a child of a join with a semi-join prefilter.
 
-    Parameters
-    ----------
-    target
-        The filter target containing all necessary information.
-
-    Returns
-    -------
-    A new Join node configured as a semi-join for prefiltering.
+    This is used during IR rewriting to defer node creation until
+    all children have been rebuilt. The instruction is keyed by
+    id(downstream_join) rather than the node to wrap, because
+    CachingVisitor's cache uses value equality which would cause
+    identical-looking nodes to share cache entries.
     """
-    from cudf_polars.dsl.expr import Col, NamedExpr
 
-    source = target.source
-    target_scan = target.target_scan
+    target: FilterTarget
+    """The filter target information."""
 
-    # Find the provider key that corresponds to source_column
-    # source_column is in source.target_key_names, find corresponding provider key
-    source_key_names = source.target_key_names
-    provider_key_names = source.provider_key_names
+    child_index: int
+    """Which child of the downstream join to wrap (0 = left, 1 = right)."""
 
-    # Find the index of source_column in target_key_names
-    try:
-        key_idx = source_key_names.index(target.source_column)
-    except ValueError:
-        # source_column not found, use the first key as fallback
-        key_idx = 0
+    use_repartition: bool = True
+    """Whether to wrap filter_keys in Repartition to force broadcast join."""
 
-    provider_key = (
-        provider_key_names[key_idx]
-        if key_idx < len(provider_key_names)
-        else provider_key_names[0]
-    )
+    def create_semi_join(self, rebuilt_node: IR, rebuilt_filter_keys: IR) -> Join:
+        """Create the semi-join node with rebuilt children."""
+        from cudf_polars.dsl.expr import Col, NamedExpr
+        from cudf_polars.experimental.repartition import Repartition
 
-    # Get the dtype for the target column from the target scan's schema
-    target_dtype = target_scan.schema[target.target_column]
+        source = self.target.source
 
-    # Get the dtype for the provider key from the filter_keys_provider's schema
-    filter_keys_provider = source.filter_keys_provider
-    # Handle Cache nodes
-    provider_for_schema = filter_keys_provider
-    while isinstance(provider_for_schema, Cache) and provider_for_schema.children:
-        provider_for_schema = provider_for_schema.children[0]
-    provider_dtype = provider_for_schema.schema[provider_key]
+        # Find the provider key that corresponds to source_column
+        source_key_names = source.target_key_names
+        provider_key_names = source.provider_key_names
 
-    # Create the join key expressions
-    # Left side: target scan's column
-    left_col = Col(target_dtype, target.target_column)
-    left_on = (NamedExpr(target.target_column, left_col),)
+        try:
+            key_idx = source_key_names.index(self.target.source_column)
+        except ValueError:
+            key_idx = 0
 
-    # Right side: filter keys provider's column
-    right_col = Col(provider_dtype, provider_key)
-    right_on = (NamedExpr(provider_key, right_col),)
+        provider_key = (
+            provider_key_names[key_idx]
+            if key_idx < len(provider_key_names)
+            else provider_key_names[0]
+        )
 
-    # Semi-join options: (how, nulls_equal, slice, suffix, coalesce, maintain_order)
-    options = ("Semi", True, None, "_right", True, "none")
+        # Get the dtype for the target column from the node's schema
+        target_dtype = rebuilt_node.schema[self.target.target_column]
 
-    # Schema for semi-join is same as left side (target scan)
-    schema = target_scan.schema
+        # Get the dtype for the provider key from the filter_keys_provider's schema
+        provider_for_schema = rebuilt_filter_keys
+        while isinstance(provider_for_schema, Cache) and provider_for_schema.children:
+            provider_for_schema = provider_for_schema.children[0]
+        provider_dtype = provider_for_schema.schema[provider_key]
 
-    # Create the semi-join node
-    return Join(
-        schema,
-        left_on,
-        right_on,
-        options,
-        target_scan,  # left child: the scan to be filtered
-        filter_keys_provider,  # right child: provides the filter keys
-    )
+        # Create the join key expressions
+        left_col = Col(target_dtype, self.target.target_column)
+        left_on = (NamedExpr(self.target.target_column, left_col),)
+
+        right_col = Col(provider_dtype, provider_key)
+        right_on = (NamedExpr(provider_key, right_col),)
+
+        # Semi-join options
+        options = ("Semi", True, None, "_right", True, "none")
+
+        # Schema for semi-join is same as the wrapped node
+        schema = rebuilt_node.schema
+
+        # Wrap filter_keys in Repartition to force broadcast join.
+        # This collapses the filter keys to a single partition, which
+        # qualifies it for broadcast in the semi-join, allowing the
+        # semi-join to be applied locally before shuffling.
+        if self.use_repartition:
+            rebuilt_filter_keys = Repartition(
+                rebuilt_filter_keys.schema, rebuilt_filter_keys
+            )
+
+        return Join(
+            schema,
+            left_on,
+            right_on,
+            options,
+            rebuilt_node,
+            rebuilt_filter_keys,
+        )
 
 
-def _rebuild_ir_with_replacements(
-    ir: IR,
-    replacements: MutableMapping[IR, IR],
+def _rebuild_node_with_wrapping(
+    node: IR,
+    rec: CachingVisitor,
 ) -> IR:
     """
-    Rebuild an IR graph with node replacements.
+    Rebuild a single IR node, applying wrap instructions from state.
 
-    This traverses the IR in post-order and rebuilds nodes that have
-    children that were replaced.
+    This is the transformation function used with CachingVisitor.
+
+    Key insight: When we need to wrap a child of a node with a semi-join,
+    we must:
+    1. First rebuild the other children (so filter_keys_provider is in cache)
+    2. Create the new semi-join wrapper for the target child
+    3. Call rec() on the NEW semi-join (so it gets processed by the visitor)
+    4. Reconstruct the parent with the results
+
+    This ensures the new semi-join goes through the CachingVisitor and is
+    properly cached, which is essential for the subsequent lowering pass.
+    """
+    wrap_instructions: MutableMapping[IR, WrapWithSemiJoin] = rec.state[
+        "wrap_instructions"
+    ]
+
+    # Check if this node (downstream_join) has a wrap instruction FIRST
+    # before processing children, so we can handle them specially
+    if node in wrap_instructions:
+        instr = wrap_instructions[node]
+        child_idx = instr.child_index
+        original_filter_keys = instr.target.source.filter_keys_provider
+
+        # Process children in a specific order:
+        # 1. First, process the children that DON'T need wrapping
+        #    (this ensures filter_keys_provider gets cached)
+        # 2. Then create the wrapper and process IT
+        rebuilt_children: list[IR | None] = []
+        for i, child in enumerate(node.children):
+            if i == child_idx:
+                # This child will be wrapped - don't process it yet
+                rebuilt_children.append(None)  # Placeholder
+            else:
+                # Process normally
+                rebuilt_children.append(rec(child))
+
+        # Now filter_keys_provider should be in cache
+        if original_filter_keys in rec.cache:
+            rebuilt_filter_keys = rec.cache[original_filter_keys]
+            original_child = node.children[child_idx]
+
+            # Create the semi-join wrapper with the ORIGINAL child
+            # (not rebuilt, because we'll process the whole wrapper now)
+            new_semi_join = instr.create_semi_join(original_child, rebuilt_filter_keys)
+
+            # NOW call rec() on the new semi-join so it gets processed
+            # This is the key: the new node goes through the visitor
+            rebuilt_semi_join = rec(new_semi_join)
+            rebuilt_children[child_idx] = rebuilt_semi_join
+        else:
+            # Can't wrap - just process the child normally
+            rebuilt_children[child_idx] = rec(node.children[child_idx])
+
+        # Reconstruct the node with new children
+        # At this point, all None placeholders have been replaced with IR nodes
+        new_children_tuple: tuple[IR, ...] = tuple(
+            c for c in rebuilt_children if c is not None
+        )
+        if all(
+            new is old
+            for new, old in zip(new_children_tuple, node.children, strict=False)
+        ):
+            return node
+        else:
+            return node.reconstruct(new_children_tuple)
+
+    # Normal case: no wrap instruction for this node
+    # Just rebuild all children
+    rebuilt = tuple(rec(child) for child in node.children)
+
+    # Reconstruct the node if children changed
+    if all(new is old for new, old in zip(rebuilt, node.children, strict=False)):
+        return node
+    else:
+        return node.reconstruct(rebuilt)
+
+
+def _rebuild_ir_with_wrapping(
+    ir: IR,
+    wrap_instructions: MutableMapping[IR, WrapWithSemiJoin],
+) -> IR:
+    """
+    Rebuild an IR graph, applying semi-join wrappers as specified.
+
+    This traverses the IR bottom-up. When a node is in wrap_instructions,
+    it gets wrapped with a semi-join after its children are rebuilt.
 
     Parameters
     ----------
     ir
         Root of the IR graph.
-    replacements
-        Mapping from old nodes to their replacements.
+    wrap_instructions
+        Mapping from downstream_join nodes to wrap instructions. We key by
+        the join node (not the child to wrap) because join nodes with
+        different children are distinct, while child nodes may have equal
+        siblings that would incorrectly match.
 
     Returns
     -------
-    The rebuilt IR graph with replacements applied.
+    The rebuilt IR graph with semi-join wrappers applied.
     """
-    # Memoization to avoid rebuilding the same subtree multiple times
-    rebuilt: dict[IR, IR] = {}
-
-    def rebuild(node: IR) -> IR:
-        if node in rebuilt:
-            return rebuilt[node]
-
-        # Check if this node should be replaced
-        if node in replacements:
-            result = replacements[node]
-            rebuilt[node] = result
-            return result
-
-        # Recursively rebuild children
-        new_children = tuple(rebuild(child) for child in node.children)
-
-        # If no children changed, keep the original node
-        if all(
-            new is old for new, old in zip(new_children, node.children, strict=False)
-        ):
-            rebuilt[node] = node
-            return node
-
-        # Reconstruct the node with new children
-        result = node.reconstruct(new_children)
-        rebuilt[node] = result
-        return result
-
-    return rebuild(ir)
+    state: dict[str, MutableMapping[IR, WrapWithSemiJoin]] = {
+        "wrap_instructions": wrap_instructions
+    }
+    mapper: CachingVisitor[IR, IR, Any] = CachingVisitor(
+        _rebuild_node_with_wrapping,  # type: ignore[arg-type]
+        state=state,
+    )
+    return mapper(ir)
 
 
 def _apply_semi_join_prefilters(
     ir: IR,
     filter_targets: FilterTargetCollection,
+    stats: StatsCollector,
 ) -> IR:
     """
     Apply semi-join prefilters to the IR graph.
 
     For each filter target, this inserts a semi-join between the target
-    scan and its downstream join to prefilter the data.
+    node and its downstream join to prefilter the data.
 
     Parameters
     ----------
@@ -971,6 +1053,8 @@ def _apply_semi_join_prefilters(
         Root of the IR graph.
     filter_targets
         Collection of filter targets to apply.
+    stats
+        Statistics collector with row count estimates.
 
     Returns
     -------
@@ -978,15 +1062,27 @@ def _apply_semi_join_prefilters(
 
     Notes
     -----
-    This function groups targets by downstream join to avoid inserting
-    multiple prefilters for the same target scan at the same join.
+    This uses an instruction-based approach: instead of pre-creating
+    replacement nodes, we create WrapWithSemiJoin instructions that
+    specify which nodes to wrap. The actual node creation happens during
+    the rebuild traversal, after all children have been rebuilt.
+
+    This avoids the complexity of replacement nodes referencing other
+    nodes from the original graph.
+
+    The optimization only applies when the filter_keys_provider has
+    an estimated row count below MAX_FILTER_KEYS_ROW_COUNT. This ensures
+    the broadcast cost (from Repartition) is acceptable.
     """
     if len(filter_targets) == 0:
         return ir
 
-    # Build replacements: map from (downstream_join, target_scan) to prefiltered version
-    # We replace at the downstream_join level to ensure the prefilter is applied
-    replacements: dict[IR, IR] = {}
+    # Build wrap instructions: map from downstream_join to instruction
+    # We key by the join node (not the child to wrap) because:
+    # 1. Join nodes with different children are distinct (not equal)
+    # 2. Child nodes (like Projections) may have equal siblings that
+    #    would incorrectly match
+    wrap_instructions: dict[IR, WrapWithSemiJoin] = {}
 
     # Group targets by downstream join
     targets_by_join: dict[Join, list[FilterTarget]] = defaultdict(list)
@@ -998,33 +1094,62 @@ def _apply_semi_join_prefilters(
         # TODO: Handle multiple targets for the same join
         target = targets[0]
 
-        # Create the prefilter semi-join
-        prefilter = _create_prefilter_semi_join(target)
+        # Check if the filter_keys_provider has an acceptable row count.
+        # If the estimated row count is too high, the broadcast cost would
+        # outweigh the benefit of prefiltering.
+        filter_keys_provider = target.source.filter_keys_provider
+        filter_keys_row_count = stats.row_count.get(
+            filter_keys_provider, ColumnStat[int](None)
+        ).value
 
-        # Determine which child of the downstream join to replace
+        if (
+            filter_keys_row_count is not None
+            and filter_keys_row_count > MAX_FILTER_KEYS_ROW_COUNT
+        ):
+            # Filter keys too large for broadcast - skip this target
+            continue
+
+        # Determine which child of the downstream join contains the target
         left_child, right_child = downstream_join.children
 
         # Check which child contains the target scan
-        if _is_ancestor_of(target.target_scan, left_child):
-            # Replace in left subtree
-            # We need to replace target_scan with prefilter in the left subtree
-            # Then rebuild the downstream join with the new left child
-            left_replacements: dict[IR, IR] = {target.target_scan: prefilter}
-            new_left = _rebuild_ir_with_replacements(left_child, left_replacements)
-            new_join = downstream_join.reconstruct((new_left, right_child))
-            replacements[downstream_join] = new_join
-        elif _is_ancestor_of(target.target_scan, right_child):
-            # Replace in right subtree
-            right_replacements: dict[IR, IR] = {target.target_scan: prefilter}
-            new_right = _rebuild_ir_with_replacements(right_child, right_replacements)
-            new_join = downstream_join.reconstruct((left_child, new_right))
-            replacements[downstream_join] = new_join
+        is_in_left = _is_ancestor_of(target.target_scan, left_child)
+        is_in_right = _is_ancestor_of(target.target_scan, right_child)
 
-    if not replacements:
+        # Determine which child to wrap (by index)
+        if is_in_left and is_in_right:
+            # Shared Scan (via Cache) - wrap right_child (index 1)
+            # The left side contains the semi-join result, right side needs prefiltering
+            child_index = 1
+            node_to_wrap = right_child
+        elif is_in_right and not is_in_left:
+            # Target only in right - wrap right_child (index 1)
+            child_index = 1
+            node_to_wrap = right_child
+        elif is_in_left and not is_in_right:
+            # Target only in left - wrap left_child (index 0)
+            child_index = 0
+            node_to_wrap = left_child
+        else:
+            # Target scan not found in either child - skip
+            continue
+
+        # Check for cycles: if node_to_wrap is an ancestor of filter_keys_provider,
+        # wrapping would create a cycle (the semi-join would depend on itself).
+        filter_keys_provider = target.source.filter_keys_provider
+        if _is_ancestor_of(node_to_wrap, filter_keys_provider):
+            continue
+
+        # Create the wrap instruction keyed by downstream_join node
+        wrap_instructions[downstream_join] = WrapWithSemiJoin(
+            target=target, child_index=child_index
+        )
+
+    if not wrap_instructions:
         return ir
 
-    # Rebuild the entire IR with the join replacements
-    return _rebuild_ir_with_replacements(ir, replacements)
+    # Rebuild the entire IR, applying wrap instructions
+    return _rebuild_ir_with_wrapping(ir, wrap_instructions)
 
 
 def add_filters(
@@ -1052,6 +1177,7 @@ def add_filters(
     The potentially rewritten IR graph.
     """
     # Collect lightweight statistics if not provided
+    # TODO: Add config option to enable/disable filter pushdown
     if stats is None:
         stats = collect_selectivity_stats(ir, config_options)
 
@@ -1073,7 +1199,11 @@ def add_filters(
     # This inserts semi-join nodes between target scans and their downstream joins
     # to reduce data shuffled for the joins.
     #
+    # The prefilter semi-join uses Repartition to force broadcast, so the
+    # filter is applied locally before any shuffle. This is only beneficial
+    # when the filter_keys are small enough (checked in _apply_semi_join_prefilters).
+    #
     # NOTE: This does not reduce I/O if the scan is wrapped in a Cache node,
     # because the Cache will still buffer all data. I/O reduction requires
     # either bloom filter support in Scan, or making Scan nodes distinguishable.
-    return _apply_semi_join_prefilters(ir, filter_targets)
+    return _apply_semi_join_prefilters(ir, filter_targets, stats)

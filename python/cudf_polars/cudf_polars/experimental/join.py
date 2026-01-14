@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 """Parallel Join Logic."""
 
@@ -83,7 +83,18 @@ def _make_hash_join(
         output_count,
         shuffler_insertion_method=shuffler_insertion_method,
     )
-    if left != new_left or right != new_right:
+    # Reconstruct if:
+    # 1. Shuffling was added (left != new_left or right != new_right)
+    # 2. OR the original children were lowered (ir.children != (left, right))
+    # The second case is needed because `left` and `right` are lowered children
+    # passed from lower_ir_node, which may differ from ir's original children.
+    original_left, original_right = ir.children
+    if (
+        left != new_left
+        or right != new_right
+        or original_left is not left
+        or original_right is not right
+    ):
         ir = ir.reconstruct([new_left, new_right])
     left = new_left
     right = new_right

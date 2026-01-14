@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 """Core lowering logic for the RapidsMPF streaming runtime."""
 
@@ -43,6 +43,26 @@ def _unsupported(
     return _lower_ir_fallback(
         ir, rec, msg=f"Class {type(ir)} does not support multiple partitions."
     )
+
+
+@lower_ir_node.register(Repartition)
+def _(
+    ir: Repartition, rec: LowerIRTransformer
+) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    # Repartition node: lower child and set output count=1
+    # This is used for filter pushdown to force broadcast joins
+    (child,) = ir.children
+    new_child, partition_info = rec(child)
+
+    # Reconstruct with lowered child
+    if new_child is not child:
+        new_node = ir.reconstruct((new_child,))
+    else:
+        new_node = ir
+
+    # Set partition count to 1 (repartition collapses to single partition)
+    partition_info[new_node] = PartitionInfo(count=1)
+    return new_node, partition_info
 
 
 @lower_ir_node.register(Sort)
