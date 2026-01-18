@@ -8,6 +8,8 @@ import pytest
 import polars as pl
 
 from cudf_polars import Translator
+from cudf_polars.dsl.ir import Cache
+from cudf_polars.dsl.traversal import traversal
 from cudf_polars.experimental.parallel import lower_ir_graph
 from cudf_polars.experimental.shuffle import Shuffle
 from cudf_polars.testing.asserts import (
@@ -270,3 +272,68 @@ def test_join_maintain_order_fallback_streaming(left, right, maintain_order):
         match=r"Join\(maintain_order=.*\) not supported for multiple partitions\.",
     ):
         assert_gpu_result_equal(q, engine=engine)
+
+
+def test_cache_preserves_partitioning_join():
+    """
+    Test that Cache preserves partitioning from a join.
+
+    Similar to TPC-H Q21: after a join shuffles data by 'key',
+    the Cache should preserve this partitioning info, avoiding
+    redundant shuffles for subsequent operations on the same key.
+
+    Regression test for Cache nodes losing partitioning information,
+    which caused unnecessary shuffles and significant performance degradation.
+    """
+    engine = pl.GPUEngine(
+        raise_on_fail=True,
+        executor="streaming",
+        executor_options={
+            "max_rows_per_partition": 3,
+            "cluster": DEFAULT_CLUSTER,
+            "runtime": DEFAULT_RUNTIME,
+        },
+    )
+
+    # Use enough data to force multiple partitions
+    left = pl.LazyFrame({"key": list(range(20)) * 5, "val_a": range(100)})
+    right = pl.LazyFrame({"key": list(range(20)) * 5, "val_b": range(100)})
+
+    joined = left.join(right, on="key")
+
+    # Use joined result twice to trigger Cache
+    q = pl.concat(
+        [
+            joined.group_by("key").agg(pl.col("val_a").sum()),
+            joined.group_by("key").agg(pl.col("val_b").sum()),
+        ]
+    )
+
+    config_options = ConfigOptions.from_polars_engine(engine)
+    ir = Translator(q._ldf.visit(), engine).translate_ir()
+    lowered_ir, partition_info, _ = lower_ir_graph(ir, config_options)
+
+    # Verify Cache exists
+    num_cache = sum(1 for node in traversal([lowered_ir]) if isinstance(node, Cache))
+    assert num_cache > 0, "Expected Cache nodes from CSE"
+
+    # Cache should preserve partitioning on 'key'
+    cache_partitioning = []
+    for node in traversal([lowered_ir]):
+        if isinstance(node, Cache):
+            pi = partition_info.get(node)
+            if pi:
+                cache_partitioning.append([ne.name for ne in pi.partitioned_on])
+    assert cache_partitioning == [["key"]], (
+        f"Expected Cache to preserve partitioning on ['key'], "
+        f"but got {cache_partitioning}"
+    )
+
+    # With preserved partitioning: only 2 shuffles needed (for join sides)
+    num_shuffles = sum(
+        1 for node in traversal([lowered_ir]) if isinstance(node, Shuffle)
+    )
+    assert num_shuffles == 2, (
+        f"Expected 2 shuffles (join only), but got {num_shuffles}. "
+        f"Cache is not preserving partitioning information from join."
+    )

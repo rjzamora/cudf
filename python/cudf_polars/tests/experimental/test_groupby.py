@@ -9,11 +9,17 @@ import pytest
 
 import polars as pl
 
+from cudf_polars import Translator
+from cudf_polars.dsl.ir import Cache
+from cudf_polars.dsl.traversal import traversal
+from cudf_polars.experimental.parallel import lower_ir_graph
+from cudf_polars.experimental.shuffle import Shuffle
 from cudf_polars.testing.asserts import (
     DEFAULT_CLUSTER,
     DEFAULT_RUNTIME,
     assert_gpu_result_equal,
 )
+from cudf_polars.utils.config import ConfigOptions
 from cudf_polars.utils.versions import POLARS_VERSION_LT_130
 
 
@@ -301,3 +307,72 @@ def test_groupby_literal_with_stats_planning(df):
     )
 
     assert_gpu_result_equal(q, engine=engine)
+
+
+def test_cache_preserves_partitioning_groupby():
+    """
+    Test that Cache preserves partitioning from a groupby shuffle.
+
+    After a groupby shuffles data by 'key', the Cache node should have
+    partitioned_on=['key']. When the cached result is used in subsequent
+    groupbys on the same key, no additional shuffles should be needed.
+
+    Regression test for Cache nodes losing partitioning information,
+    which caused unnecessary shuffles and significant performance degradation.
+    """
+    engine = pl.GPUEngine(
+        raise_on_fail=True,
+        executor="streaming",
+        executor_options={
+            "max_rows_per_partition": 3,
+            "cluster": DEFAULT_CLUSTER,
+            "runtime": DEFAULT_RUNTIME,
+        },
+    )
+
+    df = pl.LazyFrame(
+        {
+            "key": [1, 2, 1, 2, 1, 2, 3, 3, 3],
+            "value": [10, 20, 30, 40, 50, 60, 70, 80, 90],
+        }
+    )
+
+    # Create a grouped subexpression that will be cached
+    grouped = df.group_by("key").agg(pl.col("value").sum().alias("total"))
+
+    # Use the grouped result twice to trigger CSE/Cache
+    q = pl.concat(
+        [
+            grouped.group_by("key").agg(pl.col("total").max()),
+            grouped.group_by("key").agg(pl.col("total").min()),
+        ]
+    )
+
+    config_options = ConfigOptions.from_polars_engine(engine)
+    ir = Translator(q._ldf.visit(), engine).translate_ir()
+    lowered_ir, partition_info, _ = lower_ir_graph(ir, config_options)
+
+    # Verify Cache exists
+    num_cache = sum(1 for node in traversal([lowered_ir]) if isinstance(node, Cache))
+    assert num_cache > 0, "Expected Cache nodes from CSE"
+
+    # Cache should preserve partitioning on 'key'
+    cache_partitioning = []
+    for node in traversal([lowered_ir]):
+        if isinstance(node, Cache):
+            pi = partition_info.get(node)
+            if pi:
+                cache_partitioning.append([ne.name for ne in pi.partitioned_on])
+    assert cache_partitioning == [["key"]], (
+        f"Expected Cache to preserve partitioning on ['key'], "
+        f"but got {cache_partitioning}"
+    )
+
+    # With preserved partitioning: only 1 shuffle needed (initial groupby)
+    num_shuffles = sum(
+        1 for node in traversal([lowered_ir]) if isinstance(node, Shuffle)
+    )
+    assert num_shuffles == 1, (
+        f"Expected 1 shuffle (initial groupby only), but got {num_shuffles}. "
+        f"Cache is not preserving partitioning information."
+    )

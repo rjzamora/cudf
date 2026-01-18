@@ -88,7 +88,8 @@ def _make_hash_join(
         output_count,
         shuffler_insertion_method=shuffler_insertion_method,
     )
-    if left != new_left or right != new_right:
+    # Always reconstruct if children changed (either from lowering or shuffling)
+    if ir.children[0] is not new_left or ir.children[1] is not new_right:
         ir = ir.reconstruct([new_left, new_right])
     left = new_left
     right = new_right
