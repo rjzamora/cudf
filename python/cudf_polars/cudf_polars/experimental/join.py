@@ -67,7 +67,7 @@ def _make_hash_join(
     shuffler_insertion_method: ShufflerInsertionMethod,
 ) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
     # Shuffle left and right dataframes (if necessary)
-    new_left = _maybe_shuffle_frame(
+    left = _maybe_shuffle_frame(
         left,
         ir.left_on,
         partition_info,
@@ -75,7 +75,7 @@ def _make_hash_join(
         output_count,
         shuffler_insertion_method=shuffler_insertion_method,
     )
-    new_right = _maybe_shuffle_frame(
+    right = _maybe_shuffle_frame(
         right,
         ir.right_on,
         partition_info,
@@ -83,21 +83,8 @@ def _make_hash_join(
         output_count,
         shuffler_insertion_method=shuffler_insertion_method,
     )
-    # Reconstruct if:
-    # 1. Shuffling was added (left != new_left or right != new_right)
-    # 2. OR the original children were lowered (ir.children != (left, right))
-    # The second case is needed because `left` and `right` are lowered children
-    # passed from lower_ir_node, which may differ from ir's original children.
-    original_left, original_right = ir.children
-    if (
-        left != new_left
-        or right != new_right
-        or original_left is not left
-        or original_right is not right
-    ):
-        ir = ir.reconstruct([new_left, new_right])
-    left = new_left
-    right = new_right
+    # Always reconstruct in case children contain Cache nodes
+    ir = ir.reconstruct([left, right])
 
     # Record new partitioning info
     partitioned_on: tuple[NamedExpr, ...] = ()
