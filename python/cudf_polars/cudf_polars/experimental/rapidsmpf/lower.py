@@ -51,16 +51,8 @@ def _(
 ) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
     # Repartition node: lower child and set output count=1
     # This is used for filter pushdown to force broadcast joins
-    (child,) = ir.children
-    new_child, partition_info = rec(child)
-
-    # Reconstruct with lowered child
-    if new_child is not child:
-        new_node = ir.reconstruct((new_child,))
-    else:
-        new_node = ir
-
-    # Set partition count to 1 (repartition collapses to single partition)
+    child, partition_info = rec(ir.children[0])
+    new_node = ir.reconstruct((child,))
     partition_info[new_node] = PartitionInfo(count=1)
     return new_node, partition_info
 

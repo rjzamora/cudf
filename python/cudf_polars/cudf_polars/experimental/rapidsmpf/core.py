@@ -328,7 +328,6 @@ def lower_ir_graph(
     # Phase 1: Filter pushdown optimization
     # Collect lightweight statistics for selectivity estimation,
     # then rewrite the IR graph to add prefilter semi-joins.
-    # TODO: Add config option to enable/disable filter pushdown
     selectivity_stats = collect_selectivity_stats(ir, config_options)
     ir = add_filters(ir, config_options, selectivity_stats)
 
