@@ -5,13 +5,10 @@
 from __future__ import annotations
 
 import asyncio
-import struct
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from rapidsmpf.memory.buffer import MemoryType
-from rapidsmpf.memory.packed_data import PackedData
-from rapidsmpf.streaming.coll.allgather import AllGather
 from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.core.node import define_py_node
 from rapidsmpf.streaming.cudf.channel_metadata import (
@@ -33,6 +30,7 @@ from cudf_polars.experimental.rapidsmpf.dispatch import (
 )
 from cudf_polars.experimental.rapidsmpf.utils import (
     ChannelManager,
+    allgather_reduce,
     opaque_reservation,
     process_children,
     recv_metadata,
@@ -164,45 +162,6 @@ class DecomposedGroupBy:
             need_preshuffle=need_preshuffle,
             grouped_keys=grouped_keys,
         )
-
-
-# ============================================================================
-# Size Estimation via AllGather
-# ============================================================================
-
-
-async def _allgather_size_estimate(
-    context: Context,
-    local_size: int,
-    local_count: int,
-    op_id: int,
-) -> tuple[int, int]:
-    """
-    Allgather local size estimates to get global totals.
-
-    Returns (global_size, global_count).
-    """
-    # Pack local size and count as two int64s
-    data = struct.pack("qq", local_size, local_count)
-    packed = PackedData.from_host_bytes(data, context.br())
-
-    allgather = AllGather(context, op_id)
-    allgather.insert(0, packed)
-    allgather.insert_finished()
-
-    # Extract all results
-    results = await allgather.extract_all(context, ordered=False)
-
-    # Sum up sizes and counts from all ranks
-    global_size = 0
-    global_count = 0
-    for packed_result in results:
-        result_bytes = packed_result.to_host_bytes()
-        size, count = struct.unpack("qq", result_bytes)
-        global_size += size
-        global_count += count
-
-    return global_size, global_count
 
 
 # ============================================================================
@@ -781,25 +740,20 @@ async def groupby_node(
                 initial_chunks.append(pwise_chunk)
                 del chunk
 
-        # Allgather size estimates to get global picture
+        # Estimate total size: avg_sample_size * local_count, summed across ranks
         local_count = metadata_in.local_count
-        if collective_ids and nranks > 1:
-            global_size, global_count = await _allgather_size_estimate(
-                context, total_pwise_size, len(initial_chunks), collective_ids.pop()
-            )
-            # Estimate total size based on samples
-            if global_count > 0:
-                avg_chunk_size = global_size / global_count
-                estimated_total_size = int(avg_chunk_size * local_count)
-            else:
-                estimated_total_size = 0
+        if initial_chunks:
+            avg_sample_size = total_pwise_size / len(initial_chunks)
+            local_estimate = int(avg_sample_size * local_count)
         else:
-            # Single rank - use local estimate
-            if initial_chunks:
-                avg_chunk_size = total_pwise_size / len(initial_chunks)
-                estimated_total_size = int(avg_chunk_size * local_count)
-            else:
-                estimated_total_size = 0
+            local_estimate = 0
+
+        if collective_ids and nranks > 1:
+            (estimated_total_size,) = await allgather_reduce(
+                context, collective_ids.pop(), local_estimate
+            )
+        else:
+            estimated_total_size = local_estimate
 
         # =====================================================================
         # Strategy Selection

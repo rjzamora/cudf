@@ -85,6 +85,34 @@ def _lower_groupby(
     return new_node, partition_info
 
 
+@lower_ir_node.register(Slice)
+def _lower_slice(
+    ir: Slice, rec: LowerIRTransformer
+) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    """
+    Lower a Slice node for the RapidsMPF streaming runtime.
+
+    Slices require a single partition, so we collapse if needed.
+    """
+    # Lower the child first
+    (child,) = ir.children
+    child, partition_info = rec(child)
+    child_count = partition_info[child].count
+
+    if child_count > 1:
+        # Collapse to single partition before slicing
+        inter = Repartition(child.schema, child)
+        partition_info[inter] = PartitionInfo(count=1)
+        new_node = ir.reconstruct([inter])
+        partition_info[new_node] = PartitionInfo(count=1)
+        return new_node, partition_info
+
+    # Single partition - just reconstruct
+    new_node = ir.reconstruct([child])
+    partition_info[new_node] = PartitionInfo(count=1)
+    return new_node, partition_info
+
+
 @lower_ir_node.register(ShuffleSorted)
 @lower_ir_node.register(StreamingSink)
 def _unsupported(
