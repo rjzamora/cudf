@@ -10,9 +10,9 @@ from contextlib import asynccontextmanager, contextmanager
 from functools import reduce
 from typing import TYPE_CHECKING, Any
 
-from rapidsmpf.streaming.chunks.arbitrary import ArbitraryChunk
 from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.cudf.channel_metadata import (
+    ChannelMetadata,
     HashScheme,
     Partitioning,
 )
@@ -29,7 +29,6 @@ if TYPE_CHECKING:
     from rapidsmpf.streaming.core.channel import Channel
     from rapidsmpf.streaming.core.context import Context
     from rapidsmpf.streaming.core.spillable_messages import SpillableMessages
-    from rapidsmpf.streaming.cudf.channel_metadata import ChannelMetadata
 
     from rmm.pylibrmm.stream import Stream
 
@@ -137,10 +136,20 @@ async def send_metadata(
         The streaming context.
     metadata :
         The metadata to send.
+
+    Notes
+    -----
+    This function copies the metadata before sending, so the caller
+    retains ownership of the original metadata object.
     """
-    # Use ArbitraryChunk wrapper to avoid potential bugs in
-    # ChannelMetadata.into_message() (under review in rapidsmpf).
-    msg = Message(0, ArbitraryChunk(metadata))
+    # Copy metadata before sending since Message consumes the handle.
+    # Metadata is small, so copying is cheap.
+    metadata_copy = ChannelMetadata(
+        local_count=metadata.local_count,
+        partitioning=metadata.partitioning,
+        duplicated=metadata.duplicated,
+    )
+    msg = Message(0, metadata_copy)
     await ch.send_metadata(ctx, msg)
     await ch.drain_metadata(ctx)
 
@@ -161,11 +170,9 @@ async def recv_metadata(ch: Channel[TableChunk], ctx: Context) -> ChannelMetadat
     ChannelMetadata
         The received metadata.
     """
-    # Use ArbitraryChunk wrapper to avoid potential bugs in
-    # ChannelMetadata.from_message() (under review in rapidsmpf).
     msg = await ch.recv_metadata(ctx)
     assert msg is not None, f"Expected ChannelMetadata message, got {msg}."
-    return ArbitraryChunk.from_message(msg).release()
+    return ChannelMetadata.from_message(msg)
 
 
 class ChannelManager:
