@@ -333,13 +333,24 @@ async def _tree_groupby(
     metadata_in: ChannelMetadata,
     initial_chunks: list[TableChunk],
     groupby_n_ary: int,
+    collective_id: int | None = None,
 ) -> None:
-    """Execute groupby using N-ary tree reduction to single output."""
-    # Output: single chunk, possibly duplicated
+    """
+    Execute groupby using N-ary tree reduction to single output.
+
+    When collective_id is provided and data is not duplicated, uses allgather
+    to collect partial results from all ranks before final reduction.
+    """
+    nranks = context.comm().nranks
+    need_allgather = (
+        collective_id is not None and not metadata_in.duplicated and nranks > 1
+    )
+
+    # Output: single chunk, duplicated if allgather is used
     metadata_out = ChannelMetadata(
         local_count=1,
         partitioning=None,
-        duplicated=metadata_in.duplicated,
+        duplicated=True if need_allgather else metadata_in.duplicated,
     )
     await send_metadata(ch_out, context, metadata_out)
 
@@ -401,6 +412,50 @@ async def _tree_groupby(
                     )
                     del df
         pwise_chunks = new_chunks
+
+    # Allgather partial results from all ranks if needed
+    if need_allgather and pwise_chunks:
+        assert collective_id is not None
+        allgather = AllGatherManager(context, collective_id)
+
+        # Insert local result (should be single chunk after tree reduction)
+        for seq_num, chunk in enumerate(pwise_chunks):
+            allgather.insert(seq_num, chunk)
+        allgather.insert_finished()
+
+        # Extract concatenated results from all ranks
+        stream = ir_context.get_cuda_stream()
+        gathered_table = await allgather.extract_concatenated(stream)
+        pwise_chunks = [
+            TableChunk.from_pylibcudf_table(gathered_table, stream, exclusive_view=True)
+        ]
+
+        # One more reduction round to merge results from all ranks
+        if pwise_chunks:
+            chunk = pwise_chunks[0]
+            input_bytes = chunk.data_alloc_size(MemoryType.DEVICE)
+            with opaque_reservation(context, input_bytes):
+                pwise_schema = decomposed.piecewise_ir.schema
+                concatenated = DataFrame.from_table(
+                    chunk.table_view(),
+                    list(pwise_schema.keys()),
+                    list(pwise_schema.values()),
+                    chunk.stream,
+                )
+                del chunk
+                df = await asyncio.to_thread(
+                    decomposed.reduction_ir.do_evaluate,
+                    *decomposed.reduction_ir._non_child_args,
+                    concatenated,
+                    context=ir_context,
+                )
+                del concatenated
+                pwise_chunks = [
+                    TableChunk.from_pylibcudf_table(
+                        df.table, df.stream, exclusive_view=True
+                    )
+                ]
+                del df
 
     # Apply final selection and send
     if pwise_chunks:
@@ -760,7 +815,7 @@ async def groupby_node(
         # =====================================================================
 
         if already_partitioned or can_skip_global_comm:
-            # No global communication needed - use tree reduction
+            # No global communication needed - use tree reduction (no allgather)
             await _tree_groupby(
                 context,
                 decomposed,
@@ -772,7 +827,7 @@ async def groupby_node(
                 groupby_n_ary,
             )
         elif estimated_total_size < target_partition_size:
-            # Small output - use tree reduction
+            # Small output - use tree reduction with allgather to merge across ranks
             await _tree_groupby(
                 context,
                 decomposed,
@@ -782,9 +837,10 @@ async def groupby_node(
                 metadata_in,
                 initial_chunks,
                 groupby_n_ary,
+                collective_ids.pop() if collective_ids else None,
             )
         elif not collective_ids:
-            # No shuffle ID available - fall back to tree
+            # No shuffle ID available - fall back to tree (no allgather)
             await _tree_groupby(
                 context,
                 decomposed,
