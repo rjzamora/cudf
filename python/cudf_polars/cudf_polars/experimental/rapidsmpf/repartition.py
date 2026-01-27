@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from rapidsmpf.memory.buffer import MemoryType
 from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.core.node import define_py_node
+from rapidsmpf.streaming.cudf.channel_metadata import ChannelMetadata
 from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
 from cudf_polars.containers import DataFrame
@@ -18,7 +19,6 @@ from cudf_polars.experimental.rapidsmpf.dispatch import generate_ir_sub_network
 from cudf_polars.experimental.rapidsmpf.nodes import shutdown_on_error
 from cudf_polars.experimental.rapidsmpf.utils import (
     ChannelManager,
-    Metadata,
     empty_table_chunk,
     opaque_reservation,
     recv_metadata,
@@ -99,12 +99,12 @@ async def concatenate_node(
             local_output_count = max(1, math.ceil(output_count / nranks))
             output_duplicated = False
 
-        # NOTE: For now, Repartiton (e.g. concatenate_node) always destroys
+        # NOTE: For now, Repartition (e.g. concatenate_node) always destroys
         # partitioning metadata. However, this may change when we support
-        # partitioning types other than HashPartitioned. For example, when
-        # we adopt multi-stage shuffling (a global shuffle between ranks,
-        # followed by a local shuffle within each rank), some cases will
-        # preserve global partitioning.
+        # additional partitioning schemes. For example, when we adopt
+        # multi-stage shuffling (a global shuffle between ranks, followed
+        # by a local shuffle within each rank), some cases will preserve
+        # global partitioning.
 
         # max_chunks corresponds to the number of input chunks we can
         # concatenate together per output chunk.
@@ -127,9 +127,8 @@ async def concatenate_node(
             # Global repartitioning via AllGather to single duplicated chunk.
 
             # Send metadata.
-            metadata = Metadata(
+            metadata = ChannelMetadata(
                 local_count=local_output_count,
-                global_count=output_count,
                 duplicated=output_duplicated,
             )
             await send_metadata(ch_out, context, metadata)
@@ -160,9 +159,8 @@ async def concatenate_node(
             # Local repartitioning (tree reduction).
 
             # Send metadata.
-            metadata = Metadata(
+            metadata = ChannelMetadata(
                 local_count=local_output_count,
-                global_count=output_count,
                 duplicated=output_duplicated,
             )
             await send_metadata(ch_out, context, metadata)

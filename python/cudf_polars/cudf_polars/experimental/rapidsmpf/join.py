@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from rapidsmpf.memory.buffer import MemoryType
 from rapidsmpf.streaming.core.message import Message
+from rapidsmpf.streaming.cudf.channel_metadata import ChannelMetadata
 from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
 from cudf_polars.containers import DataFrame
@@ -24,12 +25,12 @@ from cudf_polars.experimental.rapidsmpf.nodes import (
 )
 from cudf_polars.experimental.rapidsmpf.utils import (
     ChannelManager,
-    Metadata,
     chunk_to_frame,
     empty_table_chunk,
     opaque_reservation,
     process_children,
     recv_metadata,
+    remap_partitioning,
     send_metadata,
 )
 from cudf_polars.experimental.utils import _concat
@@ -37,10 +38,10 @@ from cudf_polars.experimental.utils import _concat
 if TYPE_CHECKING:
     from rapidsmpf.streaming.core.channel import Channel
     from rapidsmpf.streaming.core.context import Context
+    from rapidsmpf.streaming.cudf.channel_metadata import Partitioning
 
     from cudf_polars.dsl.ir import IR, IRExecutionContext
     from cudf_polars.experimental.rapidsmpf.core import SubNetGenerator
-    from cudf_polars.experimental.rapidsmpf.utils import HashPartitioned
 
 
 @define_py_node()
@@ -86,7 +87,7 @@ async def broadcast_join_node(
             recv_metadata(ch_right, context),
         )
 
-        partitioning: HashPartitioned | None = None
+        partitioning: Partitioning | None = None
         if broadcast_side == "right":
             # Broadcast right, stream left
             small_ch = ch_right
@@ -95,8 +96,10 @@ async def broadcast_join_node(
             large_child = ir.children[0]
             # Preserve left-side partitioning metadata
             local_count = left_metadata.local_count
-            global_count = left_metadata.global_count
-            partitioning = left_metadata.partitioning
+            # Remap partitioning from child schema to output schema
+            partitioning = remap_partitioning(
+                left_metadata.partitioning, large_child.schema, ir.schema
+            )
             # Check if the right-side is already broadcasted
             small_duplicated = right_metadata.duplicated
         else:
@@ -107,16 +110,17 @@ async def broadcast_join_node(
             large_child = ir.children[1]
             # Preserve right-side partitioning metadata
             local_count = right_metadata.local_count
-            global_count = right_metadata.global_count
             if ir.options[0] == "Right":
-                partitioning = right_metadata.partitioning
+                # Remap partitioning from child schema to output schema
+                partitioning = remap_partitioning(
+                    right_metadata.partitioning, large_child.schema, ir.schema
+                )
             # Check if the right-side is already broadcasted
             small_duplicated = left_metadata.duplicated
 
         # Send metadata.
-        output_metadata = Metadata(
+        output_metadata = ChannelMetadata(
             local_count=local_count,
-            global_count=global_count,
             partitioning=partitioning,
             # The result is only "duplicated" if both sides are duplicated
             duplicated=left_metadata.duplicated and right_metadata.duplicated,

@@ -8,10 +8,14 @@ import asyncio
 import operator
 from contextlib import asynccontextmanager, contextmanager
 from functools import reduce
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from rapidsmpf.streaming.chunks.arbitrary import ArbitraryChunk
 from rapidsmpf.streaming.core.message import Message
+from rapidsmpf.streaming.cudf.channel_metadata import (
+    HashScheme,
+    Partitioning,
+)
 from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
 import pylibcudf as plc
@@ -19,17 +23,19 @@ import pylibcudf as plc
 from cudf_polars.containers import DataFrame
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 
     from rapidsmpf.memory.memory_reservation import MemoryReservation
     from rapidsmpf.streaming.core.channel import Channel
     from rapidsmpf.streaming.core.context import Context
     from rapidsmpf.streaming.core.spillable_messages import SpillableMessages
+    from rapidsmpf.streaming.cudf.channel_metadata import ChannelMetadata
 
     from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.dsl.ir import IR
     from cudf_polars.experimental.rapidsmpf.dispatch import SubNetGenerator
+    from cudf_polars.typing import DataType
 
 
 @asynccontextmanager
@@ -54,82 +60,71 @@ async def shutdown_on_error(
         raise
 
 
-class HashPartitioned:
+def remap_partitioning(
+    partitioning: Partitioning | None,
+    old_schema: Mapping[str, DataType],
+    new_schema: Mapping[str, DataType],
+) -> Partitioning | None:
     """
-    Hash-partitioned metadata.
+    Remap partitioning column indices from old schema to new schema.
 
-    Attributes
+    Since HashScheme uses column indices rather than names, we need to
+    remap indices when propagating partitioning through operations that
+    may change the schema (column order or presence).
+
+    Parameters
     ----------
-    columns
-        Columns the data is hash-partitioned on.
-    scope
-        Whether data is partitioned locally (within a rank) or
-        globally (across all ranks).
-    count
-        The modulus used for hash partitioning (number of partitions).
+    partitioning
+        The partitioning to remap.
+    old_schema
+        The schema where the partitioning was established.
+    new_schema
+        The new schema to remap to.
+
+    Returns
+    -------
+    The remapped partitioning, or None if any partitioning column
+    is not present in the new schema.
     """
+    if partitioning is None:
+        return None
 
-    __slots__ = ("columns", "count", "scope")
+    old_names = list(old_schema.keys())
+    new_names = list(new_schema.keys())
 
-    columns: tuple[str, ...]
-    scope: Literal["local", "global"]
-    count: int
+    def remap_hash_scheme(hs: HashScheme | None | str) -> HashScheme | None | str:
+        if hs is None or isinstance(hs, str):
+            # None or "aligned" - pass through unchanged
+            return hs
+        # Get column names from old indices
+        try:
+            column_names = [old_names[i] for i in hs.column_indices]
+        except IndexError:
+            return None  # Invalid index in old schema
+        # Check all exist in new schema and map to new indices
+        new_indices = []
+        for name in column_names:
+            if name not in new_names:
+                return None  # Column not in new schema - partitioning invalidated
+            new_indices.append(new_names.index(name))
+        return HashScheme(tuple(new_indices), hs.modulus)
 
-    def __init__(
-        self,
-        columns: tuple[str, ...],
-        scope: Literal["local", "global"],
-        count: int,
-    ):
-        self.columns = columns
-        self.scope = scope
-        self.count = count
+    new_inter_rank = remap_hash_scheme(partitioning.inter_rank)
+    new_local = remap_hash_scheme(partitioning.local)
 
+    # If inter_rank was a HashScheme and got invalidated, whole partitioning is invalid
+    if isinstance(partitioning.inter_rank, HashScheme) and new_inter_rank is None:
+        return None
 
-class Metadata:
-    """Metadata payload for a channel."""
+    # If local was a HashScheme and got invalidated, set it to None
+    if isinstance(partitioning.local, HashScheme) and new_local is None:
+        new_local = None
 
-    __slots__ = (
-        "duplicated",
-        "global_count",
-        "local_count",
-        "partitioning",
-    )
-
-    # Chunk counts
-    local_count: int
-    """Local chunk-count estimate for the current rank."""
-    global_count: int | None
-    """Global chunk-count estimate across all ranks."""
-
-    # Partitioning
-    partitioning: HashPartitioned | None
-    """How the data is hash-partitioned, or None if not partitioned."""
-
-    # Duplication
-    duplicated: bool
-    """Whether the data is duplicated (identical) on all workers."""
-
-    def __init__(
-        self,
-        local_count: int,
-        *,
-        global_count: int | None = None,
-        partitioning: HashPartitioned | None = None,
-        duplicated: bool = False,
-    ):
-        if local_count < 0:  # pragma: no cover
-            raise ValueError(f"Local count must be non-negative. Got: {local_count}")
-        self.local_count = local_count
-        if global_count is not None and global_count < 0:  # pragma: no cover
-            raise ValueError(f"Global count must be non-negative. Got: {global_count}")
-        self.global_count = global_count
-        self.partitioning = partitioning
-        self.duplicated = duplicated
+    return Partitioning(inter_rank=new_inter_rank, local=new_local)
 
 
 async def send_metadata(
-    ch: Channel[TableChunk], ctx: Context, metadata: Metadata
+    ch: Channel[TableChunk], ctx: Context, metadata: ChannelMetadata
 ) -> None:
     """
     Send metadata and drain the metadata queue.
@@ -143,12 +138,14 @@ async def send_metadata(
     metadata :
         The metadata to send.
     """
+    # Use ArbitraryChunk wrapper to avoid potential bugs in
+    # ChannelMetadata.into_message() (under review in rapidsmpf).
     msg = Message(0, ArbitraryChunk(metadata))
     await ch.send_metadata(ctx, msg)
     await ch.drain_metadata(ctx)
 
 
-async def recv_metadata(ch: Channel[TableChunk], ctx: Context) -> Metadata:
+async def recv_metadata(ch: Channel[TableChunk], ctx: Context) -> ChannelMetadata:
     """
     Receive metadata from a channel's metadata queue.
 
@@ -161,11 +158,13 @@ async def recv_metadata(ch: Channel[TableChunk], ctx: Context) -> Metadata:
 
     Returns
     -------
-    Metadata
+    ChannelMetadata
         The received metadata.
     """
+    # Use ArbitraryChunk wrapper to avoid potential bugs in
+    # ChannelMetadata.from_message() (under review in rapidsmpf).
     msg = await ch.recv_metadata(ctx)
-    assert msg is not None, f"Expected Metadata message, got {msg}."
+    assert msg is not None, f"Expected ChannelMetadata message, got {msg}."
     return ArbitraryChunk.from_message(msg).release()
 
 
