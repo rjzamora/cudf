@@ -25,6 +25,7 @@ from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 import rmm
 
 import cudf_polars.experimental.rapidsmpf.collectives.shuffle
+import cudf_polars.experimental.rapidsmpf.groupby
 import cudf_polars.experimental.rapidsmpf.io
 import cudf_polars.experimental.rapidsmpf.join
 import cudf_polars.experimental.rapidsmpf.lower
@@ -95,7 +96,7 @@ def evaluate_logical_plan(
     ir, partition_info, stats = lower_ir_graph(ir, config_options)
 
     # Reserve shuffle IDs for the entire pipeline execution
-    with ReserveOpIDs(ir) as collective_id_map:
+    with ReserveOpIDs(ir, config_options) as collective_id_map:
         # Build and execute the streaming pipeline.
         # This must be done on all worker processes
         # for cluster == "distributed".
