@@ -283,6 +283,19 @@ def _(
             msg=f"Join({maintain_order=}) not supported for multiple partitions.",
         )
 
+    # Check for dynamic planning - defer broadcast vs shuffle decision to runtime
+    # Only use dynamic planning for inner/left/semi/anti joins (not right/full)
+    join_type = ir.options[0]
+    if (
+        config_options.executor.runtime == "rapidsmpf"
+        and config_options.executor.dynamic_planning.enabled
+        and join_type in ("Inner", "Left", "Semi", "Anti")
+    ):
+        # Don't insert Shuffle nodes - let runtime decide strategy
+        new_node = ir.reconstruct(children)
+        partition_info[new_node] = PartitionInfo(count=output_count)
+        return new_node, partition_info
+
     if _should_bcast_join(
         ir,
         left,
