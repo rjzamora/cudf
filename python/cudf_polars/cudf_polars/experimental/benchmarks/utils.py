@@ -259,6 +259,7 @@ class RunConfig:
     max_io_threads: int
     native_parquet: bool
     spill_to_pinned_memory: bool
+    dynamic_planning: bool | None = None
 
     def __post_init__(self) -> None:  # noqa: D105
         if self.gather_shuffle_stats and self.shuffle != "rapidsmpf":
@@ -377,6 +378,7 @@ class RunConfig:
             max_io_threads=args.max_io_threads,
             native_parquet=args.native_parquet,
             spill_to_pinned_memory=args.spill_to_pinned_memory,
+            dynamic_planning=args.dynamic_planning,
         )
 
     def serialize(self, engine: pl.GPUEngine | None) -> dict:
@@ -469,6 +471,10 @@ def get_executor_options(
         executor_options["runtime"] = run_config.runtime
         executor_options["max_io_threads"] = run_config.max_io_threads
         executor_options["spill_to_pinned_memory"] = run_config.spill_to_pinned_memory
+        if run_config.dynamic_planning is not None:
+            executor_options["dynamic_planning"] = {
+                "enabled": run_config.dynamic_planning
+            }
 
     if (
         benchmark
@@ -476,6 +482,8 @@ def get_executor_options(
         and run_config.executor == "streaming"
         # Only use the unique_fraction config if stats_planning is disabled
         and not run_config.stats_planning
+        # And if dynamic planning is disabled
+        and not run_config.dynamic_planning
     ):
         executor_options["unique_fraction"] = {
             "c_custkey": 0.05,
@@ -761,6 +769,20 @@ def parse_args(
         choices=["tasks", "rapidsmpf"],
         default="tasks",
         help="Runtime to use for the streaming executor (tasks or rapidsmpf).",
+    )
+    dynamic_planning_group = parser.add_mutually_exclusive_group()
+    dynamic_planning_group.add_argument(
+        "--dynamic-planning",
+        dest="dynamic_planning",
+        action="store_true",
+        default=None,
+        help="Enable dynamic planning for shuffle decisions at runtime.",
+    )
+    dynamic_planning_group.add_argument(
+        "--no-dynamic-planning",
+        dest="dynamic_planning",
+        action="store_false",
+        help="Disable dynamic planning (use static lowering).",
     )
     parser.add_argument(
         "--stream-policy",
