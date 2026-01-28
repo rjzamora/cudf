@@ -82,6 +82,26 @@ def _get_partitioning_modulus(metadata: ChannelMetadata) -> int | None:
     return inter_rank.modulus
 
 
+def _get_key_partitioning_modulus(
+    metadata: ChannelMetadata,
+    key_indices: tuple[int, ...],
+) -> int | None:
+    """
+    Get the modulus if data is partitioned on the specified keys.
+
+    Returns the modulus if partitioned on exactly the given keys, else None.
+    """
+    if metadata.partitioning is None:
+        return None
+    inter_rank = metadata.partitioning.inter_rank
+    if inter_rank is None or inter_rank == "aligned":
+        return None
+    # Check if partitioned on same keys
+    if set(inter_rank.column_indices) != set(key_indices):
+        return None
+    return inter_rank.modulus
+
+
 @define_py_node()
 async def broadcast_join_node(
     context: Context,
@@ -391,9 +411,10 @@ async def _broadcast_join(
                 stream,
             )
         ]
-    elif len(small_chunks) > 1 and (
-        ir.options[0] != "Inner" or small_size < target_partition_size
-    ):
+    elif len(small_chunks) > 1:
+        # Always concatenate multiple small chunks into one DataFrame.
+        # This avoids O(large_chunks * small_chunks) join operations.
+        # Since we're broadcasting, all data must be in memory anyway.
         small_dfs = [
             _concat(
                 *[chunk_to_frame(chunk, small_child) for chunk in small_chunks],
@@ -968,10 +989,6 @@ async def join_node(
             )
         else:
             # Shuffle join path
-            # Calculate output partition count
-            total_size = left_total + right_total
-            output_count = max(1, total_size // target_partition_size)
-            modulus = nranks * output_count
 
             # Get key column indices for checking partitioning
             left_schema_keys = list(ir.children[0].schema.keys())
@@ -984,6 +1001,48 @@ async def join_node(
             )
 
             # Check if either side is already partitioned on join keys
+            left_existing_modulus = _get_key_partitioning_modulus(
+                left_metadata, left_key_indices
+            )
+            right_existing_modulus = _get_key_partitioning_modulus(
+                right_metadata, right_key_indices
+            )
+
+            # Estimate output size - use max of inputs as rough heuristic
+            # (joins can expand or contract; max is a reasonable middle ground)
+            estimated_output_size = max(left_total, right_total)
+            min_output_count = max(1, estimated_output_size // target_partition_size)
+            min_modulus = nranks * min_output_count
+
+            # Determine which modulus to use, preferring existing partitioning
+            # if it provides at least the minimum needed partitions
+            if left_existing_modulus is not None and right_existing_modulus is not None:
+                # Both sides partitioned - use the larger modulus if compatible
+                # (one must be a multiple of the other for compatibility)
+                if left_existing_modulus >= right_existing_modulus:
+                    if left_existing_modulus % right_existing_modulus == 0:
+                        modulus = left_existing_modulus
+                    else:
+                        # Incompatible - use whichever is larger
+                        modulus = max(left_existing_modulus, right_existing_modulus)
+                else:
+                    if right_existing_modulus % left_existing_modulus == 0:
+                        modulus = right_existing_modulus
+                    else:
+                        modulus = max(left_existing_modulus, right_existing_modulus)
+            elif left_existing_modulus is not None:
+                # Only left is partitioned - use its modulus if sufficient
+                modulus = max(left_existing_modulus, min_modulus)
+            elif right_existing_modulus is not None:
+                # Only right is partitioned - use its modulus if sufficient
+                modulus = max(right_existing_modulus, min_modulus)
+            else:
+                # Neither side partitioned - compute fresh
+                modulus = min_modulus
+
+            output_count = modulus // nranks
+
+            # Now check which sides need shuffling with the chosen modulus
             left_partitioned = _is_partitioned_on_keys(
                 left_metadata, left_key_indices, modulus
             )
