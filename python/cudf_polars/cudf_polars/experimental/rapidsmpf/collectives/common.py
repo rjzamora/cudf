@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Literal
 
 from rapidsmpf.shuffler import Shuffler
 
-from cudf_polars.dsl.ir import GroupBy
+from cudf_polars.dsl.ir import Distinct, GroupBy
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.experimental.join import Join
 from cudf_polars.experimental.repartition import Repartition
@@ -80,8 +80,8 @@ class ReserveOpIDs:
         # Find all collective IR nodes.
         collective_types: tuple[type, ...] = (Shuffle, Join, Repartition)
         if self.dynamic_planning_enabled:
-            # Include GroupBy when dynamic planning is enabled
-            collective_types = (Shuffle, Join, Repartition, GroupBy)
+            # Include GroupBy and Distinct when dynamic planning is enabled
+            collective_types = (Shuffle, Join, Repartition, GroupBy, Distinct)
 
         self.collective_nodes: list[IR] = [
             node for node in traversal([ir]) if isinstance(node, collective_types)
@@ -101,8 +101,8 @@ class ReserveOpIDs:
         """
         # Reserve IDs and map nodes to a list of IDs
         for node in self.collective_nodes:
-            if isinstance(node, GroupBy) and self.dynamic_planning_enabled:
-                # GroupBy needs 2 IDs: one for size allgather, one for shuffle
+            if isinstance(node, (GroupBy, Distinct)) and self.dynamic_planning_enabled:
+                # GroupBy/Distinct need 2 IDs: one for size allgather, one for shuffle
                 self.collective_id_map[node] = [
                     _get_new_collective_id(),
                     _get_new_collective_id(),

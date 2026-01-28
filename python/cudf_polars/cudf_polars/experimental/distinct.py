@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 """Multi-partition Distinct logic."""
 
@@ -175,7 +175,47 @@ def _(
     assert config_options.executor.name == "streaming", (
         "'in-memory' executor not supported in 'lower_ir_node'"
     )
+    child_count = partition_info[child].count
 
+    # Check if dynamic planning is enabled
+    use_dynamic = (
+        config_options.executor.dynamic_planning.enabled
+        and rec.state.get("runtime") == "rapidsmpf"
+    )
+
+    if use_dynamic:
+        # Dynamic planning: preserve partition count, defer strategy selection
+        # to runtime. Handle zlice by extracting it to a separate Slice node.
+        from cudf_polars.dsl.ir import Slice
+
+        new_node: IR
+        if ir.zlice is not None:
+            offset, length = ir.zlice
+            if offset == 0 and length is not None:
+                # Supported slice: extract to separate Slice node
+                new_node = ir.reconstruct([child])
+                new_node = Distinct(
+                    new_node.schema,
+                    new_node.keep,
+                    new_node.subset,
+                    None,  # Remove zlice from Distinct
+                    new_node.stable,
+                    child,
+                )
+                partition_info[new_node] = PartitionInfo(count=child_count)
+                slice_node = Slice(new_node.schema, offset, length, new_node)
+                partition_info[slice_node] = PartitionInfo(count=child_count)
+                return slice_node, partition_info
+            else:
+                # Unsupported slice offset - fall through to base lowering
+                pass
+        else:
+            # No zlice - just preserve partition count
+            new_node = ir.reconstruct([child])
+            partition_info[new_node] = PartitionInfo(count=child_count)
+            return new_node, partition_info
+
+    # Base lowering path (statistics-based or fallback)
     subset: frozenset[str] = ir.subset or frozenset(ir.schema)
     unique_fraction_dict = _get_unique_fractions(
         tuple(subset),
