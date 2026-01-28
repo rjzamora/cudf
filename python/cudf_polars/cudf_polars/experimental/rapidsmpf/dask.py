@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from rapidsmpf.streaming.cudf.channel_metadata import ChannelMetadata
 
     from cudf_polars.dsl.ir import IR
-    from cudf_polars.experimental.base import PartitionInfo, StatsCollector
+    from cudf_polars.experimental.base import PartitionInfo, Profiler, StatsCollector
     from cudf_polars.experimental.parallel import ConfigOptions
 
 
@@ -39,8 +39,8 @@ class EvaluatePipelineCallback(Protocol):
         rmpf_context: Context | None = None,
         *,
         collect_metadata: bool = False,
-    ) -> tuple[pl.DataFrame, list[ChannelMetadata] | None]:
-        """Evaluate a pipeline and return the result DataFrame and metadata."""
+    ) -> tuple[pl.DataFrame, list[ChannelMetadata] | None, Profiler | None]:
+        """Evaluate a pipeline and return the result DataFrame, metadata, and profiler."""
         ...
 
 
@@ -61,7 +61,7 @@ def evaluate_pipeline_dask(
     collective_id_map: dict[IR, list[int]],
     *,
     collect_metadata: bool = False,
-) -> tuple[pl.DataFrame, list[ChannelMetadata] | None]:
+) -> tuple[pl.DataFrame, list[ChannelMetadata] | None, Profiler | None]:
     """
     Evaluate a RapidsMPF streaming pipeline on a Dask cluster.
 
@@ -84,8 +84,10 @@ def evaluate_pipeline_dask(
 
     Returns
     -------
-    The output DataFrame and metadata collector.
+    The output DataFrame, metadata collector, and merged profiler.
     """
+    from cudf_polars.experimental.base import Profiler
+
     client = get_dask_client()
     result = client.run(
         _evaluate_pipeline_dask,
@@ -99,12 +101,17 @@ def evaluate_pipeline_dask(
     )
     dfs: list[pl.DataFrame] = []
     metadata_collector: list[ChannelMetadata] = []
-    for df, md in result.values():
+    merged_profiler: Profiler | None = None
+    for df, md, prof in result.values():
         dfs.append(df)
         if md is not None:
             metadata_collector.extend(md)
+        if prof is not None:
+            if merged_profiler is None:
+                merged_profiler = Profiler()
+            merged_profiler.merge(prof)
 
-    return pl.concat(dfs), metadata_collector or None
+    return pl.concat(dfs), metadata_collector or None, merged_profiler
 
 
 def _evaluate_pipeline_dask(
@@ -117,7 +124,7 @@ def _evaluate_pipeline_dask(
     dask_worker: Any = None,
     *,
     collect_metadata: bool = False,
-) -> tuple[pl.DataFrame, list[ChannelMetadata] | None]:
+) -> tuple[pl.DataFrame, list[ChannelMetadata] | None, Profiler | None]:
     """
     Build and evaluate a RapidsMPF streaming pipeline.
 
@@ -144,7 +151,7 @@ def _evaluate_pipeline_dask(
 
     Returns
     -------
-    The output DataFrame and metadata collector.
+    The output DataFrame, metadata collector, and profiler.
     """
     assert dask_worker is not None, "Dask worker must be provided"
     assert config_options.executor.name == "streaming", "Executor must be streaming"

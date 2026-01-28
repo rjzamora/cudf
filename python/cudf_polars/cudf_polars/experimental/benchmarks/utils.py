@@ -260,6 +260,7 @@ class RunConfig:
     native_parquet: bool
     spill_to_pinned_memory: bool
     dynamic_planning: bool | None = None
+    profile_output: str | None = None
 
     def __post_init__(self) -> None:  # noqa: D105
         if self.gather_shuffle_stats and self.shuffle != "rapidsmpf":
@@ -379,6 +380,7 @@ class RunConfig:
             native_parquet=args.native_parquet,
             spill_to_pinned_memory=args.spill_to_pinned_memory,
             dynamic_planning=args.dynamic_planning,
+            profile_output=args.profile_output,
         )
 
     def serialize(self, engine: pl.GPUEngine | None) -> dict:
@@ -475,6 +477,8 @@ def get_executor_options(
             executor_options["dynamic_planning"] = {
                 "enabled": run_config.dynamic_planning
             }
+        if run_config.profile_output is not None:
+            executor_options["profile_output"] = run_config.profile_output
 
     if (
         benchmark
@@ -783,6 +787,13 @@ def parse_args(
         dest="dynamic_planning",
         action="store_false",
         help="Disable dynamic planning (use static lowering).",
+    )
+    parser.add_argument(
+        "--profile-output",
+        dest="profile_output",
+        type=str,
+        default=None,
+        help="Path to write runtime profile (row counts and decisions) for debugging.",
     )
     parser.add_argument(
         "--stream-policy",

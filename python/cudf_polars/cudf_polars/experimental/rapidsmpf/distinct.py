@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from rapidsmpf.streaming.core.channel import Channel
     from rapidsmpf.streaming.core.context import Context
 
+    from cudf_polars.experimental.base import Profiler
     from cudf_polars.experimental.rapidsmpf.dispatch import SubNetGenerator
 
 
@@ -69,6 +70,7 @@ async def _tree_distinct(
     initial_chunks: list[TableChunk],
     n_ary: int,
     collective_id: int | None = None,
+    profiler: Profiler | None = None,
 ) -> None:
     """
     Tree-based distinct reduction.
@@ -194,6 +196,8 @@ async def _tree_distinct(
 
     # Send final result
     if distinct_chunks:
+        if profiler is not None:
+            profiler.row_count[ir] += distinct_chunks[0].table_view().num_rows()
         await ch_out.send(context, Message(0, distinct_chunks[0]))
     else:
         stream = ir_context.get_cuda_stream()
@@ -213,6 +217,7 @@ async def _shuffle_distinct(
     output_count: int,
     collective_id: int,
     key_indices: tuple[int, ...],
+    profiler: Profiler | None = None,
 ) -> None:
     """
     Shuffle-based distinct.
@@ -264,6 +269,7 @@ async def _shuffle_distinct(
     # Extract shuffled partitions and apply local distinct
     input_schema = ir.children[0].schema
     stream = ir_context.get_cuda_stream()
+    n_rows_out = 0
     for seq_num, partition_id in enumerate(
         range(context.comm().rank, output_count, nranks)
     ):
@@ -289,10 +295,13 @@ async def _shuffle_distinct(
             output_chunk = TableChunk.from_pylibcudf_table(
                 df.table, df.stream, exclusive_view=True
             )
+            n_rows_out += output_chunk.table_view().num_rows()
             del df, partition_chunk
 
         await ch_out.send(context, Message(seq_num, output_chunk))
 
+    if profiler is not None:
+        profiler.row_count[ir] += n_rows_out
     await ch_out.drain(context)
 
 
@@ -312,6 +321,7 @@ async def unique_node(
     target_partition_size: int,
     n_ary: int,
     collective_ids: list[int],
+    profiler: Profiler | None = None,
 ) -> None:
     """
     Dynamic Distinct node that selects the best strategy at runtime.
@@ -384,6 +394,8 @@ async def unique_node(
 
         if already_partitioned or can_skip_global_comm:
             # No global communication needed - use tree reduction (no allgather)
+            if profiler is not None:
+                profiler.decisions[ir] = "tree_local"
             await _tree_distinct(
                 context,
                 ir,
@@ -393,9 +405,12 @@ async def unique_node(
                 metadata_in,
                 initial_chunks,
                 n_ary,
+                profiler=profiler,
             )
         elif estimated_total_size < target_partition_size:
             # Small output - use tree reduction with allgather to merge across ranks
+            if profiler is not None:
+                profiler.decisions[ir] = "tree_allgather"
             await _tree_distinct(
                 context,
                 ir,
@@ -406,9 +421,12 @@ async def unique_node(
                 initial_chunks,
                 n_ary,
                 collective_ids.pop() if collective_ids else None,
+                profiler,
             )
         elif not collective_ids:
             # No shuffle ID available - fall back to tree (no allgather)
+            if profiler is not None:
+                profiler.decisions[ir] = "tree_fallback"
             await _tree_distinct(
                 context,
                 ir,
@@ -418,9 +436,12 @@ async def unique_node(
                 metadata_in,
                 initial_chunks,
                 n_ary,
+                profiler=profiler,
             )
         else:
             # Large output - use shuffle
+            if profiler is not None:
+                profiler.decisions[ir] = "shuffle"
             output_count = max(1, estimated_total_size // target_partition_size)
             await _shuffle_distinct(
                 context,
@@ -433,6 +454,7 @@ async def unique_node(
                 output_count,
                 collective_ids.pop(),
                 key_indices,
+                profiler,
             )
 
 
@@ -478,6 +500,7 @@ def _(
             executor.target_partition_size,
             executor.groupby_n_ary,  # Reuse groupby n_ary for now
             collective_ids,
+            rec.state["profiler"],
         )
     ]
 

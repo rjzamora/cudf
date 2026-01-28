@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
@@ -26,11 +26,12 @@ from cudf_polars.utils.config import ConfigOptions
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping
+    from pathlib import Path
 
     import polars as pl
 
     from cudf_polars.dsl.ir import IR
-    from cudf_polars.experimental.base import PartitionInfo, StatsCollector
+    from cudf_polars.experimental.base import PartitionInfo, Profiler, StatsCollector
 
 
 def explain_query(
@@ -168,3 +169,68 @@ def _(ir: Sort, *, offset: str = "") -> str:
 def _(ir: Scan, *, offset: str = "") -> str:
     label = f"SCAN {ir.typ.upper()}"
     return _repr_header(offset, label, ir.schema)
+
+
+def write_profile_output(
+    profile_output: str | Path,
+    ir: IR,
+    partition_info: MutableMapping[IR, PartitionInfo],
+    profiler: Profiler,
+) -> None:
+    """
+    Write a post-execution profile showing actual row counts and decisions.
+
+    Parameters
+    ----------
+    profile_output
+        Path to write the profile file.
+    ir
+        The lowered IR root node.
+    partition_info
+        Partition information for the IR nodes.
+    profiler
+        The profiler with actual row counts and decisions from execution.
+    """
+    from pathlib import Path
+
+    profile_repr = _repr_profile_tree(ir, partition_info, profiler)
+    Path(profile_output).write_text(profile_repr)
+
+
+def _repr_profile_tree(
+    ir: IR,
+    partition_info: MutableMapping[IR, PartitionInfo],
+    profiler: Profiler,
+    *,
+    offset: str = "",
+) -> str:
+    """Recursively build a tree representation with profiler data."""
+    header = _repr_ir(ir, offset=offset)
+    count = partition_info[ir].count if partition_info else None
+
+    # Add actual row count
+    actual = profiler.row_count.get(ir)
+    actual_str = _fmt_row_count(actual) if actual is not None else "?"
+    header = header.rstrip("\n") + f" rows={actual_str}"
+
+    # Add decision if present
+    if ir in profiler.decisions:
+        header += f" decision={profiler.decisions[ir]}"
+
+    # Add partition count
+    if count is not None:
+        header += f" [{count}]"
+
+    header += "\n"
+
+    children_strs = [
+        _repr_profile_tree(child, partition_info, profiler, offset=offset + "  ")
+        for child in ir.children
+    ]
+
+    return header + "".join(
+        f"{line}{offset}  (repeated {count} times)\n"
+        if (count := sum(1 for _ in group)) > 1
+        else line
+        for line, group in groupby(children_strs)
+    )

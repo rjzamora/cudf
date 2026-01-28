@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from rapidsmpf.streaming.cudf.channel_metadata import Partitioning
 
     from cudf_polars.dsl.ir import IR, IRExecutionContext
+    from cudf_polars.experimental.base import Profiler
     from cudf_polars.experimental.rapidsmpf.core import SubNetGenerator
 
 
@@ -279,6 +280,7 @@ async def _broadcast_join(
     broadcast_side: Literal["left", "right"],
     collective_id: int,
     target_partition_size: int,
+    profiler: Profiler | None = None,
 ) -> None:
     """
     Execute a broadcast join after initial sampling.
@@ -286,6 +288,7 @@ async def _broadcast_join(
     The small side is gathered (if not already duplicated) and joined
     with each chunk from the large side.
     """
+    n_rows_out = 0
     left, right = ir.children
 
     if broadcast_side == "right":
@@ -401,6 +404,7 @@ async def _broadcast_join(
                 ],
                 context=ir_context,
             )
+            n_rows_out += df.num_rows
             await ch_out.send(
                 context,
                 Message(
@@ -451,6 +455,7 @@ async def _broadcast_join(
                 ],
                 context=ir_context,
             )
+            n_rows_out += df.num_rows
             await ch_out.send(
                 context,
                 Message(
@@ -484,6 +489,7 @@ async def _broadcast_join(
                 ],
                 context=ir_context,
             )
+            n_rows_out += df.num_rows
             await ch_out.send(
                 context,
                 Message(
@@ -496,6 +502,8 @@ async def _broadcast_join(
             del df, large_df
 
     del small_dfs, small_chunks
+    if profiler is not None:
+        profiler.row_count[ir] += n_rows_out
     await ch_out.drain(context)
 
 
@@ -513,6 +521,7 @@ async def _shuffle_join(
     output_count: int,
     left_collective_id: int,
     right_collective_id: int,
+    profiler: Profiler | None = None,
 ) -> None:
     """
     Execute a shuffle (hash) join after initial sampling.
@@ -524,6 +533,7 @@ async def _shuffle_join(
 
     from cudf_polars.experimental.rapidsmpf.collectives.shuffle import ShuffleManager
 
+    n_rows_out = 0
     left, right = ir.children
     nranks = context.comm().nranks
     modulus = nranks * output_count
@@ -634,6 +644,7 @@ async def _shuffle_join(
                 right_df,
                 context=ir_context,
             )
+            n_rows_out += df.num_rows
             await ch_out.send(
                 context,
                 Message(
@@ -645,6 +656,8 @@ async def _shuffle_join(
             )
             del df, left_df, right_df, left_table, right_table
 
+    if profiler is not None:
+        profiler.row_count[ir] += n_rows_out
     await ch_out.drain(context)
 
 
@@ -660,6 +673,7 @@ async def join_node(
     broadcast_threshold: int,
     target_partition_size: int,
     collective_ids: list[int],
+    profiler: Profiler | None = None,
 ) -> None:
     """
     Dynamic Join node that selects the best strategy at runtime.
@@ -773,6 +787,8 @@ async def join_node(
 
         if broadcast_side is not None:
             # Broadcast join
+            if profiler is not None:
+                profiler.decisions[ir] = f"broadcast_{broadcast_side}"
             bcast_collective_id = collective_ids.pop() if collective_ids else 0
             await _broadcast_join(
                 context,
@@ -788,6 +804,7 @@ async def join_node(
                 broadcast_side,
                 bcast_collective_id,
                 target_partition_size,
+                profiler,
             )
         else:
             # Shuffle join - need 2 collective IDs (left and right shuffles)
@@ -802,6 +819,8 @@ async def join_node(
                     if can_broadcast_left and left_total < right_total
                     else "right"
                 )
+                if profiler is not None:
+                    profiler.decisions[ir] = f"broadcast_{fallback_side}_fallback"
                 await _broadcast_join(
                     context,
                     ir,
@@ -816,12 +835,16 @@ async def join_node(
                     fallback_side,
                     collective_ids.pop() if collective_ids else 0,
                     target_partition_size,
+                    profiler,
                 )
                 return
 
             # Calculate output partition count
             total_size = left_total + right_total
             output_count = max(1, total_size // target_partition_size)
+
+            if profiler is not None:
+                profiler.decisions[ir] = "shuffle"
 
             await _shuffle_join(
                 context,
@@ -837,6 +860,7 @@ async def join_node(
                 output_count,
                 left_collective_id,
                 right_collective_id,
+                profiler,
             )
 
 
@@ -914,6 +938,7 @@ def _(
                 broadcast_threshold,
                 executor.target_partition_size,
                 collective_ids,
+                rec.state["profiler"],
             )
         ]
         return nodes, channels

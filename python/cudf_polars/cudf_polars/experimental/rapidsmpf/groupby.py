@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from rapidsmpf.streaming.core.context import Context
 
     from cudf_polars.dsl.ir import IRExecutionContext
+    from cudf_polars.experimental.base import Profiler
     from cudf_polars.experimental.rapidsmpf.dispatch import SubNetGenerator
 
 
@@ -177,8 +178,10 @@ async def _partitionwise_groupby(
     ch_in: Channel[TableChunk],
     metadata_in: ChannelMetadata,
     initial_chunks: list[TableChunk],
+    profiler: Profiler | None = None,
 ) -> None:
     """Execute partition-wise groupby (data already partitioned on keys)."""
+    n_rows_out = 0
     # Send output metadata preserving partitioning
     await send_metadata(ch_out, context, metadata_in)
 
@@ -186,6 +189,7 @@ async def _partitionwise_groupby(
     for seq_num, chunk in enumerate(initial_chunks):
         with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
             result = await asyncio.to_thread(_apply_do_evaluate, chunk, ir, ir_context)
+            n_rows_out += result.table_view().num_rows()
             await ch_out.send(context, Message(seq_num, result))
             del chunk, result
 
@@ -197,11 +201,14 @@ async def _partitionwise_groupby(
         )
         del msg
         with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
-            chunk = await asyncio.to_thread(_apply_do_evaluate, chunk, ir, ir_context)
-            await ch_out.send(context, Message(seq_num, chunk))
-            del chunk
+            result = await asyncio.to_thread(_apply_do_evaluate, chunk, ir, ir_context)
+            n_rows_out += result.table_view().num_rows()
+            await ch_out.send(context, Message(seq_num, result))
+            del chunk, result
         seq_num += 1
 
+    if profiler is not None:
+        profiler.row_count[ir] += n_rows_out
     await ch_out.drain(context)
 
 
@@ -214,6 +221,7 @@ async def _concat_groupby(
     metadata_in: ChannelMetadata,
     initial_chunks: list[TableChunk],
     collective_id: int | None = None,
+    profiler: Profiler | None = None,
 ) -> None:
     """
     Execute groupby by concatenating all data first.
@@ -308,6 +316,8 @@ async def _concat_groupby(
                 ir.do_evaluate, *ir._non_child_args, concatenated, context=ir_context
             )
             del concatenated
+            if profiler is not None:
+                profiler.row_count[ir] += df.num_rows
             await ch_out.send(
                 context,
                 Message(
@@ -334,6 +344,7 @@ async def _tree_groupby(
     initial_chunks: list[TableChunk],
     groupby_n_ary: int,
     collective_id: int | None = None,
+    profiler: Profiler | None = None,
 ) -> None:
     """
     Execute groupby using N-ary tree reduction to single output.
@@ -512,6 +523,8 @@ async def _tree_groupby(
                 ir_context,
                 input_schema=decomposed.reduction_ir.schema,
             )
+            if profiler is not None:
+                profiler.row_count[decomposed.ir] += chunk.table_view().num_rows()
             await ch_out.send(context, Message(0, chunk))
             del chunk
     else:
@@ -536,6 +549,7 @@ async def _shuffle_groupby(
     output_count: int,
     collective_id: int,
     key_indices: tuple[int, ...],
+    profiler: Profiler | None = None,
 ) -> None:
     """Execute groupby using shuffle-based redistribution."""
     nranks = context.comm().nranks
@@ -579,6 +593,7 @@ async def _shuffle_groupby(
     await shuffle.insert_finished()
 
     # Extract shuffled partitions and apply reduction + selection
+    n_rows_out = 0
     for partition_id in range(context.comm().rank, output_count, nranks):
         stream = ir_context.get_cuda_stream()
         chunk = TableChunk.from_pylibcudf_table(
@@ -603,9 +618,12 @@ async def _shuffle_groupby(
                 ir_context,
                 input_schema=decomposed.reduction_ir.schema,
             )
+            n_rows_out += chunk.table_view().num_rows()
             await ch_out.send(context, Message(partition_id, chunk))
             del chunk
 
+    if profiler is not None:
+        profiler.row_count[decomposed.ir] += n_rows_out
     await ch_out.drain(context)
 
 
@@ -620,6 +638,7 @@ async def _shuffle_full_groupby(
     output_count: int,
     collective_id: int,
     key_indices: tuple[int, ...],
+    profiler: Profiler | None = None,
 ) -> None:
     """
     Execute non-decomposable groupby using shuffle-based redistribution.
@@ -659,6 +678,7 @@ async def _shuffle_full_groupby(
     await shuffle.insert_finished()
 
     # Extract shuffled partitions and apply full groupby
+    n_rows_out = 0
     for partition_id in range(context.comm().rank, output_count, nranks):
         stream = ir_context.get_cuda_stream()
         chunk = TableChunk.from_pylibcudf_table(
@@ -675,9 +695,12 @@ async def _shuffle_full_groupby(
                 ir,
                 ir_context,
             )
+            n_rows_out += chunk.table_view().num_rows()
             await ch_out.send(context, Message(partition_id, chunk))
             del chunk
 
+    if profiler is not None:
+        profiler.row_count[ir] += n_rows_out
     await ch_out.drain(context)
 
 
@@ -697,6 +720,7 @@ async def groupby_node(
     target_partition_size: int,
     groupby_n_ary: int,
     collective_ids: list[int],
+    profiler: Profiler | None = None,
 ) -> None:
     """
     Dynamic GroupBy node that selects the best strategy at runtime.
@@ -761,6 +785,8 @@ async def groupby_node(
                 initial_chunks.append(chunk)
 
             # Use concat_groupby strategy
+            if profiler is not None:
+                profiler.decisions[ir] = "concat"
             collective_id = collective_ids.pop() if collective_ids else None
             await _concat_groupby(
                 context,
@@ -771,6 +797,7 @@ async def groupby_node(
                 metadata_in,
                 initial_chunks,
                 collective_id if not can_skip_global_comm else None,
+                profiler,
             )
             return
 
@@ -801,6 +828,8 @@ async def groupby_node(
                 initial_chunks.append(chunk)
 
             # Use shuffle_full_groupby (shuffles raw data, then full groupby)
+            if profiler is not None:
+                profiler.decisions[ir] = "shuffle_full"
             output_count = max(nranks, nranks * 2)
             await _shuffle_full_groupby(
                 context,
@@ -813,6 +842,7 @@ async def groupby_node(
                 output_count,
                 collective_ids.pop(),
                 key_indices,
+                profiler,
             )
             return
 
@@ -860,6 +890,8 @@ async def groupby_node(
 
         if already_partitioned or can_skip_global_comm:
             # No global communication needed - use tree reduction (no allgather)
+            if profiler is not None:
+                profiler.decisions[ir] = "tree_local"
             await _tree_groupby(
                 context,
                 decomposed,
@@ -869,9 +901,12 @@ async def groupby_node(
                 metadata_in,
                 initial_chunks,
                 groupby_n_ary,
+                profiler=profiler,
             )
         elif estimated_total_size < target_partition_size:
             # Small output - use tree reduction with allgather to merge across ranks
+            if profiler is not None:
+                profiler.decisions[ir] = "tree_allgather"
             await _tree_groupby(
                 context,
                 decomposed,
@@ -882,9 +917,12 @@ async def groupby_node(
                 initial_chunks,
                 groupby_n_ary,
                 collective_ids.pop() if collective_ids else None,
+                profiler,
             )
         elif not collective_ids:
             # No shuffle ID available - fall back to tree (no allgather)
+            if profiler is not None:
+                profiler.decisions[ir] = "tree_fallback"
             await _tree_groupby(
                 context,
                 decomposed,
@@ -894,9 +932,12 @@ async def groupby_node(
                 metadata_in,
                 initial_chunks,
                 groupby_n_ary,
+                profiler=profiler,
             )
         else:
             # Large output - use shuffle
+            if profiler is not None:
+                profiler.decisions[ir] = "shuffle"
             # Calculate output partition count based on estimated size
             output_count = max(1, estimated_total_size // target_partition_size)
             await _shuffle_groupby(
@@ -910,6 +951,7 @@ async def groupby_node(
                 output_count,
                 collective_ids.pop(),
                 key_indices,
+                profiler,
             )
 
 
@@ -952,6 +994,7 @@ def _(
             config_options.executor.target_partition_size,
             config_options.executor.groupby_n_ary,
             collective_ids,
+            rec.state["profiler"],
         )
     ]
 

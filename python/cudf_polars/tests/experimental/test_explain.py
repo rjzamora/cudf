@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -495,3 +495,57 @@ def test_explain_logical_io_then_concat_then_groupby(engine, tmp_path, kind):
         assert re.search(
             rf"^\s*SORT.*row_count=\'~{final_count_2}\'\s*$", repr, re.MULTILINE
         )
+
+
+@pytest.mark.skipif(
+    DEFAULT_RUNTIME != "rapidsmpf", reason="Requires 'rapidsmpf' runtime."
+)
+def test_profile_output(tmp_path, df):
+    """Test that profile_output writes a profile file with row counts and decisions."""
+    # Create parquet source
+    source_path = tmp_path / "data"
+    source_path.mkdir(parents=True, exist_ok=True)
+    make_partitioned_source(df, source_path, fmt="parquet", n_files=2)
+
+    # Configure profile output path
+    profile_path = tmp_path / "profile.txt"
+
+    engine = pl.GPUEngine(
+        raise_on_fail=True,
+        executor="streaming",
+        executor_options={
+            "cluster": DEFAULT_CLUSTER,
+            "runtime": DEFAULT_RUNTIME,
+            "target_partition_size": 10_000,
+            "profile_output": str(profile_path),
+            "dynamic_planning": {"enabled": True},
+        },
+    )
+
+    # Execute a query with a groupby (which uses dynamic planning)
+    q = pl.scan_parquet(source_path).group_by("y").agg(pl.col("x").sum().alias("x_sum"))
+    result = q.collect(engine=engine)
+
+    # Verify the profile file was written
+    assert profile_path.exists(), "Profile file was not written"
+
+    # Read and verify content
+    profile_content = profile_path.read_text()
+
+    # Should contain row counts (from profiler)
+    assert "rows=" in profile_content, (
+        f"Expected rows= in profile, got:\n{profile_content}"
+    )
+
+    # Should contain GROUPBY node
+    assert "GROUPBY" in profile_content, (
+        f"Expected GROUPBY in profile, got:\n{profile_content}"
+    )
+
+    # Should contain a decision for the dynamic groupby node
+    assert "decision=" in profile_content, (
+        f"Expected decision= in profile, got:\n{profile_content}"
+    )
+
+    # Verify query executed correctly
+    assert result.height == 2  # 'cat' and 'dog'

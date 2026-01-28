@@ -35,6 +35,7 @@ import cudf_polars.experimental.rapidsmpf.union  # noqa: F401
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import DataFrameScan, IRExecutionContext, Join, Scan, Union
 from cudf_polars.dsl.traversal import CachingVisitor, traversal
+from cudf_polars.experimental.base import Profiler
 from cudf_polars.experimental.rapidsmpf.collectives import ReserveOpIDs
 from cudf_polars.experimental.rapidsmpf.dispatch import FanoutInfo, lower_ir_node
 from cudf_polars.experimental.rapidsmpf.nodes import (
@@ -109,7 +110,7 @@ def evaluate_logical_plan(
             # NOTE: Distributed execution requires Dask for now
             from cudf_polars.experimental.rapidsmpf.dask import evaluate_pipeline_dask
 
-            result, metadata_collector = evaluate_pipeline_dask(
+            result, metadata_collector, profiler = evaluate_pipeline_dask(
                 evaluate_pipeline,
                 ir,
                 partition_info,
@@ -120,7 +121,7 @@ def evaluate_logical_plan(
             )
         else:
             # Single-process execution: Run locally
-            result, metadata_collector = evaluate_pipeline(
+            result, metadata_collector, profiler = evaluate_pipeline(
                 ir,
                 partition_info,
                 config_options,
@@ -128,6 +129,13 @@ def evaluate_logical_plan(
                 collective_id_map,
                 collect_metadata=collect_metadata,
             )
+
+    # Write profiler output if configured
+    profile_output = config_options.executor.profile_output
+    if profile_output is not None and profiler is not None:
+        from cudf_polars.experimental.explain import write_profile_output
+
+        write_profile_output(profile_output, ir, partition_info, profiler)
 
     return result, metadata_collector
 
@@ -141,7 +149,7 @@ def evaluate_pipeline(
     rmpf_context: Context | None = None,
     *,
     collect_metadata: bool = False,
-) -> tuple[pl.DataFrame, list[ChannelMetadata] | None]:
+) -> tuple[pl.DataFrame, list[ChannelMetadata] | None, Profiler | None]:
     """
     Build and evaluate a RapidsMPF streaming pipeline.
 
@@ -164,7 +172,7 @@ def evaluate_pipeline(
 
     Returns
     -------
-    The output DataFrame and metadata collector.
+    The output DataFrame, metadata collector, and profiler.
     """
     assert config_options.executor.name == "streaming", "Executor must be streaming"
     assert config_options.executor.runtime == "rapidsmpf", "Runtime must be rapidsmpf"
@@ -234,6 +242,9 @@ def evaluate_pipeline(
         metadata_collector: list[ChannelMetadata] | None = (
             [] if collect_metadata else None
         )
+        profiler: Profiler | None = (
+            Profiler() if config_options.executor.profile_output else None
+        )
         nodes, output = generate_network(
             rmpf_context,
             ir,
@@ -243,6 +254,7 @@ def evaluate_pipeline(
             ir_context=ir_context,
             collective_id_map=collective_id_map,
             metadata_collector=metadata_collector,
+            profiler=profiler,
         )
 
         # Run the network
@@ -296,7 +308,7 @@ def evaluate_pipeline(
         if _initial_mr is not None:
             rmm.mr.set_current_device_resource(_original_mr)
 
-        return result, metadata_collector
+        return result, metadata_collector, profiler
 
 
 def lower_ir_graph(
@@ -418,6 +430,7 @@ def generate_network(
     ir_context: IRExecutionContext,
     collective_id_map: dict[IR, list[int]],
     metadata_collector: list[ChannelMetadata] | None,
+    profiler: Profiler | None = None,
 ) -> tuple[list[Any], DeferredMessages]:
     """
     Translate the IR graph to a RapidsMPF streaming network.
@@ -442,6 +455,8 @@ def generate_network(
         The list to collect the final metadata.
         This list will be mutated when the network is executed.
         If None, metadata will not be collected.
+    profiler
+        Profiler for collecting runtime statistics.
 
     Returns
     -------
@@ -474,6 +489,7 @@ def generate_network(
         "max_io_threads": max_io_threads_local,
         "stats": stats,
         "collective_id_map": collective_id_map,
+        "profiler": profiler,
     }
     mapper: SubNetGenerator = CachingVisitor(
         generate_ir_sub_network_wrapper, state=state
