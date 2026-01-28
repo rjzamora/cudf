@@ -160,27 +160,9 @@ async def _tree_distinct(
         if distinct_chunks:
             chunk = distinct_chunks[0]
             allgather.insert(0, chunk)
-        else:
-            # No local data - create empty input and process through distinct
-            empty_input = empty_table_chunk(ir.children[0], context, stream)
-            empty_df = DataFrame.from_table(
-                empty_input.table_view(),
-                list(input_schema.keys()),
-                list(input_schema.values()),
-                stream,
-            )
-            df = await asyncio.to_thread(
-                ir.do_evaluate,
-                *ir._non_child_args,
-                empty_df,
-                context=ir_context,
-            )
-            del empty_df, empty_input
-            reduced_chunk = TableChunk.from_pylibcudf_table(
-                df.table, df.stream, exclusive_view=True
-            )
-            del df
-            allgather.insert(0, reduced_chunk)
+        # else: No local data - don't insert anything into allgather
+        # Empty table chunks can have schema mismatches (e.g., STRING columns
+        # with 0 children vs 1 child), so we skip them entirely
         allgather.insert_finished()
 
         # Extract concatenated results from all ranks

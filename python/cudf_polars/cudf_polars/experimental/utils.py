@@ -28,6 +28,14 @@ if TYPE_CHECKING:
 
 def _concat(*dfs: DataFrame, context: IRExecutionContext) -> DataFrame:
     # Concatenate a sequence of DataFrames vertically
+    # Filter out empty DataFrames to avoid schema mismatches from empty tables
+    # (e.g., empty STRING columns have 0 children vs 1 child for non-empty)
+    # Keep at least one DataFrame to preserve schema
+    if len(dfs) > 1:
+        non_empty = [df for df in dfs if df.num_rows > 0]
+        if non_empty:
+            dfs = tuple(non_empty)
+        # else: keep original dfs (all empty) - schema comes from first
     return dfs[0] if len(dfs) == 1 else Union.do_evaluate(None, *dfs, context=context)
 
 

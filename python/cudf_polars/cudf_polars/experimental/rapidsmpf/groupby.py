@@ -372,46 +372,51 @@ async def _tree_groupby(
             del chunk
 
     # Tree reduction
+    # After first reduction pass, chunks are in reduction_ir schema (not piecewise_ir)
     k = groupby_n_ary
+    # Track current schema - starts as piecewise, becomes reduction after first pass
+    chunk_schema = decomposed.piecewise_ir.schema
+    tree_reduction_ran = False
+
     while len(pwise_chunks) > 1:
         new_chunks: list[TableChunk] = []
         for i in range(0, len(pwise_chunks), k):
             batch = pwise_chunks[i : i + k]
-            if len(batch) == 1:
-                new_chunks.append(batch[0])
-            else:
-                # Concatenate and reduce
-                input_bytes = sum(c.data_alloc_size(MemoryType.DEVICE) for c in batch)
-                with opaque_reservation(context, input_bytes):
-                    pwise_schema = decomposed.piecewise_ir.schema
-                    concatenated = await asyncio.to_thread(
-                        _concat,
-                        *[
-                            DataFrame.from_table(
-                                c.table_view(),
-                                list(pwise_schema.keys()),
-                                list(pwise_schema.values()),
-                                c.stream,
-                            )
-                            for c in batch
-                        ],
-                        context=ir_context,
-                    )
-                    del batch
-                    df = await asyncio.to_thread(
-                        decomposed.reduction_ir.do_evaluate,
-                        *decomposed.reduction_ir._non_child_args,
-                        concatenated,
-                        context=ir_context,
-                    )
-                    del concatenated
-                    new_chunks.append(
-                        TableChunk.from_pylibcudf_table(
-                            df.table, df.stream, exclusive_view=True
+            # Concatenate and reduce (even single-chunk batches need reduction
+            # to convert from piecewise to reduction schema on first pass)
+            input_bytes = sum(c.data_alloc_size(MemoryType.DEVICE) for c in batch)
+            with opaque_reservation(context, input_bytes):
+                concatenated = await asyncio.to_thread(
+                    _concat,
+                    *[
+                        DataFrame.from_table(
+                            c.table_view(),
+                            list(chunk_schema.keys()),
+                            list(chunk_schema.values()),
+                            c.stream,
                         )
+                        for c in batch
+                    ],
+                    context=ir_context,
+                )
+                del batch
+                df = await asyncio.to_thread(
+                    decomposed.reduction_ir.do_evaluate,
+                    *decomposed.reduction_ir._non_child_args,
+                    concatenated,
+                    context=ir_context,
+                )
+                del concatenated
+                new_chunks.append(
+                    TableChunk.from_pylibcudf_table(
+                        df.table, df.stream, exclusive_view=True
                     )
-                    del df
+                )
+                del df
         pwise_chunks = new_chunks
+        # After first reduction, output is in reduction_ir schema
+        chunk_schema = decomposed.reduction_ir.schema
+        tree_reduction_ran = True
 
     # Allgather partial results from all ranks if needed
     if need_allgather:
@@ -420,10 +425,10 @@ async def _tree_groupby(
         allgather = AllGatherManager(context, collective_id)
         stream = ir_context.get_cuda_stream()
 
-        # Before allgather, ensure we have exactly one chunk with consistent schema
-        # by applying reduction to normalize all data to reduction_ir schema
+        # Before allgather, ensure we have exactly one chunk in reduction_ir schema
+        reduction_schema = decomposed.reduction_ir.schema
         if pwise_chunks:
-            pwise_schema = decomposed.piecewise_ir.schema
+            # Construct DataFrames with correct schema based on whether tree reduction ran
             input_bytes = sum(
                 c.data_alloc_size(MemoryType.DEVICE) for c in pwise_chunks
             )
@@ -433,8 +438,8 @@ async def _tree_groupby(
                     *[
                         DataFrame.from_table(
                             c.table_view(),
-                            list(pwise_schema.keys()),
-                            list(pwise_schema.values()),
+                            list(chunk_schema.keys()),
+                            list(chunk_schema.values()),
                             c.stream,
                         )
                         for c in pwise_chunks
@@ -442,43 +447,26 @@ async def _tree_groupby(
                     context=ir_context,
                 )
                 del pwise_chunks
-                df = await asyncio.to_thread(
-                    decomposed.reduction_ir.do_evaluate,
-                    *decomposed.reduction_ir._non_child_args,
-                    concatenated,
-                    context=ir_context,
-                )
-                del concatenated
+                if not tree_reduction_ran:
+                    # Chunks still in piecewise schema - apply reduction
+                    df = await asyncio.to_thread(
+                        decomposed.reduction_ir.do_evaluate,
+                        *decomposed.reduction_ir._non_child_args,
+                        concatenated,
+                        context=ir_context,
+                    )
+                    del concatenated
+                else:
+                    # Tree reduction already applied - chunks in reduction schema
+                    df = concatenated
                 reduced_chunk = TableChunk.from_pylibcudf_table(
                     df.table, df.stream, exclusive_view=True
                 )
                 del df
             allgather.insert(0, reduced_chunk)
-        else:
-            # No local data - create empty input and process through do_evaluate
-            # to ensure the output schema matches ranks that have data.
-            from cudf_polars.experimental.rapidsmpf.utils import empty_table_chunk
-
-            pwise_schema = decomposed.piecewise_ir.schema
-            empty_pwise = empty_table_chunk(decomposed.piecewise_ir, context, stream)
-            empty_df = DataFrame.from_table(
-                empty_pwise.table_view(),
-                list(pwise_schema.keys()),
-                list(pwise_schema.values()),
-                stream,
-            )
-            df = await asyncio.to_thread(
-                decomposed.reduction_ir.do_evaluate,
-                *decomposed.reduction_ir._non_child_args,
-                empty_df,
-                context=ir_context,
-            )
-            del empty_df, empty_pwise
-            reduced_chunk = TableChunk.from_pylibcudf_table(
-                df.table, df.stream, exclusive_view=True
-            )
-            del df
-            allgather.insert(0, reduced_chunk)
+        # else: No local data - don't insert anything into allgather
+        # Empty table chunks can have schema mismatches (e.g., STRING columns
+        # with 0 children vs 1 child), so we skip them entirely
         allgather.insert_finished()
 
         # Extract concatenated results from all ranks

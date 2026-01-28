@@ -485,7 +485,7 @@ class DynamicPlanningOptions:
     )
     sample_chunk_count: int = dataclasses.field(
         default_factory=_make_default_factory(
-            f"{_env_prefix}__SAMPLE_CHUNK_COUNT", int, default=1
+            f"{_env_prefix}__SAMPLE_CHUNK_COUNT", int, default=2
         )
     )
 
