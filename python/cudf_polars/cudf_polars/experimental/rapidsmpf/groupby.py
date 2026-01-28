@@ -871,11 +871,16 @@ async def groupby_node(
 
         # Estimate total size: avg_sample_size * local_count, summed across ranks
         local_count = metadata_in.local_count
-        if initial_chunks:
+        if initial_chunks and total_pwise_size > 0:
             avg_sample_size = total_pwise_size / len(initial_chunks)
             local_estimate = int(avg_sample_size * local_count)
+            # Adaptive n-ary: how many chunks can fit in target_partition_size?
+            # Bounded between 2 (minimum progress) and 256 (reasonable upper limit)
+            chunks_per_partition = max(1, target_partition_size // avg_sample_size)
+            adaptive_n_ary = max(2, min(256, int(chunks_per_partition)))
         else:
             local_estimate = 0
+            adaptive_n_ary = groupby_n_ary  # fallback to configured value
 
         if collective_ids and nranks > 1:
             (estimated_total_size,) = await allgather_reduce(
@@ -900,7 +905,7 @@ async def groupby_node(
                 ch_in,
                 metadata_in,
                 initial_chunks,
-                groupby_n_ary,
+                adaptive_n_ary,
                 profiler=profiler,
             )
         elif estimated_total_size < target_partition_size:
@@ -915,7 +920,7 @@ async def groupby_node(
                 ch_in,
                 metadata_in,
                 initial_chunks,
-                groupby_n_ary,
+                adaptive_n_ary,
                 collective_ids.pop() if collective_ids else None,
                 profiler,
             )
@@ -931,7 +936,7 @@ async def groupby_node(
                 ch_in,
                 metadata_in,
                 initial_chunks,
-                groupby_n_ary,
+                adaptive_n_ary,
                 profiler=profiler,
             )
         else:
