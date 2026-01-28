@@ -414,35 +414,34 @@ async def _tree_groupby(
         pwise_chunks = new_chunks
 
     # Allgather partial results from all ranks if needed
-    if need_allgather and pwise_chunks:
+    if need_allgather:
         assert collective_id is not None
+
         allgather = AllGatherManager(context, collective_id)
-
-        # Insert local result (should be single chunk after tree reduction)
-        for seq_num, chunk in enumerate(pwise_chunks):
-            allgather.insert(seq_num, chunk)
-        allgather.insert_finished()
-
-        # Extract concatenated results from all ranks
         stream = ir_context.get_cuda_stream()
-        gathered_table = await allgather.extract_concatenated(stream)
-        pwise_chunks = [
-            TableChunk.from_pylibcudf_table(gathered_table, stream, exclusive_view=True)
-        ]
 
-        # One more reduction round to merge results from all ranks
+        # Before allgather, ensure we have exactly one chunk with consistent schema
+        # by applying reduction to normalize all data to reduction_ir schema
         if pwise_chunks:
-            chunk = pwise_chunks[0]
-            input_bytes = chunk.data_alloc_size(MemoryType.DEVICE)
+            pwise_schema = decomposed.piecewise_ir.schema
+            input_bytes = sum(
+                c.data_alloc_size(MemoryType.DEVICE) for c in pwise_chunks
+            )
             with opaque_reservation(context, input_bytes):
-                pwise_schema = decomposed.piecewise_ir.schema
-                concatenated = DataFrame.from_table(
-                    chunk.table_view(),
-                    list(pwise_schema.keys()),
-                    list(pwise_schema.values()),
-                    chunk.stream,
+                concatenated = await asyncio.to_thread(
+                    _concat,
+                    *[
+                        DataFrame.from_table(
+                            c.table_view(),
+                            list(pwise_schema.keys()),
+                            list(pwise_schema.values()),
+                            c.stream,
+                        )
+                        for c in pwise_chunks
+                    ],
+                    context=ir_context,
                 )
-                del chunk
+                del pwise_chunks
                 df = await asyncio.to_thread(
                     decomposed.reduction_ir.do_evaluate,
                     *decomposed.reduction_ir._non_child_args,
@@ -450,12 +449,50 @@ async def _tree_groupby(
                     context=ir_context,
                 )
                 del concatenated
-                pwise_chunks = [
-                    TableChunk.from_pylibcudf_table(
-                        df.table, df.stream, exclusive_view=True
-                    )
-                ]
+                reduced_chunk = TableChunk.from_pylibcudf_table(
+                    df.table, df.stream, exclusive_view=True
+                )
                 del df
+            allgather.insert(0, reduced_chunk)
+        else:
+            # Insert empty chunk with correct schema (reduction schema)
+            from cudf_polars.experimental.rapidsmpf.utils import empty_table_chunk
+
+            empty_chunk = empty_table_chunk(decomposed.reduction_ir, context, stream)
+            allgather.insert(0, empty_chunk)
+        allgather.insert_finished()
+
+        # Extract concatenated results from all ranks
+        gathered_table = await allgather.extract_concatenated(stream)
+        pwise_chunks = [
+            TableChunk.from_pylibcudf_table(gathered_table, stream, exclusive_view=True)
+        ]
+
+        # One more reduction round to merge results from all ranks
+        chunk = pwise_chunks[0]
+        input_bytes = chunk.data_alloc_size(MemoryType.DEVICE)
+        with opaque_reservation(context, input_bytes):
+            reduction_schema = decomposed.reduction_ir.schema
+            concatenated = DataFrame.from_table(
+                chunk.table_view(),
+                list(reduction_schema.keys()),
+                list(reduction_schema.values()),
+                chunk.stream,
+            )
+            del chunk
+            df = await asyncio.to_thread(
+                decomposed.reduction_ir.do_evaluate,
+                *decomposed.reduction_ir._non_child_args,
+                concatenated,
+                context=ir_context,
+            )
+            del concatenated
+            pwise_chunks = [
+                TableChunk.from_pylibcudf_table(
+                    df.table, df.stream, exclusive_view=True
+                )
+            ]
+            del df
 
     # Apply final selection and send
     if pwise_chunks:

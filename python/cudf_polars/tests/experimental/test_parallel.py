@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import pickle
 
 import pytest
@@ -258,7 +259,13 @@ def test_fallback_on_concat_zlice(engine: pl.GPUEngine) -> None:
         ]
     ).tail(1)
 
-    with pytest.raises(
-        UserWarning, match="This slice not supported for multiple partitions."
-    ):
+    ctx: contextlib.AbstractContextManager[object]
+    if DEFAULT_RUNTIME == "rapidsmpf":
+        # rapidsmpf handles slices via Repartition instead of warning
+        ctx = contextlib.nullcontext()
+    else:
+        ctx = pytest.raises(
+            UserWarning, match="This slice not supported for multiple partitions."
+        )
+    with ctx:
         assert_gpu_result_equal(q, engine=engine)

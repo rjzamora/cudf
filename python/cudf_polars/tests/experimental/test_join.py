@@ -207,7 +207,8 @@ def test_join_and_slice(zlice):
     q = left.join(right, on="a", how="inner").slice(*zlice)
     # Check that we get the correct row count
     # See: https://github.com/rapidsai/cudf/issues/19153
-    if zlice in {(2, 2), (-2, None)}:
+    if zlice in {(2, 2), (-2, None)} and DEFAULT_RUNTIME != "rapidsmpf":
+        # rapidsmpf handles slices via Repartition instead of warning
         with pytest.warns(
             UserWarning, match="This slice not supported for multiple partitions."
         ):
@@ -218,6 +219,7 @@ def test_join_and_slice(zlice):
     # Need sort to match order after a join
     q = left.join(right, on="a", how="inner").sort(pl.col("a")).slice(*zlice)
     if zlice == (2, 2):
+        # Sort with offset zlice requires fallback
         msg = (
             "does not support multiple partitions."
             if DEFAULT_RUNTIME == "rapidsmpf"
