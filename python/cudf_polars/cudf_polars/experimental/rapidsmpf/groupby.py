@@ -455,11 +455,30 @@ async def _tree_groupby(
                 del df
             allgather.insert(0, reduced_chunk)
         else:
-            # Insert empty chunk with correct schema (reduction schema)
+            # No local data - create empty input and process through do_evaluate
+            # to ensure the output schema matches ranks that have data.
             from cudf_polars.experimental.rapidsmpf.utils import empty_table_chunk
 
-            empty_chunk = empty_table_chunk(decomposed.reduction_ir, context, stream)
-            allgather.insert(0, empty_chunk)
+            pwise_schema = decomposed.piecewise_ir.schema
+            empty_pwise = empty_table_chunk(decomposed.piecewise_ir, context, stream)
+            empty_df = DataFrame.from_table(
+                empty_pwise.table_view(),
+                list(pwise_schema.keys()),
+                list(pwise_schema.values()),
+                stream,
+            )
+            df = await asyncio.to_thread(
+                decomposed.reduction_ir.do_evaluate,
+                *decomposed.reduction_ir._non_child_args,
+                empty_df,
+                context=ir_context,
+            )
+            del empty_df, empty_pwise
+            reduced_chunk = TableChunk.from_pylibcudf_table(
+                df.table, df.stream, exclusive_view=True
+            )
+            del df
+            allgather.insert(0, reduced_chunk)
         allgather.insert_finished()
 
         # Extract concatenated results from all ranks
