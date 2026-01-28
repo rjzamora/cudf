@@ -182,6 +182,7 @@ async def _partitionwise_groupby(
 ) -> None:
     """Execute partition-wise groupby (data already partitioned on keys)."""
     n_rows_out = 0
+    n_chunks_out = 0
     # Send output metadata preserving partitioning
     await send_metadata(ch_out, context, metadata_in)
 
@@ -190,6 +191,7 @@ async def _partitionwise_groupby(
         with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
             result = await asyncio.to_thread(_apply_do_evaluate, chunk, ir, ir_context)
             n_rows_out += result.table_view().num_rows()
+            n_chunks_out += 1
             await ch_out.send(context, Message(seq_num, result))
             del chunk, result
 
@@ -203,12 +205,14 @@ async def _partitionwise_groupby(
         with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
             result = await asyncio.to_thread(_apply_do_evaluate, chunk, ir, ir_context)
             n_rows_out += result.table_view().num_rows()
+            n_chunks_out += 1
             await ch_out.send(context, Message(seq_num, result))
             del chunk, result
         seq_num += 1
 
     if profiler is not None:
         profiler.row_count[ir] += n_rows_out
+        profiler.chunk_count[ir] += n_chunks_out
     await ch_out.drain(context)
 
 
@@ -318,6 +322,7 @@ async def _concat_groupby(
             del concatenated
             if profiler is not None:
                 profiler.row_count[ir] += df.num_rows
+                profiler.chunk_count[ir] += 1
             await ch_out.send(
                 context,
                 Message(
@@ -525,6 +530,7 @@ async def _tree_groupby(
             )
             if profiler is not None:
                 profiler.row_count[decomposed.ir] += chunk.table_view().num_rows()
+                profiler.chunk_count[decomposed.ir] += 1
             await ch_out.send(context, Message(0, chunk))
             del chunk
     else:
@@ -533,6 +539,8 @@ async def _tree_groupby(
 
         stream = ir_context.get_cuda_stream()
         chunk = empty_table_chunk(decomposed.ir, context, stream)
+        if profiler is not None:
+            profiler.chunk_count[decomposed.ir] += 1
         await ch_out.send(context, Message(0, chunk))
 
     await ch_out.drain(context)
@@ -594,6 +602,7 @@ async def _shuffle_groupby(
 
     # Extract shuffled partitions and apply reduction + selection
     n_rows_out = 0
+    n_chunks_out = 0
     for partition_id in range(context.comm().rank, output_count, nranks):
         stream = ir_context.get_cuda_stream()
         chunk = TableChunk.from_pylibcudf_table(
@@ -619,11 +628,13 @@ async def _shuffle_groupby(
                 input_schema=decomposed.reduction_ir.schema,
             )
             n_rows_out += chunk.table_view().num_rows()
+            n_chunks_out += 1
             await ch_out.send(context, Message(partition_id, chunk))
             del chunk
 
     if profiler is not None:
         profiler.row_count[decomposed.ir] += n_rows_out
+        profiler.chunk_count[decomposed.ir] += n_chunks_out
     await ch_out.drain(context)
 
 
@@ -679,6 +690,7 @@ async def _shuffle_full_groupby(
 
     # Extract shuffled partitions and apply full groupby
     n_rows_out = 0
+    n_chunks_out = 0
     for partition_id in range(context.comm().rank, output_count, nranks):
         stream = ir_context.get_cuda_stream()
         chunk = TableChunk.from_pylibcudf_table(
@@ -696,11 +708,13 @@ async def _shuffle_full_groupby(
                 ir_context,
             )
             n_rows_out += chunk.table_view().num_rows()
+            n_chunks_out += 1
             await ch_out.send(context, Message(partition_id, chunk))
             del chunk
 
     if profiler is not None:
         profiler.row_count[ir] += n_rows_out
+        profiler.chunk_count[ir] += n_chunks_out
     await ch_out.drain(context)
 
 

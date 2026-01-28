@@ -414,23 +414,29 @@ class Profiler:
     ----------
     row_count
         Mapping from IR node to actual row count produced during execution.
+    chunk_count
+        Mapping from IR node to actual chunk count produced during execution.
     decisions
         Mapping from IR node to the algorithm decision made at runtime
         (e.g., "broadcast_left", "shuffle", "tree", etc.).
     """
 
-    __slots__ = ("decisions", "row_count")
+    __slots__ = ("chunk_count", "decisions", "row_count")
     row_count: defaultdict[IR, int]
+    chunk_count: defaultdict[IR, int]
     decisions: dict[IR, str]
 
     def __init__(self) -> None:
         self.row_count = defaultdict(int)
+        self.chunk_count = defaultdict(int)
         self.decisions = {}
 
     def merge(self, other: Profiler) -> None:
         """Merge another profiler's statistics into this one."""
         for ir, n_rows in other.row_count.items():
             self.row_count[ir] += n_rows
+        for ir, n_chunks in other.chunk_count.items():
+            self.chunk_count[ir] += n_chunks
         self.decisions.update(other.decisions)
 
 

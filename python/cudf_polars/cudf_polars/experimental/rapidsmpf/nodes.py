@@ -93,6 +93,7 @@ async def default_node_single(
 
         # Recv/send data.
         n_rows_out = 0
+        n_chunks_out = 0
         seq_num = 0
         receiving = True
         received_any = False
@@ -116,6 +117,7 @@ async def default_node_single(
                     await ch_out.drain(context)
                     if profiler is not None:
                         profiler.row_count[ir] += n_rows_out
+                        profiler.chunk_count[ir] += n_chunks_out
                     return
             else:
                 received_any = True
@@ -139,6 +141,7 @@ async def default_node_single(
                     context=ir_context,
                 )
                 n_rows_out += df.table.num_rows()
+                n_chunks_out += 1
                 await ch_out.send(
                     context,
                     Message(
@@ -153,6 +156,7 @@ async def default_node_single(
         await ch_out.drain(context)
         if profiler is not None:
             profiler.row_count[ir] += n_rows_out
+            profiler.chunk_count[ir] += n_chunks_out
 
 
 @define_py_node()
@@ -295,6 +299,7 @@ async def default_node_multi(
         await ch_out.drain(context)
         if profiler is not None:
             profiler.row_count[ir] += n_rows_out
+            profiler.chunk_count[ir] += seq_num  # seq_num tracks output chunk count
 
 
 @define_py_node()

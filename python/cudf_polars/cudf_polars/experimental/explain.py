@@ -206,20 +206,27 @@ def _repr_profile_tree(
 ) -> str:
     """Recursively build a tree representation with profiler data."""
     header = _repr_ir(ir, offset=offset)
-    count = partition_info[ir].count if partition_info else None
+    static_count = partition_info[ir].count if partition_info else None
 
     # Add actual row count
-    actual = profiler.row_count.get(ir)
-    actual_str = _fmt_row_count(actual) if actual is not None else "?"
+    actual_rows = profiler.row_count.get(ir)
+    actual_str = _fmt_row_count(actual_rows) if actual_rows is not None else "?"
     header = header.rstrip("\n") + f" rows={actual_str}"
 
     # Add decision if present
     if ir in profiler.decisions:
         header += f" decision={profiler.decisions[ir]}"
 
-    # Add partition count
-    if count is not None:
-        header += f" [{count}]"
+    # Add partition/chunk count
+    # Show static count, or actual chunk count if available
+    actual_chunks = profiler.chunk_count.get(ir)
+    if actual_chunks is not None:
+        if static_count is not None and actual_chunks != static_count:
+            header += f" [{static_count}->{actual_chunks}]"
+        else:
+            header += f" [{actual_chunks}]"
+    elif static_count is not None:
+        header += f" [{static_count}]"
 
     header += "\n"
 

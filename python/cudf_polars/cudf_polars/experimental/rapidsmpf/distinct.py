@@ -198,9 +198,12 @@ async def _tree_distinct(
     if distinct_chunks:
         if profiler is not None:
             profiler.row_count[ir] += distinct_chunks[0].table_view().num_rows()
+            profiler.chunk_count[ir] += 1
         await ch_out.send(context, Message(0, distinct_chunks[0]))
     else:
         stream = ir_context.get_cuda_stream()
+        if profiler is not None:
+            profiler.chunk_count[ir] += 1
         await ch_out.send(context, Message(0, empty_table_chunk(ir, context, stream)))
 
     await ch_out.drain(context)
@@ -270,6 +273,7 @@ async def _shuffle_distinct(
     input_schema = ir.children[0].schema
     stream = ir_context.get_cuda_stream()
     n_rows_out = 0
+    n_chunks_out = 0
     for seq_num, partition_id in enumerate(
         range(context.comm().rank, output_count, nranks)
     ):
@@ -296,12 +300,14 @@ async def _shuffle_distinct(
                 df.table, df.stream, exclusive_view=True
             )
             n_rows_out += output_chunk.table_view().num_rows()
+            n_chunks_out += 1
             del df, partition_chunk
 
         await ch_out.send(context, Message(seq_num, output_chunk))
 
     if profiler is not None:
         profiler.row_count[ir] += n_rows_out
+        profiler.chunk_count[ir] += n_chunks_out
     await ch_out.drain(context)
 
 

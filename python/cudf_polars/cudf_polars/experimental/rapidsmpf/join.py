@@ -324,6 +324,7 @@ async def _broadcast_join(
     with each chunk from the large side.
     """
     n_rows_out = 0
+    n_chunks_out = 0
     left, right = ir.children
 
     if broadcast_side == "right":
@@ -440,6 +441,7 @@ async def _broadcast_join(
                 context=ir_context,
             )
             n_rows_out += df.num_rows
+            n_chunks_out += 1
             await ch_out.send(
                 context,
                 Message(
@@ -491,6 +493,7 @@ async def _broadcast_join(
                 context=ir_context,
             )
             n_rows_out += df.num_rows
+            n_chunks_out += 1
             await ch_out.send(
                 context,
                 Message(
@@ -525,6 +528,7 @@ async def _broadcast_join(
                 context=ir_context,
             )
             n_rows_out += df.num_rows
+            n_chunks_out += 1
             await ch_out.send(
                 context,
                 Message(
@@ -539,6 +543,7 @@ async def _broadcast_join(
     del small_dfs, small_chunks
     if profiler is not None:
         profiler.row_count[ir] += n_rows_out
+        profiler.chunk_count[ir] += n_chunks_out
     await ch_out.drain(context)
 
 
@@ -572,6 +577,7 @@ async def _shuffle_join(
     from cudf_polars.experimental.rapidsmpf.collectives.shuffle import ShuffleManager
 
     n_rows_out = 0
+    n_chunks_out = 0
     left, right = ir.children
     nranks = context.comm().nranks
     modulus = nranks * output_count
@@ -789,6 +795,7 @@ async def _shuffle_join(
                 context=ir_context,
             )
             n_rows_out += df.num_rows
+            n_chunks_out += 1
             await ch_out.send(
                 context,
                 Message(
@@ -802,6 +809,7 @@ async def _shuffle_join(
 
     if profiler is not None:
         profiler.row_count[ir] += n_rows_out
+        profiler.chunk_count[ir] += n_chunks_out
     await ch_out.drain(context)
 
 
