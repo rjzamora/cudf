@@ -192,9 +192,7 @@ async def shuffle_node(
         metadata_in = await recv_metadata(ch_in, context)
 
         # Check if we can skip the shuffle (already partitioned correctly)
-        if (
-            False
-        ):  # and _is_already_partitioned(metadata_in, columns_to_hash, num_partitions):
+        if _is_already_partitioned(metadata_in, columns_to_hash, num_partitions):
             # Forward metadata and data unchanged
             await send_metadata(ch_out, context, metadata_in)
             while (msg := await ch_in.recv(context)) is not None:
