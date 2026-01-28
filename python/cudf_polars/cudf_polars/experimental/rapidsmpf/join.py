@@ -118,12 +118,24 @@ async def broadcast_join_node(
             # Check if the right-side is already broadcasted
             small_duplicated = left_metadata.duplicated
 
+        # Determine which metadata belongs to the large side
+        large_metadata = left_metadata if broadcast_side == "right" else right_metadata
+
+        # Allgather is a collective - all ranks must participate even with no local data
+        need_allgather = context.comm().nranks > 1 and not small_duplicated
+
+        # The result is duplicated if:
+        # - The small side is/will be duplicated (already duplicated OR will be AllGathered)
+        # - AND the large side is already duplicated
+        output_duplicated = (
+            small_duplicated or need_allgather
+        ) and large_metadata.duplicated
+
         # Send metadata.
         output_metadata = ChannelMetadata(
             local_count=local_count,
             partitioning=partitioning,
-            # The result is only "duplicated" if both sides are duplicated
-            duplicated=left_metadata.duplicated and right_metadata.duplicated,
+            duplicated=output_duplicated,
         )
         await send_metadata(ch_out, context, output_metadata)
 
@@ -139,8 +151,6 @@ async def broadcast_join_node(
             del msg
             small_size += small_chunks[-1].data_alloc_size(MemoryType.DEVICE)
 
-        # Allgather is a collective - all ranks must participate even with no local data
-        need_allgather = context.comm().nranks > 1 and not small_duplicated
         if need_allgather:
             allgather = AllGatherManager(context, collective_id)
             for s_id in range(len(small_chunks)):
