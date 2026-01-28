@@ -901,13 +901,6 @@ class StreamingExecutor:
                 "target_partition_size",
                 default_blocksize(self.cluster),
             )
-        if self.broadcast_join_limit == 0:
-            object.__setattr__(
-                self,
-                "broadcast_join_limit",
-                # Usually better to avoid shuffling for single gpu with UVM
-                2 if self.cluster == "distributed" else 32,
-            )
         object.__setattr__(self, "cluster", Cluster(self.cluster))
         object.__setattr__(self, "shuffle_method", ShuffleMethod(self.shuffle_method))
         object.__setattr__(
@@ -931,6 +924,18 @@ class StreamingExecutor:
                 "dynamic_planning",
                 DynamicPlanningOptions(**self.dynamic_planning),
             )
+
+        # Set broadcast_join_limit default after dynamic_planning is processed
+        if self.broadcast_join_limit == 0:
+            if self.dynamic_planning.enabled:
+                # With dynamic planning, use conservative threshold (1x target_partition_size)
+                limit = 1
+            elif self.cluster == "distributed":
+                limit = 2
+            else:
+                # Usually better to avoid shuffling for single gpu with UVM
+                limit = 32
+            object.__setattr__(self, "broadcast_join_limit", limit)
 
         if self.cluster == "distributed":
             if self.sink_to_directory is False:

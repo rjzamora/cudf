@@ -657,6 +657,7 @@ async def join_node(
     ch_left: Channel[TableChunk],
     ch_right: Channel[TableChunk],
     sample_chunk_count: int,
+    broadcast_threshold: int,
     target_partition_size: int,
     collective_ids: list[int],
 ) -> None:
@@ -664,8 +665,8 @@ async def join_node(
     Dynamic Join node that selects the best strategy at runtime.
 
     Strategy selection based on sampled data:
-    - Broadcast right: If right side is small (< target_partition_size)
-    - Broadcast left: If left side is small (< target_partition_size)
+    - Broadcast right: If right side is small (< broadcast_threshold)
+    - Broadcast left: If left side is small (< broadcast_threshold)
     - Shuffle: Both sides are large, shuffle by join keys
     """
     async with shutdown_on_error(context, ch_left, ch_right, ch_out):
@@ -762,10 +763,10 @@ async def join_node(
         elif left_duplicated and can_broadcast_left:
             # Left already duplicated - broadcast left (only for Inner)
             broadcast_side = "left"
-        elif right_total < target_partition_size:
+        elif right_total < broadcast_threshold:
             # Right is small enough to broadcast
             broadcast_side = "right"
-        elif left_total < target_partition_size and can_broadcast_left:
+        elif left_total < broadcast_threshold and can_broadcast_left:
             # Left is small enough to broadcast (only for Inner)
             broadcast_side = "left"
         # else: shuffle both sides
@@ -898,6 +899,9 @@ def _(
         # Dynamic join - decide strategy at runtime
         assert isinstance(executor, StreamingExecutor)
         collective_ids = list(rec.state["collective_id_map"].get(ir, []))
+        broadcast_threshold = (
+            executor.target_partition_size * executor.broadcast_join_limit
+        )
         nodes[ir] = [
             join_node(
                 rec.state["context"],
@@ -907,6 +911,7 @@ def _(
                 channels[left].reserve_output_slot(),
                 channels[right].reserve_output_slot(),
                 executor.dynamic_planning.sample_chunk_count,
+                broadcast_threshold,
                 executor.target_partition_size,
                 collective_ids,
             )
