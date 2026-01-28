@@ -217,14 +217,20 @@ async def shuffle_node(
             context, num_partitions, columns_to_hash, collective_id
         )
 
+        # When input is duplicated, only rank 0 should contribute data
+        # to avoid 4x (or nranks-x) duplication in the output.
+        # Other ranks still participate in the shuffle protocol.
+        skip_insert = metadata_in.duplicated and context.comm().rank != 0
+
         # Process input chunks
         while (msg := await ch_in.recv(context)) is not None:
-            # Extract TableChunk from message and insert into shuffler
-            shuffle.insert_chunk(
-                TableChunk.from_message(msg).make_available_and_spill(
-                    context.br(), allow_overbooking=True
+            if not skip_insert:
+                # Extract TableChunk from message and insert into shuffler
+                shuffle.insert_chunk(
+                    TableChunk.from_message(msg).make_available_and_spill(
+                        context.br(), allow_overbooking=True
+                    )
                 )
-            )
             del msg
 
         # Insert finished
