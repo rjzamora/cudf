@@ -156,7 +156,7 @@ def _(ir: GroupBy, *, offset: str = "") -> str:
 def _(ir: Join, *, offset: str = "") -> str:
     left_on = tuple(ne.name for ne in ir.left_on)
     right_on = tuple(ne.name for ne in ir.right_on)
-    return _repr_header(offset, f"JOIN {ir.options[0]} {left_on} {right_on}", ir.schema)
+    return _repr_header(offset, f"JOIN {ir.options[0]} {left_on} {right_on}", None)
 
 
 @_repr_ir.register

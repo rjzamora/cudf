@@ -47,6 +47,41 @@ if TYPE_CHECKING:
     from cudf_polars.experimental.rapidsmpf.core import SubNetGenerator
 
 
+def _is_partitioned_on_keys(
+    metadata: ChannelMetadata,
+    key_indices: tuple[int, ...],
+    target_modulus: int,
+) -> bool:
+    """
+    Check if data is already partitioned on the join keys with compatible modulus.
+
+    Returns True if the data is partitioned on the specified key columns with
+    a modulus that is a multiple of the target modulus (meaning it can be used
+    directly or with local repartitioning).
+    """
+    if metadata.partitioning is None:
+        return False
+    inter_rank = metadata.partitioning.inter_rank
+    if inter_rank is None or inter_rank == "aligned":
+        return False
+    # Check if partitioned on same keys
+    if set(inter_rank.column_indices) != set(key_indices):
+        return False
+    # Check if modulus is compatible (existing modulus is a multiple of target)
+    # This means the existing partitioning is at least as fine-grained
+    return inter_rank.modulus % target_modulus == 0
+
+
+def _get_partitioning_modulus(metadata: ChannelMetadata) -> int | None:
+    """Get the modulus from the metadata's partitioning, if any."""
+    if metadata.partitioning is None:
+        return None
+    inter_rank = metadata.partitioning.inter_rank
+    if inter_rank is None or inter_rank == "aligned":
+        return None
+    return inter_rank.modulus
+
+
 @define_py_node()
 async def broadcast_join_node(
     context: Context,
@@ -519,15 +554,18 @@ async def _shuffle_join(
     left_initial_chunks: list[TableChunk],
     right_initial_chunks: list[TableChunk],
     output_count: int,
-    left_collective_id: int,
-    right_collective_id: int,
+    left_collective_id: int | None,
+    right_collective_id: int | None,
+    *,
+    shuffle_left: bool = True,
+    shuffle_right: bool = True,
     profiler: Profiler | None = None,
 ) -> None:
     """
     Execute a shuffle (hash) join after initial sampling.
 
-    Both sides are shuffled by their join keys, then partition-wise joins
-    are performed.
+    When shuffle_left/shuffle_right is False, that side is assumed to be
+    already partitioned on the join keys with a compatible modulus.
     """
     from rapidsmpf.streaming.cudf.channel_metadata import HashScheme, Partitioning
 
@@ -576,54 +614,160 @@ async def _shuffle_join(
     )
     await send_metadata(ch_out, context, metadata_out)
 
-    # Create shuffle managers for both sides
-    left_shuffle = ShuffleManager(
-        context, output_count, left_key_indices, left_collective_id
-    )
-    right_shuffle = ShuffleManager(
-        context, output_count, right_key_indices, right_collective_id
-    )
+    # Create shuffle managers only for sides that need shuffling
+    left_shuffle: ShuffleManager | None = None
+    right_shuffle: ShuffleManager | None = None
+
+    if shuffle_left:
+        assert left_collective_id is not None
+        left_shuffle = ShuffleManager(
+            context, output_count, left_key_indices, left_collective_id
+        )
+    if shuffle_right:
+        assert right_collective_id is not None
+        right_shuffle = ShuffleManager(
+            context, output_count, right_key_indices, right_collective_id
+        )
+
+    # For sides that don't need shuffling, collect chunks by partition
+    # (they're already partitioned, we just need to gather them locally)
+    left_by_partition: dict[int, list[TableChunk]] = {}
+    right_by_partition: dict[int, list[TableChunk]] = {}
+
+    def _get_partition_id(chunk: TableChunk, key_indices: tuple[int, ...]) -> int:
+        """Compute partition ID for a chunk based on its first row's hash."""
+        import pylibcudf as plc
+
+        if chunk.table_view().num_rows() == 0:
+            return 0
+        # Hash the key columns and get the partition
+        key_cols = [chunk.table_view().column(i) for i in key_indices]
+        hashes = plc.hashing.murmurhash3_x86_32(plc.Table(key_cols))
+        # Get first row's hash value modulo output_count
+        first_hash_scalar = plc.copying.get_element(hashes, 0)
+        first_hash: int = plc.interop.to_arrow(first_hash_scalar).as_py()
+        return (first_hash % modulus) // nranks
 
     # Insert initial chunks
-    for chunk in left_initial_chunks:
-        left_shuffle.insert_chunk(
-            chunk.make_available_and_spill(context.br(), allow_overbooking=True)
-        )
-    for chunk in right_initial_chunks:
-        right_shuffle.insert_chunk(
-            chunk.make_available_and_spill(context.br(), allow_overbooking=True)
-        )
+    if shuffle_left:
+        assert left_shuffle is not None
+        for chunk in left_initial_chunks:
+            left_shuffle.insert_chunk(
+                chunk.make_available_and_spill(context.br(), allow_overbooking=True)
+            )
+    else:
+        for chunk in left_initial_chunks:
+            spilled_chunk = chunk.make_available_and_spill(
+                context.br(), allow_overbooking=True
+            )
+            pid = _get_partition_id(spilled_chunk, left_key_indices)
+            left_by_partition.setdefault(pid, []).append(spilled_chunk)
+
+    if shuffle_right:
+        assert right_shuffle is not None
+        for chunk in right_initial_chunks:
+            right_shuffle.insert_chunk(
+                chunk.make_available_and_spill(context.br(), allow_overbooking=True)
+            )
+    else:
+        for chunk in right_initial_chunks:
+            spilled_chunk = chunk.make_available_and_spill(
+                context.br(), allow_overbooking=True
+            )
+            pid = _get_partition_id(spilled_chunk, right_key_indices)
+            right_by_partition.setdefault(pid, []).append(spilled_chunk)
 
     # Drain remaining chunks from both channels concurrently
     async def drain_left() -> None:
-        while (msg := await ch_left.recv(context)) is not None:
-            left_shuffle.insert_chunk(
-                TableChunk.from_message(msg).make_available_and_spill(
+        if shuffle_left:
+            assert left_shuffle is not None
+            while (msg := await ch_left.recv(context)) is not None:
+                left_shuffle.insert_chunk(
+                    TableChunk.from_message(msg).make_available_and_spill(
+                        context.br(), allow_overbooking=True
+                    )
+                )
+                del msg
+            await left_shuffle.insert_finished()
+        else:
+            while (msg := await ch_left.recv(context)) is not None:
+                chunk = TableChunk.from_message(msg).make_available_and_spill(
                     context.br(), allow_overbooking=True
                 )
-            )
-            del msg
-        await left_shuffle.insert_finished()
+                pid = _get_partition_id(chunk, left_key_indices)
+                left_by_partition.setdefault(pid, []).append(chunk)
+                del msg
 
     async def drain_right() -> None:
-        while (msg := await ch_right.recv(context)) is not None:
-            right_shuffle.insert_chunk(
-                TableChunk.from_message(msg).make_available_and_spill(
+        if shuffle_right:
+            assert right_shuffle is not None
+            while (msg := await ch_right.recv(context)) is not None:
+                right_shuffle.insert_chunk(
+                    TableChunk.from_message(msg).make_available_and_spill(
+                        context.br(), allow_overbooking=True
+                    )
+                )
+                del msg
+            await right_shuffle.insert_finished()
+        else:
+            while (msg := await ch_right.recv(context)) is not None:
+                chunk = TableChunk.from_message(msg).make_available_and_spill(
                     context.br(), allow_overbooking=True
                 )
-            )
-            del msg
-        await right_shuffle.insert_finished()
+                pid = _get_partition_id(chunk, right_key_indices)
+                right_by_partition.setdefault(pid, []).append(chunk)
+                del msg
 
     await asyncio.gather(drain_left(), drain_right())
 
-    # Extract shuffled partitions and perform partition-wise joins
+    # Extract partitions and perform partition-wise joins
     stream = ir_context.get_cuda_stream()
     for seq_num, partition_id in enumerate(
         range(context.comm().rank, output_count, nranks)
     ):
-        left_table = await left_shuffle.extract_chunk(partition_id, stream)
-        right_table = await right_shuffle.extract_chunk(partition_id, stream)
+        # Get left side for this partition
+        if shuffle_left:
+            assert left_shuffle is not None
+            left_table = await left_shuffle.extract_chunk(partition_id, stream)
+        else:
+            left_chunks = left_by_partition.get(partition_id, [])
+            if left_chunks:
+                left_table = _concat(
+                    *[
+                        DataFrame.from_table(
+                            c.table_view(),
+                            list(left.schema.keys()),
+                            list(left.schema.values()),
+                            c.stream,
+                        )
+                        for c in left_chunks
+                    ],
+                    context=ir_context,
+                ).table
+            else:
+                left_table = empty_table_chunk(left, context, stream).table_view()
+
+        # Get right side for this partition
+        if shuffle_right:
+            assert right_shuffle is not None
+            right_table = await right_shuffle.extract_chunk(partition_id, stream)
+        else:
+            right_chunks = right_by_partition.get(partition_id, [])
+            if right_chunks:
+                right_table = _concat(
+                    *[
+                        DataFrame.from_table(
+                            c.table_view(),
+                            list(right.schema.keys()),
+                            list(right.schema.values()),
+                            c.stream,
+                        )
+                        for c in right_chunks
+                    ],
+                    context=ir_context,
+                ).table
+            else:
+                right_table = empty_table_chunk(right, context, stream).table_view()
 
         left_df = DataFrame.from_table(
             left_table, list(left.schema.keys()), list(left.schema.values()), stream
@@ -777,13 +921,21 @@ async def join_node(
         elif left_duplicated and can_broadcast_left:
             # Left already duplicated - broadcast left (only for Inner)
             broadcast_side = "left"
-        elif right_total < broadcast_threshold:
-            # Right is small enough to broadcast
-            broadcast_side = "right"
-        elif left_total < broadcast_threshold and can_broadcast_left:
-            # Left is small enough to broadcast (only for Inner)
-            broadcast_side = "left"
-        # else: shuffle both sides
+        else:
+            # Decide based on size estimates - broadcast the smaller side if possible
+            left_small_enough = left_total < broadcast_threshold and can_broadcast_left
+            right_small_enough = right_total < broadcast_threshold
+
+            if left_small_enough and right_small_enough:
+                # Both are small enough - broadcast the smaller one
+                broadcast_side = "left" if left_total <= right_total else "right"
+            elif right_small_enough:
+                # Only right is small enough
+                broadcast_side = "right"
+            elif left_small_enough:
+                # Only left is small enough (Inner join only)
+                broadcast_side = "left"
+            # else: shuffle both sides
 
         if broadcast_side is not None:
             # Broadcast join
@@ -807,11 +959,38 @@ async def join_node(
                 profiler,
             )
         else:
-            # Shuffle join - need 2 collective IDs (left and right shuffles)
-            if len(collective_ids) >= 2:
-                left_collective_id = collective_ids.pop()
-                right_collective_id = collective_ids.pop()
-            else:
+            # Shuffle join path
+            # Calculate output partition count
+            total_size = left_total + right_total
+            output_count = max(1, total_size // target_partition_size)
+            modulus = nranks * output_count
+
+            # Get key column indices for checking partitioning
+            left_schema_keys = list(ir.children[0].schema.keys())
+            right_schema_keys = list(ir.children[1].schema.keys())
+            left_key_indices = tuple(
+                left_schema_keys.index(expr.name) for expr in ir.left_on
+            )
+            right_key_indices = tuple(
+                right_schema_keys.index(expr.name) for expr in ir.right_on
+            )
+
+            # Check if either side is already partitioned on join keys
+            left_partitioned = _is_partitioned_on_keys(
+                left_metadata, left_key_indices, modulus
+            )
+            right_partitioned = _is_partitioned_on_keys(
+                right_metadata, right_key_indices, modulus
+            )
+
+            # Determine which sides need shuffling
+            shuffle_left = not left_partitioned
+            shuffle_right = not right_partitioned
+
+            # Count how many collective IDs we need
+            ids_needed = int(shuffle_left) + int(shuffle_right)
+
+            if ids_needed > 0 and len(collective_ids) < ids_needed:
                 # Fallback: not enough IDs, use broadcast instead
                 # For Left/Semi/Anti must broadcast right; for Inner prefer smaller
                 fallback_side: Literal["left", "right"] = (
@@ -839,12 +1018,20 @@ async def join_node(
                 )
                 return
 
-            # Calculate output partition count
-            total_size = left_total + right_total
-            output_count = max(1, total_size // target_partition_size)
+            # Get collective IDs for sides that need shuffling
+            left_collective_id = collective_ids.pop() if shuffle_left else None
+            right_collective_id = collective_ids.pop() if shuffle_right else None
 
+            # Set profiler decision based on shuffle configuration
             if profiler is not None:
-                profiler.decisions[ir] = "shuffle"
+                if shuffle_left and shuffle_right:
+                    profiler.decisions[ir] = "shuffle"
+                elif shuffle_left:
+                    profiler.decisions[ir] = "shuffle_left"
+                elif shuffle_right:
+                    profiler.decisions[ir] = "shuffle_right"
+                else:
+                    profiler.decisions[ir] = "pwise"  # Both already partitioned
 
             await _shuffle_join(
                 context,
@@ -860,7 +1047,9 @@ async def join_node(
                 output_count,
                 left_collective_id,
                 right_collective_id,
-                profiler,
+                shuffle_left=shuffle_left,
+                shuffle_right=shuffle_right,
+                profiler=profiler,
             )
 
 
