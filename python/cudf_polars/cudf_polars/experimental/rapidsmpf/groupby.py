@@ -930,27 +930,8 @@ async def groupby_node(
         # Strategy Selection
         # =====================================================================
 
-        # Debug output for strategy selection
-        import sys
-
-        print(
-            f"[GROUPBY DEBUG] estimated_total_size={estimated_total_size}, "
-            f"target_partition_size={target_partition_size}, "
-            f"adaptive_n_ary={adaptive_n_ary}, "
-            f"already_partitioned={already_partitioned}, "
-            f"can_skip_global_comm={can_skip_global_comm}, "
-            f"num_initial_chunks={len(initial_chunks)}",
-            file=sys.stderr,
-            flush=True,
-        )
-
         if already_partitioned:
             # Already partitioned on groupby keys - use tree reduction (no allgather)
-            print(
-                "[GROUPBY DEBUG] -> selecting tree_local (already_partitioned)",
-                file=sys.stderr,
-                flush=True,
-            )
             if profiler is not None:
                 profiler.decisions[ir] = "tree_local"
             await _tree_groupby(
@@ -966,11 +947,6 @@ async def groupby_node(
             )
         elif can_skip_global_comm and estimated_total_size < target_partition_size:
             # Single rank with small data - use tree reduction
-            print(
-                "[GROUPBY DEBUG] -> selecting tree_local (small single-rank)",
-                file=sys.stderr,
-                flush=True,
-            )
             if profiler is not None:
                 profiler.decisions[ir] = "tree_local"
             await _tree_groupby(
@@ -1002,11 +978,6 @@ async def groupby_node(
             )
         elif not collective_ids:
             # No shuffle ID available - fall back to tree (no allgather)
-            print(
-                "[GROUPBY DEBUG] -> selecting tree_fallback",
-                file=sys.stderr,
-                flush=True,
-            )
             if profiler is not None:
                 profiler.decisions[ir] = "tree_fallback"
             await _tree_groupby(
@@ -1023,11 +994,6 @@ async def groupby_node(
         else:
             # Large output - use shuffle
             output_count = max(1, estimated_total_size // target_partition_size)
-            print(
-                f"[GROUPBY DEBUG] -> selecting shuffle with output_count={output_count}",
-                file=sys.stderr,
-                flush=True,
-            )
             if profiler is not None:
                 profiler.decisions[ir] = "shuffle"
             await _shuffle_groupby(
