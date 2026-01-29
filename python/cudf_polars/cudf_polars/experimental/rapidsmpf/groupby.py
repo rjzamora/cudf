@@ -297,7 +297,8 @@ async def _concat_groupby(
             input_bytes += chunk.data_alloc_size(MemoryType.DEVICE)
 
     if chunks:
-        with opaque_reservation(context, input_bytes):
+        # Reserve extra for groupby working memory (input + output)
+        with opaque_reservation(context, input_bytes * 2):
             multi_chunks = len(chunks) > 1
             input_schema = ir.children[0].schema
 
@@ -404,7 +405,8 @@ async def _tree_groupby(
             # Concatenate and reduce (even single-chunk batches need reduction
             # to convert from piecewise to reduction schema on first pass)
             input_bytes = sum(c.data_alloc_size(MemoryType.DEVICE) for c in batch)
-            with opaque_reservation(context, input_bytes):
+            # Reserve extra for groupby working memory (input + output)
+            with opaque_reservation(context, input_bytes * 2):
                 concatenated = await asyncio.to_thread(
                     _concat,
                     *[
@@ -451,7 +453,8 @@ async def _tree_groupby(
             input_bytes = sum(
                 c.data_alloc_size(MemoryType.DEVICE) for c in pwise_chunks
             )
-            with opaque_reservation(context, input_bytes):
+            # Reserve extra for groupby working memory (3x for safety)
+            with opaque_reservation(context, input_bytes * 3):
                 concatenated = await asyncio.to_thread(
                     _concat,
                     *[
@@ -497,7 +500,8 @@ async def _tree_groupby(
         # One more reduction round to merge results from all ranks
         chunk = pwise_chunks[0]
         input_bytes = chunk.data_alloc_size(MemoryType.DEVICE)
-        with opaque_reservation(context, input_bytes):
+        # Reserve extra for groupby working memory (input + output)
+        with opaque_reservation(context, input_bytes * 2):
             reduction_schema = decomposed.reduction_ir.schema
             concatenated = DataFrame.from_table(
                 chunk.table_view(),
@@ -621,7 +625,8 @@ async def _shuffle_groupby(
             exclusive_view=True,
         )
 
-        with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
+        # Reserve extra for groupby working memory (input + output)
+        with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE) * 2):
             # Apply reduction
             chunk = await asyncio.to_thread(
                 _apply_do_evaluate,
@@ -716,7 +721,8 @@ async def _shuffle_full_groupby(
             exclusive_view=True,
         )
 
-        with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
+        # Reserve extra for groupby working memory (input + output)
+        with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE) * 2):
             # Apply full groupby (including zlice if present)
             chunk = await asyncio.to_thread(
                 _apply_do_evaluate,
