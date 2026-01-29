@@ -438,38 +438,45 @@ async def _broadcast_join(
         small_row_count += chunk.table_view().num_rows()
         del msg
 
-    # Sanity check: verify row count won't exceed cuDF limit before concatenating
+    # Check if we can safely concatenate the small side
     # cuDF column limit is 2^31-1 = 2,147,483,647 rows
     cudf_row_limit = 2**31 - 1
-    if small_row_count >= cudf_row_limit:
-        raise ValueError(
-            f"Broadcast join small-side row count ({small_row_count:,}) exceeds "
-            f"cuDF column limit ({cudf_row_limit:,}). Row estimation was too low. "
-            f"broadcast_side={broadcast_side}, num_chunks={len(small_chunks)}, "
-            f"size={small_size / 1024**3:.2f} GB. "
-            "Consider reducing broadcast-join-limit to force shuffle join."
-        )
+    can_concatenate = small_row_count < cudf_row_limit
 
-    # Build single small-side DataFrame (allgather if needed, then concatenate)
-    small_df: DataFrame | None = None
+    # Build small-side DataFrame list
+    # If row count is safe, concatenate into single-element list for efficiency
+    # Otherwise, keep as list of individual DataFrames
+    small_dfs: list[DataFrame] = []
+
     if need_allgather:
         allgather = AllGatherManager(context, collective_id)
         for s_id in range(len(small_chunks)):
             allgather.insert(s_id, small_chunks.pop(0))
         allgather.insert_finished()
         stream = ir_context.get_cuda_stream()
-        small_df = DataFrame.from_table(
-            await allgather.extract_concatenated(stream),
-            list(small_child.schema.keys()),
-            list(small_child.schema.values()),
-            stream,
-        )
+        small_dfs = [
+            DataFrame.from_table(
+                await allgather.extract_concatenated(stream),
+                list(small_child.schema.keys()),
+                list(small_child.schema.values()),
+                stream,
+            )
+        ]
     elif small_chunks:
-        # Concatenate multiple small chunks into one DataFrame
-        small_df = _concat(
-            *[chunk_to_frame(chunk, small_child) for chunk in small_chunks],
-            context=ir_context,
-        )
+        if can_concatenate:
+            # Safe to concatenate - produces single-element list
+            # (_concat is a no-op for single element)
+            # Reserve memory for concatenation (input + output ~= 2x input size)
+            with opaque_reservation(context, small_size * 2):
+                small_dfs = [
+                    _concat(
+                        *[chunk_to_frame(chunk, small_child) for chunk in small_chunks],
+                        context=ir_context,
+                    )
+                ]
+        else:
+            # Too many rows to concatenate - keep as list of DataFrames
+            small_dfs = [chunk_to_frame(c, small_child) for c in small_chunks]
         small_chunks.clear()
 
     # Stream through large side
@@ -478,27 +485,37 @@ async def _broadcast_join(
     async def join_large_chunk(
         large_df: DataFrame, seq_num: int, large_chunk_size: int
     ) -> None:
-        """Join a large chunk with the small DataFrame and send result."""
-        nonlocal n_rows_out, n_chunks_out, small_df
+        """Join a large chunk with the small DataFrame(s) and send result."""
+        nonlocal n_rows_out, n_chunks_out, small_dfs
 
-        # Ensure we have a small DataFrame (create empty if needed)
-        if small_df is None:
+        # Get small DataFrames to join with (create empty if none)
+        dfs_to_join = small_dfs
+        if not dfs_to_join:
             stream = ir_context.get_cuda_stream()
             empty_small = empty_table_chunk(small_child, context, stream)
-            small_df = chunk_to_frame(empty_small, small_child)
+            dfs_to_join = [chunk_to_frame(empty_small, small_child)]
 
+        # Join large chunk with each small DataFrame
+        join_results: list[DataFrame] = []
         input_bytes = large_chunk_size + small_size
         with opaque_reservation(context, input_bytes):
-            df = await asyncio.to_thread(
-                ir.do_evaluate,
-                *ir._non_child_args,
-                *(
-                    [large_df, small_df]
-                    if broadcast_side == "right"
-                    else [small_df, large_df]
-                ),
-                context=ir_context,
-            )
+            for sdf in dfs_to_join:
+                result = await asyncio.to_thread(
+                    ir.do_evaluate,
+                    *ir._non_child_args,
+                    *(
+                        [large_df, sdf]
+                        if broadcast_side == "right"
+                        else [sdf, large_df]
+                    ),
+                    context=ir_context,
+                )
+                join_results.append(result)
+
+            # Concatenate join results (_concat is no-op for single element)
+            df = _concat(*join_results, context=ir_context)
+            del join_results
+
             n_rows_out += df.num_rows
             n_chunks_out += 1
             await ch_out.send(
@@ -547,14 +564,14 @@ async def _broadcast_join(
         del large_df, large_chunk
 
     # Handle edge case: no large-side data received
-    if not large_chunk_processed and small_df is not None:
+    if not large_chunk_processed and small_dfs:
         stream = ir_context.get_cuda_stream()
         large_chunk = empty_table_chunk(large_child, context, stream)
         large_df = chunk_to_frame(large_chunk, large_child)
         await join_large_chunk(large_df, 0, 0)
         del large_df
 
-    del small_df, small_chunks
+    del small_dfs, small_chunks
     if profiler is not None:
         profiler.row_count[ir] += n_rows_out
         profiler.chunk_count[ir] += n_chunks_out
