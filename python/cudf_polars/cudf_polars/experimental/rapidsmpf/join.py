@@ -50,8 +50,9 @@ if TYPE_CHECKING:
 # Sanity check limits for dynamic planning
 MAX_REASONABLE_PARTITIONS = 1_000_000  # 1M partitions should be plenty
 MAX_REASONABLE_CHUNK_SIZE = 64 * 1024**3  # 64 GB per chunk is suspicious
-# cuDF has a 2^31-1 row limit for columns; use a conservative limit
-MAX_BROADCAST_ROWS = 2_000_000_000  # 2 billion rows max for broadcast side
+# cuDF has a 2^31-1 (~2.15 billion) row limit for columns; use conservative limit
+# to account for estimation error (use 1.5 billion to have good margin)
+MAX_BROADCAST_ROWS = 1_500_000_000  # 1.5 billion rows max for broadcast side
 
 
 def _is_partitioned_on_keys(
@@ -427,13 +428,27 @@ async def _broadcast_join(
     # Collect remaining small-side chunks
     small_chunks: list[TableChunk] = list(small_initial_chunks)
     small_size = sum(c.data_alloc_size(MemoryType.DEVICE) for c in small_chunks)
+    small_row_count = sum(c.table_view().num_rows() for c in small_chunks)
     while (msg := await small_ch.recv(context)) is not None:
         chunk = TableChunk.from_message(msg).make_available_and_spill(
             context.br(), allow_overbooking=True
         )
         small_chunks.append(chunk)
         small_size += chunk.data_alloc_size(MemoryType.DEVICE)
+        small_row_count += chunk.table_view().num_rows()
         del msg
+
+    # Sanity check: verify row count won't exceed cuDF limit before concatenating
+    # cuDF column limit is 2^31-1 = 2,147,483,647 rows
+    cudf_row_limit = 2**31 - 1
+    if small_row_count >= cudf_row_limit:
+        raise ValueError(
+            f"Broadcast join small-side row count ({small_row_count:,}) exceeds "
+            f"cuDF column limit ({cudf_row_limit:,}). Row estimation was too low. "
+            f"broadcast_side={broadcast_side}, num_chunks={len(small_chunks)}, "
+            f"size={small_size / 1024**3:.2f} GB. "
+            "Consider reducing broadcast-join-limit to force shuffle join."
+        )
 
     # Build single small-side DataFrame (allgather if needed, then concatenate)
     small_df: DataFrame | None = None
