@@ -50,6 +50,8 @@ if TYPE_CHECKING:
 # Sanity check limits for dynamic planning
 MAX_REASONABLE_PARTITIONS = 1_000_000  # 1M partitions should be plenty
 MAX_REASONABLE_CHUNK_SIZE = 64 * 1024**3  # 64 GB per chunk is suspicious
+# cuDF has a 2^31-1 row limit for columns; use a conservative limit
+MAX_BROADCAST_ROWS = 2_000_000_000  # 2 billion rows max for broadcast side
 
 
 def _is_partitioned_on_keys(
@@ -867,9 +869,11 @@ async def join_node(
         right_initial_chunks: list[TableChunk] = []
         left_sample_size = 0
         right_sample_size = 0
+        left_sample_rows = 0
+        right_sample_rows = 0
 
         async def sample_left() -> None:
-            nonlocal left_sample_size
+            nonlocal left_sample_size, left_sample_rows
             for _ in range(sample_chunk_count):
                 msg = await ch_left.recv(context)
                 if msg is None:
@@ -879,10 +883,11 @@ async def join_node(
                 )
                 left_initial_chunks.append(chunk)
                 left_sample_size += chunk.data_alloc_size(MemoryType.DEVICE)
+                left_sample_rows += chunk.table_view().num_rows()
                 del msg
 
         async def sample_right() -> None:
-            nonlocal right_sample_size
+            nonlocal right_sample_size, right_sample_rows
             for _ in range(sample_chunk_count):
                 msg = await ch_right.recv(context)
                 if msg is None:
@@ -892,33 +897,51 @@ async def join_node(
                 )
                 right_initial_chunks.append(chunk)
                 right_sample_size += chunk.data_alloc_size(MemoryType.DEVICE)
+                right_sample_rows += chunk.table_view().num_rows()
                 del msg
 
         await asyncio.gather(sample_left(), sample_right())
 
-        # Estimate total sizes
+        # Estimate total sizes and row counts
         left_local_count = left_metadata.local_count
         right_local_count = right_metadata.local_count
 
         if left_initial_chunks:
-            left_avg = left_sample_size / len(left_initial_chunks)
-            left_estimate = int(left_avg * left_local_count)
+            left_avg_size = left_sample_size / len(left_initial_chunks)
+            left_avg_rows = left_sample_rows / len(left_initial_chunks)
+            left_estimate = int(left_avg_size * left_local_count)
+            left_row_estimate = int(left_avg_rows * left_local_count)
         else:
             left_estimate = 0
+            left_row_estimate = 0
 
         if right_initial_chunks:
-            right_avg = right_sample_size / len(right_initial_chunks)
-            right_estimate = int(right_avg * right_local_count)
+            right_avg_size = right_sample_size / len(right_initial_chunks)
+            right_avg_rows = right_sample_rows / len(right_initial_chunks)
+            right_estimate = int(right_avg_size * right_local_count)
+            right_row_estimate = int(right_avg_rows * right_local_count)
         else:
             right_estimate = 0
+            right_row_estimate = 0
 
-        # AllGather size estimates across ranks
+        # AllGather size and row estimates across ranks
         if collective_ids and nranks > 1:
-            left_total, right_total = await allgather_reduce(
-                context, collective_ids.pop(), left_estimate, right_estimate
+            (
+                left_total,
+                right_total,
+                left_total_rows,
+                right_total_rows,
+            ) = await allgather_reduce(
+                context,
+                collective_ids.pop(),
+                left_estimate,
+                right_estimate,
+                left_row_estimate,
+                right_row_estimate,
             )
         else:
             left_total, right_total = left_estimate, right_estimate
+            left_total_rows, right_total_rows = left_row_estimate, right_row_estimate
 
         # =====================================================================
         # Strategy Selection
@@ -935,22 +958,34 @@ async def join_node(
         left_duplicated = left_metadata.duplicated
         right_duplicated = right_metadata.duplicated
 
+        # Check row counts - can't broadcast if concatenated rows exceed cuDF limit
+        left_rows_ok = left_total_rows < MAX_BROADCAST_ROWS
+        right_rows_ok = right_total_rows < MAX_BROADCAST_ROWS
+
         # Determine strategy
         broadcast_side: Literal["left", "right"] | None = None
 
         if nranks == 1:
-            # Single rank - just do a local join (broadcast right as default)
-            broadcast_side = "right"
-        elif right_duplicated:
+            # Single rank - prefer broadcast right if row count is ok,
+            # otherwise try left, otherwise shuffle
+            if right_rows_ok:
+                broadcast_side = "right"
+            elif left_rows_ok and can_broadcast_left:
+                broadcast_side = "left"
+            # else: fall through to shuffle
+        elif right_duplicated and right_rows_ok:
             # Right already duplicated - broadcast right (no allgather needed)
             broadcast_side = "right"
-        elif left_duplicated and can_broadcast_left:
+        elif left_duplicated and can_broadcast_left and left_rows_ok:
             # Left already duplicated - broadcast left (only for Inner)
             broadcast_side = "left"
         else:
             # Decide based on size estimates - broadcast the smaller side if possible
-            left_small_enough = left_total < broadcast_threshold and can_broadcast_left
-            right_small_enough = right_total < broadcast_threshold
+            # Must also check row counts to avoid exceeding cuDF column size limit
+            left_small_enough = (
+                left_total < broadcast_threshold and can_broadcast_left and left_rows_ok
+            )
+            right_small_enough = right_total < broadcast_threshold and right_rows_ok
 
             if left_small_enough and right_small_enough:
                 # Both are small enough - broadcast the smaller one
