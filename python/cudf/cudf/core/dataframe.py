@@ -24,7 +24,7 @@ from collections.abc import (
     Sequence,
 )
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Self, assert_never
 
 import cupy
 import numba
@@ -34,7 +34,6 @@ import pyarrow as pa
 from nvtx import annotate
 from pandas.io.formats import console
 from pandas.io.formats.printing import pprint_thing
-from typing_extensions import Self, assert_never
 
 import pylibcudf as plc
 
@@ -437,7 +436,19 @@ class _DataFrameLocIndexer(_DataFrameIndexer):
 
 
 class _DataFrameAtIndexer(_DataFrameLocIndexer):
-    pass
+    @_performance_tracking
+    def __getitem__(self, key):
+        indexing_utils.validate_scalar_key(
+            key, "Invalid call for scalar access (getting)!"
+        )
+        return super().__getitem__(key)
+
+    @_performance_tracking
+    def __setitem__(self, key, value):
+        indexing_utils.validate_scalar_key(
+            key, "Invalid call for scalar access (getting)!"
+        )
+        return super().__setitem__(key, value)
 
 
 class _DataFrameIlocIndexer(_DataFrameIndexer):
@@ -507,7 +518,19 @@ class _DataFrameIlocIndexer(_DataFrameIndexer):
 
 
 class _DataFrameiAtIndexer(_DataFrameIlocIndexer):
-    pass
+    @_performance_tracking
+    def __getitem__(self, key):
+        indexing_utils.validate_scalar_key(
+            key, "iAt based indexing can only have integer indexers"
+        )
+        return super().__getitem__(key)
+
+    @_performance_tracking
+    def __setitem__(self, key, value):
+        indexing_utils.validate_scalar_key(
+            key, "iAt based indexing can only have integer indexers"
+        )
+        return super().__setitem__(key, value)
 
 
 @_performance_tracking
