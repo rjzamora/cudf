@@ -998,13 +998,19 @@ async def join_node(
         broadcast_side: Literal["left", "right"] | None = None
 
         if nranks == 1:
-            # Single rank - prefer broadcast right if row count is ok,
-            # otherwise try left, otherwise shuffle
-            if right_rows_ok:
+            # Single rank - no network cost, but still want to broadcast smaller side
+            # to minimize memory usage during join
+            left_ok = left_rows_ok and can_broadcast_left
+            right_ok = right_rows_ok
+
+            if left_ok and right_ok:
+                # Both sides OK - broadcast the smaller one
+                broadcast_side = "left" if left_total <= right_total else "right"
+            elif right_ok:
                 broadcast_side = "right"
-            elif left_rows_ok and can_broadcast_left:
+            elif left_ok:
                 broadcast_side = "left"
-            # else: fall through to shuffle
+            # else: fall through to shuffle (shouldn't happen on single GPU)
         elif right_duplicated and right_rows_ok:
             # Right already duplicated - broadcast right (no allgather needed)
             broadcast_side = "right"
