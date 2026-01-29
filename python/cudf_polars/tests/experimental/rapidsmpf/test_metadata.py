@@ -81,11 +81,11 @@ def test_rapidsmpf_join_metadata(
     assert metadata.local_count == left_count
     assert metadata.duplicated is False
     if right_count > broadcast_join_limit:
-        # After shuffle, partitioning has inter_rank=HashScheme, local="aligned"
+        # After shuffle, partitioning has inter_rank=HashScheme, local="passthrough"
         assert isinstance(metadata.partitioning.inter_rank, HashScheme)
         # "y" is at index 1 in the output schema: ["x", "y", "z", "xx", "zz"]
         assert metadata.partitioning.inter_rank.column_indices == (1,)
-        assert metadata.partitioning.local == "aligned"
+        assert metadata.partitioning.local == "passthrough"
     else:
         # No partitioning (broadcast join preserves no partitioning from IO)
         assert metadata.partitioning.inter_rank is None

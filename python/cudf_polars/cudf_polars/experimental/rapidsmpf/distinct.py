@@ -243,7 +243,7 @@ async def _shuffle_distinct(
         local_count=output_count,
         partitioning=Partitioning(
             HashScheme(column_indices=key_indices, modulus=modulus),
-            local="aligned",
+            local="passthrough",
         ),
         duplicated=False,
     )
