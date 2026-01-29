@@ -944,10 +944,32 @@ async def groupby_node(
             flush=True,
         )
 
-        if already_partitioned or can_skip_global_comm:
-            # No global communication needed - use tree reduction (no allgather)
+        if already_partitioned:
+            # Already partitioned on groupby keys - use tree reduction (no allgather)
             print(
-                "[GROUPBY DEBUG] -> selecting tree_local", file=sys.stderr, flush=True
+                "[GROUPBY DEBUG] -> selecting tree_local (already_partitioned)",
+                file=sys.stderr,
+                flush=True,
+            )
+            if profiler is not None:
+                profiler.decisions[ir] = "tree_local"
+            await _tree_groupby(
+                context,
+                decomposed,
+                ir_context,
+                ch_out,
+                ch_in,
+                metadata_in,
+                initial_chunks,
+                adaptive_n_ary,
+                profiler=profiler,
+            )
+        elif can_skip_global_comm and estimated_total_size < target_partition_size:
+            # Single rank with small data - use tree reduction
+            print(
+                "[GROUPBY DEBUG] -> selecting tree_local (small single-rank)",
+                file=sys.stderr,
+                flush=True,
             )
             if profiler is not None:
                 profiler.decisions[ir] = "tree_local"
