@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import warnings
 from typing import TYPE_CHECKING, Any, Literal
 
 from rapidsmpf.memory.buffer import MemoryType
@@ -45,6 +46,10 @@ if TYPE_CHECKING:
     from cudf_polars.dsl.ir import IR, IRExecutionContext
     from cudf_polars.experimental.base import Profiler
     from cudf_polars.experimental.rapidsmpf.core import SubNetGenerator
+
+# Sanity check limits for dynamic planning
+MAX_REASONABLE_PARTITIONS = 1_000_000  # 1M partitions should be plenty
+MAX_REASONABLE_CHUNK_SIZE = 64 * 1024**3  # 64 GB per chunk is suspicious
 
 
 def _is_partitioned_on_keys(
@@ -100,6 +105,38 @@ def _get_key_partitioning_modulus(
     if set(inter_rank.column_indices) != set(key_indices):
         return None
     return inter_rank.modulus
+
+
+def _validate_chunk_for_shuffle(
+    chunk: TableChunk, context_info: str = ""
+) -> TableChunk:
+    """
+    Validate a chunk before shuffle operations.
+
+    Warns if chunk seems unusually large, which could indicate
+    issues that may cause downstream failures.
+
+    Returns the chunk to allow chaining and avoid leaving dangling references.
+    """
+    chunk_size = chunk.data_alloc_size(MemoryType.DEVICE)
+    num_rows = chunk.table_view().num_rows()
+
+    if chunk_size > MAX_REASONABLE_CHUNK_SIZE:
+        warnings.warn(
+            f"Very large chunk being shuffled{context_info}: "
+            f"size={chunk_size / 1024**3:.2f} GB, rows={num_rows:,}. "
+            "This may cause memory issues.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+    if num_rows < 0:
+        raise ValueError(
+            f"Chunk has negative row count{context_info}: {num_rows}. "
+            "This indicates corrupted data."
+        )
+
+    return chunk
 
 
 @define_py_node()
@@ -540,6 +577,11 @@ async def _shuffle_join(
     n_chunks_out = 0
     left, right = ir.children
     nranks = context.comm().nranks
+
+    # Sanity check output_count
+    if output_count <= 0:
+        raise ValueError(f"Invalid output_count={output_count} for shuffle join")
+
     modulus = nranks * output_count
 
     # Get key column indices for both sides
@@ -619,7 +661,12 @@ async def _shuffle_join(
         assert left_shuffle is not None
         for chunk in left_initial_chunks:
             left_shuffle.insert_chunk(
-                chunk.make_available_and_spill(context.br(), allow_overbooking=True)
+                _validate_chunk_for_shuffle(
+                    chunk.make_available_and_spill(
+                        context.br(), allow_overbooking=True
+                    ),
+                    " (left initial)",
+                )
             )
     else:
         for chunk in left_initial_chunks:
@@ -633,7 +680,12 @@ async def _shuffle_join(
         assert right_shuffle is not None
         for chunk in right_initial_chunks:
             right_shuffle.insert_chunk(
-                chunk.make_available_and_spill(context.br(), allow_overbooking=True)
+                _validate_chunk_for_shuffle(
+                    chunk.make_available_and_spill(
+                        context.br(), allow_overbooking=True
+                    ),
+                    " (right initial)",
+                )
             )
     else:
         for chunk in right_initial_chunks:
@@ -649,8 +701,11 @@ async def _shuffle_join(
             assert left_shuffle is not None
             while (msg := await ch_left.recv(context)) is not None:
                 left_shuffle.insert_chunk(
-                    TableChunk.from_message(msg).make_available_and_spill(
-                        context.br(), allow_overbooking=True
+                    _validate_chunk_for_shuffle(
+                        TableChunk.from_message(msg).make_available_and_spill(
+                            context.br(), allow_overbooking=True
+                        ),
+                        " (left drain)",
                     )
                 )
                 del msg
@@ -669,8 +724,11 @@ async def _shuffle_join(
             assert right_shuffle is not None
             while (msg := await ch_right.recv(context)) is not None:
                 right_shuffle.insert_chunk(
-                    TableChunk.from_message(msg).make_available_and_spill(
-                        context.br(), allow_overbooking=True
+                    _validate_chunk_for_shuffle(
+                        TableChunk.from_message(msg).make_available_and_spill(
+                            context.br(), allow_overbooking=True
+                        ),
+                        " (right drain)",
                     )
                 )
                 del msg
@@ -980,6 +1038,19 @@ async def join_node(
                 modulus = min_modulus
 
             output_count = modulus // nranks
+
+            # Sanity check: output_count should be reasonable
+            # At SF10K with 256MB partitions, we might have ~40K partitions max
+            MAX_REASONABLE_PARTITIONS = 1_000_000
+            if output_count <= 0 or output_count > MAX_REASONABLE_PARTITIONS:
+                raise ValueError(
+                    f"Unreasonable output_count={output_count} computed for shuffle join. "
+                    f"modulus={modulus}, nranks={nranks}, "
+                    f"left_total={left_total}, right_total={right_total}, "
+                    f"left_existing_modulus={left_existing_modulus}, "
+                    f"right_existing_modulus={right_existing_modulus}, "
+                    f"min_modulus={min_modulus}"
+                )
 
             # Now check which sides need shuffling with the chosen modulus
             left_partitioned = _is_partitioned_on_keys(

@@ -47,6 +47,9 @@ if TYPE_CHECKING:
     from cudf_polars.experimental.base import Profiler
     from cudf_polars.experimental.rapidsmpf.dispatch import SubNetGenerator
 
+# Sanity check limits for dynamic planning
+MAX_REASONABLE_PARTITIONS = 1_000_000  # 1M partitions should be plenty
+
 
 # ============================================================================
 # Helper Functions
@@ -560,6 +563,13 @@ async def _shuffle_groupby(
     profiler: Profiler | None = None,
 ) -> None:
     """Execute groupby using shuffle-based redistribution."""
+    # Sanity check output_count
+    if output_count <= 0 or output_count > MAX_REASONABLE_PARTITIONS:
+        raise ValueError(
+            f"Unreasonable output_count={output_count} for shuffle groupby. "
+            f"Expected 1 to {MAX_REASONABLE_PARTITIONS}."
+        )
+
     nranks = context.comm().nranks
     local_output_count = max(1, output_count // nranks)
 
@@ -657,6 +667,13 @@ async def _shuffle_full_groupby(
     Unlike _shuffle_groupby, this doesn't use piecewise aggregation.
     It shuffles raw data by keys, then applies the full groupby.
     """
+    # Sanity check output_count
+    if output_count <= 0 or output_count > MAX_REASONABLE_PARTITIONS:
+        raise ValueError(
+            f"Unreasonable output_count={output_count} for shuffle_full groupby. "
+            f"Expected 1 to {MAX_REASONABLE_PARTITIONS}."
+        )
+
     nranks = context.comm().nranks
     local_output_count = max(1, output_count // nranks)
 
