@@ -37,9 +37,6 @@ if TYPE_CHECKING:
     from cudf_polars.experimental.base import Profiler
     from cudf_polars.experimental.rapidsmpf.dispatch import SubNetGenerator
 
-# Sanity check limits for dynamic planning
-MAX_REASONABLE_PARTITIONS = 1_000_000  # 1M partitions should be plenty
-
 
 def _apply_distinct(
     chunk: TableChunk,
@@ -233,13 +230,6 @@ async def _shuffle_distinct(
     from cudf_polars.experimental.rapidsmpf.collectives.shuffle import (
         ShuffleManager,
     )
-
-    # Sanity check output_count
-    if output_count <= 0 or output_count > MAX_REASONABLE_PARTITIONS:
-        raise ValueError(
-            f"Unreasonable output_count={output_count} for shuffle distinct. "
-            f"Expected 1 to {MAX_REASONABLE_PARTITIONS}."
-        )
 
     nranks = context.comm().nranks
 
