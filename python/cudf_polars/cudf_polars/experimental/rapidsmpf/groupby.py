@@ -930,8 +930,25 @@ async def groupby_node(
         # Strategy Selection
         # =====================================================================
 
+        # Debug output for strategy selection
+        import sys
+
+        print(
+            f"[GROUPBY DEBUG] estimated_total_size={estimated_total_size}, "
+            f"target_partition_size={target_partition_size}, "
+            f"adaptive_n_ary={adaptive_n_ary}, "
+            f"already_partitioned={already_partitioned}, "
+            f"can_skip_global_comm={can_skip_global_comm}, "
+            f"num_initial_chunks={len(initial_chunks)}",
+            file=sys.stderr,
+            flush=True,
+        )
+
         if already_partitioned or can_skip_global_comm:
             # No global communication needed - use tree reduction (no allgather)
+            print(
+                "[GROUPBY DEBUG] -> selecting tree_local", file=sys.stderr, flush=True
+            )
             if profiler is not None:
                 profiler.decisions[ir] = "tree_local"
             await _tree_groupby(
@@ -963,6 +980,11 @@ async def groupby_node(
             )
         elif not collective_ids:
             # No shuffle ID available - fall back to tree (no allgather)
+            print(
+                "[GROUPBY DEBUG] -> selecting tree_fallback",
+                file=sys.stderr,
+                flush=True,
+            )
             if profiler is not None:
                 profiler.decisions[ir] = "tree_fallback"
             await _tree_groupby(
@@ -978,10 +1000,14 @@ async def groupby_node(
             )
         else:
             # Large output - use shuffle
+            output_count = max(1, estimated_total_size // target_partition_size)
+            print(
+                f"[GROUPBY DEBUG] -> selecting shuffle with output_count={output_count}",
+                file=sys.stderr,
+                flush=True,
+            )
             if profiler is not None:
                 profiler.decisions[ir] = "shuffle"
-            # Calculate output partition count based on estimated size
-            output_count = max(1, estimated_total_size // target_partition_size)
             await _shuffle_groupby(
                 context,
                 decomposed,
