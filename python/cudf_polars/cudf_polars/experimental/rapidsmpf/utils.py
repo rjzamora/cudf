@@ -96,7 +96,7 @@ def remap_partitioning(
 
     def remap_hash_scheme(hs: HashScheme | None | str) -> HashScheme | None | str:
         if hs is None or isinstance(hs, str):
-            # None or "passthrough" - pass through unchanged
+            # None or "inherit" - inherits parent partitioning unchanged
             return hs
         # Get column names from old indices
         try:

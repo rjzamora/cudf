@@ -60,7 +60,7 @@ def _is_partitioned_on_keys(
     if metadata.partitioning is None:
         return False
     inter_rank = metadata.partitioning.inter_rank
-    if inter_rank is None or inter_rank == "passthrough":
+    if inter_rank is None or inter_rank == "inherit":
         return False
     return set(inter_rank.column_indices) == set(key_indices)
 
@@ -575,7 +575,7 @@ async def _shuffle_groupby(
         local_count=local_output_count,
         partitioning=Partitioning(
             inter_rank=HashScheme(pwise_key_indices, output_count),
-            local="passthrough",
+            local="inherit",
         ),
         duplicated=False,
     )
@@ -669,7 +669,7 @@ async def _shuffle_full_groupby(
         local_count=local_output_count,
         partitioning=Partitioning(
             inter_rank=HashScheme(key_indices, output_count),
-            local="passthrough",
+            local="inherit",
         ),
         duplicated=False,
     )

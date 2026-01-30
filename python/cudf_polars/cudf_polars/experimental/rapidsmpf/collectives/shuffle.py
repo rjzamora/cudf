@@ -134,13 +134,13 @@ def _is_already_partitioned(
     if metadata.partitioning is None:
         return False
 
-    # Check that inter_rank is a HashScheme (not None or "passthrough")
+    # Check that inter_rank is a HashScheme (not None or "inherit")
     inter_rank = metadata.partitioning.inter_rank
     if not isinstance(inter_rank, HashScheme):
         return False
 
-    # Check that local partitioning is passthrough
-    if metadata.partitioning.local != "passthrough":
+    # Check that local partitioning is inherit
+    if metadata.partitioning.local != "inherit":
         return False
 
     # Check for exact match: same columns and same modulus
@@ -205,7 +205,7 @@ async def shuffle_node(
             local_count=max(1, num_partitions // context.comm().nranks),
             partitioning=Partitioning(
                 inter_rank=HashScheme(columns_to_hash, num_partitions),
-                local="passthrough",
+                local="inherit",
             ),
         )
         await send_metadata(ch_out, context, output_metadata)

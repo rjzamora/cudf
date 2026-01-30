@@ -66,7 +66,7 @@ def _is_partitioned_on_keys(
     if metadata.partitioning is None:
         return False
     inter_rank = metadata.partitioning.inter_rank
-    if inter_rank is None or inter_rank == "passthrough":
+    if inter_rank is None or inter_rank == "inherit":
         return False
     # Check if partitioned on same keys
     if set(inter_rank.column_indices) != set(key_indices):
@@ -81,7 +81,7 @@ def _get_partitioning_modulus(metadata: ChannelMetadata) -> int | None:
     if metadata.partitioning is None:
         return None
     inter_rank = metadata.partitioning.inter_rank
-    if inter_rank is None or inter_rank == "passthrough":
+    if inter_rank is None or inter_rank == "inherit":
         return None
     return inter_rank.modulus
 
@@ -98,7 +98,7 @@ def _get_key_partitioning_modulus(
     if metadata.partitioning is None:
         return None
     inter_rank = metadata.partitioning.inter_rank
-    if inter_rank is None or inter_rank == "passthrough":
+    if inter_rank is None or inter_rank == "inherit":
         return None
     # Check if partitioned on same keys
     if set(inter_rank.column_indices) != set(key_indices):
@@ -612,7 +612,7 @@ async def _shuffle_join(
         local_count=output_count,
         partitioning=Partitioning(
             HashScheme(column_indices=output_key_indices, modulus=modulus),
-            local="passthrough",
+            local="inherit",
         )
         if output_key_indices
         else None,
