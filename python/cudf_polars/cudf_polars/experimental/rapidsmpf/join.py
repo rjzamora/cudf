@@ -1158,7 +1158,7 @@ def _(
     join_type = ir.options[0]
     use_dynamic = (
         isinstance(executor, StreamingExecutor)
-        and executor.dynamic_planning.enabled
+        and executor.dynamic_planning is not None
         and join_type in ("Inner", "Left", "Semi", "Anti")
     )
 
@@ -1201,6 +1201,7 @@ def _(
     elif use_dynamic:
         # Dynamic join - decide strategy at runtime
         assert isinstance(executor, StreamingExecutor)
+        assert executor.dynamic_planning is not None  # Checked in use_dynamic
         collective_ids = list(rec.state["collective_id_map"].get(ir, []))
         broadcast_threshold = (
             executor.target_partition_size * executor.broadcast_join_limit

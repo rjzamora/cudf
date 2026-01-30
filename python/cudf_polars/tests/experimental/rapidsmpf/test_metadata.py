@@ -59,7 +59,7 @@ def test_rapidsmpf_join_metadata(
             "broadcast_join_limit": broadcast_join_limit,
             "cluster": DEFAULT_CLUSTER,
             "runtime": DEFAULT_RUNTIME,
-            "dynamic_planning": {"enabled": False},
+            "dynamic_planning": None,
         },
     )
     config_options = ConfigOptions.from_polars_engine(engine)

@@ -74,7 +74,7 @@ class ReserveOpIDs:
         self.dynamic_planning_enabled = (
             config_options is not None
             and config_options.executor.name == "streaming"
-            and config_options.executor.dynamic_planning.enabled
+            and config_options.executor.dynamic_planning is not None
         )
 
         # Find all collective IR nodes.

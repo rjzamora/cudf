@@ -518,7 +518,7 @@ def test_profile_output(tmp_path, df):
             "runtime": DEFAULT_RUNTIME,
             "target_partition_size": 10_000,
             "profile_output": str(profile_path),
-            "dynamic_planning": {"enabled": True},
+            "dynamic_planning": {},
         },
     )
 

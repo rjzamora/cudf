@@ -483,12 +483,12 @@ def _(
     config_options = rec.state["config_options"]
     executor = config_options.executor
 
-    if (
-        not isinstance(executor, StreamingExecutor)
-        or not executor.dynamic_planning.enabled
-    ):
+    if not isinstance(executor, StreamingExecutor) or executor.dynamic_planning is None:
         # Fall back to the default IR handler (bypass Distinct dispatch)
         return generate_ir_sub_network.dispatch(IR)(ir, rec)
+
+    # For type narrowing after the early return
+    dynamic_planning = executor.dynamic_planning
 
     # Process children
     nodes, channels = process_children(ir, rec)
@@ -507,7 +507,7 @@ def _(
             rec.state["ir_context"],
             channels[ir].reserve_input_slot(),
             channels[ir.children[0]].reserve_output_slot(),
-            executor.dynamic_planning.sample_chunk_count,
+            dynamic_planning.sample_chunk_count,
             executor.target_partition_size,
             executor.groupby_n_ary,  # Reuse groupby n_ary for now
             collective_ids,

@@ -1007,9 +1007,12 @@ def _(
     assert config_options.executor.name == "streaming"
 
     # Only use the dynamic groupby node when dynamic planning is enabled
-    if not config_options.executor.dynamic_planning.enabled:
+    if config_options.executor.dynamic_planning is None:
         # Fall back to the default IR handler (bypass GroupBy dispatch)
         return generate_ir_sub_network.dispatch(IR)(ir, rec)
+
+    # For type narrowing after the early return
+    dynamic_planning = config_options.executor.dynamic_planning
 
     # Process children
     nodes, channels = process_children(ir, rec)
@@ -1028,7 +1031,7 @@ def _(
             rec.state["ir_context"],
             channels[ir].reserve_input_slot(),
             channels[ir.children[0]].reserve_output_slot(),
-            config_options.executor.dynamic_planning.sample_chunk_count,
+            dynamic_planning.sample_chunk_count,
             config_options.executor.target_partition_size,
             config_options.executor.groupby_n_ary,
             collective_ids,

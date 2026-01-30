@@ -256,11 +256,11 @@ class RunConfig:
     query_set: str
     collect_traces: bool = False
     stats_planning: bool
+    dynamic_planning: bool | None = None
+    profile_output: str | None = None
     max_io_threads: int
     native_parquet: bool
     spill_to_pinned_memory: bool
-    dynamic_planning: bool | None = None
-    profile_output: str | None = None
     extra_info: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:  # noqa: D105
@@ -377,12 +377,12 @@ class RunConfig:
             query_set=args.query_set,
             collect_traces=args.collect_traces,
             stats_planning=args.stats_planning,
+            dynamic_planning=args.dynamic_planning,
+            profile_output=args.profile_output,
             max_io_threads=args.max_io_threads,
             native_parquet=args.native_parquet,
             extra_info=args.extra_info,
             spill_to_pinned_memory=args.spill_to_pinned_memory,
-            dynamic_planning=args.dynamic_planning,
-            profile_output=args.profile_output,
         )
 
     def serialize(self, engine: pl.GPUEngine | None) -> dict:
@@ -414,6 +414,7 @@ class RunConfig:
                 print(f"stats_planning: {self.stats_planning}")
                 if self.runtime == "rapidsmpf":
                     print(f"native_parquet: {self.native_parquet}")
+                    print(f"dynamic_planning: {self.dynamic_planning}")
                 if self.cluster == "distributed":
                     print(f"n_workers: {self.n_workers}")
                     print(f"threads: {self.threads}")
@@ -475,10 +476,9 @@ def get_executor_options(
         executor_options["runtime"] = run_config.runtime
         executor_options["max_io_threads"] = run_config.max_io_threads
         executor_options["spill_to_pinned_memory"] = run_config.spill_to_pinned_memory
-        if run_config.dynamic_planning is not None:
-            executor_options["dynamic_planning"] = {
-                "enabled": run_config.dynamic_planning
-            }
+        if run_config.dynamic_planning:
+            # Pass empty dict to enable with defaults; None means disabled
+            executor_options["dynamic_planning"] = {}
         if run_config.profile_output is not None:
             executor_options["profile_output"] = run_config.profile_output
 
@@ -488,7 +488,6 @@ def get_executor_options(
         and run_config.executor == "streaming"
         # Only use the unique_fraction config if stats_planning is disabled
         and not run_config.stats_planning
-        # And if dynamic planning is disabled
         and not run_config.dynamic_planning
     ):
         executor_options["unique_fraction"] = {
@@ -776,27 +775,6 @@ def parse_args(
         default="tasks",
         help="Runtime to use for the streaming executor (tasks or rapidsmpf).",
     )
-    dynamic_planning_group = parser.add_mutually_exclusive_group()
-    dynamic_planning_group.add_argument(
-        "--dynamic-planning",
-        dest="dynamic_planning",
-        action="store_true",
-        default=None,
-        help="Enable dynamic planning for shuffle decisions at runtime.",
-    )
-    dynamic_planning_group.add_argument(
-        "--no-dynamic-planning",
-        dest="dynamic_planning",
-        action="store_false",
-        help="Disable dynamic planning (use static lowering).",
-    )
-    parser.add_argument(
-        "--profile-output",
-        dest="profile_output",
-        type=str,
-        default=None,
-        help="Path to write runtime profile (row counts and decisions) for debugging.",
-    )
     parser.add_argument(
         "--stream-policy",
         type=str,
@@ -993,6 +971,19 @@ def parse_args(
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Enable statistics planning.",
+    )
+    parser.add_argument(
+        "--dynamic-planning",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable dynamic shuffle planning.",
+    )
+    parser.add_argument(
+        "--profile-output",
+        dest="profile_output",
+        type=str,
+        default=None,
+        help="Path to write runtime profile (row counts and decisions) for debugging.",
     )
     parser.add_argument(
         "--max-io-threads",

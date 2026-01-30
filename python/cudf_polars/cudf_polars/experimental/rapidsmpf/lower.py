@@ -47,7 +47,7 @@ def _lower_groupby(
     config_options = rec.state["config_options"]
     assert config_options.executor.name == "streaming"
 
-    if not config_options.executor.dynamic_planning.enabled:
+    if config_options.executor.dynamic_planning is None:
         # Static planning: Use base task-engine lowering (inserts Shuffles)
         from cudf_polars.experimental.dispatch import (
             lower_ir_node as base_lower_ir_node,

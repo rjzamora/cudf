@@ -179,7 +179,7 @@ def _(
 
     # Check if dynamic planning is enabled
     use_dynamic = (
-        config_options.executor.dynamic_planning.enabled
+        config_options.executor.dynamic_planning is not None
         and rec.state.get("runtime") == "rapidsmpf"
     )
 

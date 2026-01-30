@@ -91,7 +91,7 @@ def test_broadcast_join_limit(left, right, broadcast_join_limit):
             "cluster": DEFAULT_CLUSTER,
             "runtime": DEFAULT_RUNTIME,
             "shuffle_method": DEFAULT_RUNTIME,  # Names coincide
-            "dynamic_planning": {"enabled": False},
+            "dynamic_planning": None,
         },
     )
     left = pl.LazyFrame(
@@ -190,7 +190,6 @@ def test_join_and_slice(zlice):
             "runtime": DEFAULT_RUNTIME,
             "shuffle_method": DEFAULT_RUNTIME,  # Names coincide
             "fallback_mode": "warn",
-            "dynamic_planning": {"enabled": False},
         },
     )
     left = pl.LazyFrame(
@@ -269,7 +268,7 @@ def test_cache_preserves_partitioning_join():
             "max_rows_per_partition": 3,
             "cluster": DEFAULT_CLUSTER,
             "runtime": DEFAULT_RUNTIME,
-            "dynamic_planning": {"enabled": False},
+            "dynamic_planning": None,
         },
     )
 

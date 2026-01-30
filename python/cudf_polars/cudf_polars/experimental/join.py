@@ -288,7 +288,7 @@ def _(
     join_type = ir.options[0]
     if (
         config_options.executor.runtime == "rapidsmpf"
-        and config_options.executor.dynamic_planning.enabled
+        and config_options.executor.dynamic_planning is not None
         and join_type in ("Inner", "Left", "Semi", "Anti")
     ):
         # Don't insert Shuffle nodes - let runtime decide strategy
