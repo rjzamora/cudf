@@ -810,6 +810,7 @@ async def groupby_node(
         # =====================================================================
         # For n_unique etc., we need to shuffle by keys BEFORE piecewise
         # This ensures all instances of the same key are together
+        # TODO: We can also do a pre-concat if the data is small enough
         if (
             need_preshuffle
             and not already_partitioned
@@ -818,6 +819,7 @@ async def groupby_node(
         ):
             # Collect initial chunks (no piecewise yet)
             initial_chunks = []
+            local_size = 0
             for _ in range(sample_chunk_count):
                 msg = await ch_in.recv(context)
                 if msg is None:
@@ -827,11 +829,30 @@ async def groupby_node(
                 )
                 del msg
                 initial_chunks.append(chunk)
+                local_size += chunk.data_alloc_size(MemoryType.DEVICE)
+
+            # Estimate total size and chunk count across all ranks
+            local_chunk_count = metadata_in.local_count
+            if initial_chunks:
+                avg_chunk_size = local_size / len(initial_chunks)
+                local_estimate = int(avg_chunk_size * local_chunk_count)
+            else:
+                local_estimate = 0
+
+            if nranks > 1:
+                estimated_total_size, global_chunk_count = await allgather_reduce(
+                    context, collective_ids.pop(), local_estimate, local_chunk_count
+                )
+            else:
+                estimated_total_size = local_estimate
+                global_chunk_count = local_chunk_count
 
             # Use shuffle_full_groupby (shuffles raw data, then full groupby)
             if tracer is not None:
                 tracer.decision = "shuffle_full"
-            output_count = max(nranks, nranks * 2)
+            ideal_count = max(1, estimated_total_size // target_partition_size)
+            # Cap at global chunk count, but use the rank count if it's larger
+            output_count = max(nranks, min(ideal_count, global_chunk_count))
             await _shuffle_full_groupby(
                 context,
                 ir,
@@ -884,11 +905,12 @@ async def groupby_node(
             adaptive_n_ary = groupby_n_ary  # fallback to configured value
 
         if collective_ids and nranks > 1:
-            (estimated_total_size,) = await allgather_reduce(
-                context, collective_ids.pop(), local_estimate
+            estimated_total_size, global_chunk_count = await allgather_reduce(
+                context, collective_ids.pop(), local_estimate, local_count
             )
         else:
             estimated_total_size = local_estimate
+            global_chunk_count = local_count
 
         # =====================================================================
         # Strategy Selection
@@ -957,7 +979,9 @@ async def groupby_node(
             )
         else:
             # Large output - use shuffle
-            output_count = max(1, estimated_total_size // target_partition_size)
+            ideal_count = max(1, estimated_total_size // target_partition_size)
+            # Cap at global chunk count, but use the rank count if it's larger
+            output_count = max(nranks, min(ideal_count, global_chunk_count))
             if tracer is not None:
                 tracer.decision = "shuffle"
             await _shuffle_groupby(

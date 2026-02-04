@@ -387,11 +387,12 @@ async def unique_node(
             adaptive_n_ary = n_ary  # fallback to configured value
 
         if collective_ids and nranks > 1:
-            (estimated_total_size,) = await allgather_reduce(
-                context, collective_ids.pop(), local_estimate
+            estimated_total_size, global_chunk_count = await allgather_reduce(
+                context, collective_ids.pop(), local_estimate, local_count
             )
         else:
             estimated_total_size = local_estimate
+            global_chunk_count = local_count
 
         # =====================================================================
         # Strategy Selection
@@ -447,7 +448,9 @@ async def unique_node(
             # Large output - use shuffle
             if tracer is not None:
                 tracer.decision = "shuffle"
-            output_count = max(1, estimated_total_size // target_partition_size)
+            ideal_count = max(1, estimated_total_size // target_partition_size)
+            # Cap at global chunk count, but use the rank count if it's larger
+            output_count = max(nranks, min(ideal_count, global_chunk_count))
             await _shuffle_distinct(
                 context,
                 ir,
