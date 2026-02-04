@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from rapidsmpf.streaming.core.context import Context
 
     from cudf_polars.experimental.rapidsmpf.dispatch import SubNetGenerator
-    from cudf_polars.experimental.rapidsmpf.tracing import StreamingNodeTracer
+    from cudf_polars.experimental.rapidsmpf.tracing import ActorTracer
 
 
 def _apply_distinct(
@@ -70,7 +70,7 @@ async def _tree_distinct(
     initial_chunks: list[TableChunk],
     n_ary: int,
     collective_id: int | None = None,
-    tracer: StreamingNodeTracer | None = None,
+    tracer: ActorTracer | None = None,
 ) -> None:
     """
     Tree-based distinct reduction.
@@ -220,7 +220,7 @@ async def _shuffle_distinct(
     output_count: int,
     collective_id: int,
     key_indices: tuple[int, ...],
-    tracer: StreamingNodeTracer | None = None,
+    tracer: ActorTracer | None = None,
 ) -> None:
     """
     Shuffle-based distinct.

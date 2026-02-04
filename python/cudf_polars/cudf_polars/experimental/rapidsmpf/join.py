@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 
     from cudf_polars.dsl.ir import IR, IRExecutionContext
     from cudf_polars.experimental.rapidsmpf.dispatch import SubNetGenerator
-    from cudf_polars.experimental.rapidsmpf.tracing import StreamingNodeTracer
+    from cudf_polars.experimental.rapidsmpf.tracing import ActorTracer
 
 # cuDF has a 2^31-1 (~2.15 billion) row limit for columns; use conservative limit
 # to account for estimation error (use 1.5 billion to have good margin)
@@ -339,7 +339,7 @@ async def _broadcast_join(
     broadcast_side: Literal["left", "right"],
     collective_id: int,
     target_partition_size: int,
-    tracer: StreamingNodeTracer | None = None,
+    tracer: ActorTracer | None = None,
 ) -> None:
     """
     Execute a broadcast join after initial sampling.
@@ -554,7 +554,7 @@ async def _shuffle_join(
     *,
     shuffle_left: bool = True,
     shuffle_right: bool = True,
-    tracer: StreamingNodeTracer | None = None,
+    tracer: ActorTracer | None = None,
 ) -> None:
     """
     Execute a shuffle (hash) join after initial sampling.

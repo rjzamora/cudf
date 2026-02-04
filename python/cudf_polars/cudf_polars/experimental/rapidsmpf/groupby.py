@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
     from cudf_polars.dsl.ir import IRExecutionContext
     from cudf_polars.experimental.rapidsmpf.dispatch import SubNetGenerator
-    from cudf_polars.experimental.rapidsmpf.tracing import StreamingNodeTracer
+    from cudf_polars.experimental.rapidsmpf.tracing import ActorTracer
 
 # ============================================================================
 # Helper Functions
@@ -177,7 +177,7 @@ async def _partitionwise_groupby(
     ch_in: Channel[TableChunk],
     metadata_in: ChannelMetadata,
     initial_chunks: list[TableChunk],
-    tracer: StreamingNodeTracer | None = None,
+    tracer: ActorTracer | None = None,
 ) -> None:
     """Execute partition-wise groupby (data already partitioned on keys)."""
     # Send output metadata preserving partitioning
@@ -219,7 +219,7 @@ async def _concat_groupby(
     metadata_in: ChannelMetadata,
     initial_chunks: list[TableChunk],
     collective_id: int | None = None,
-    tracer: StreamingNodeTracer | None = None,
+    tracer: ActorTracer | None = None,
 ) -> None:
     """
     Execute groupby by concatenating all data first.
@@ -343,7 +343,7 @@ async def _tree_groupby(
     initial_chunks: list[TableChunk],
     groupby_n_ary: int,
     collective_id: int | None = None,
-    tracer: StreamingNodeTracer | None = None,
+    tracer: ActorTracer | None = None,
 ) -> None:
     """
     Execute groupby using N-ary tree reduction to single output.
@@ -553,7 +553,7 @@ async def _shuffle_groupby(
     output_count: int,
     collective_id: int,
     key_indices: tuple[int, ...],
-    tracer: StreamingNodeTracer | None = None,
+    tracer: ActorTracer | None = None,
 ) -> None:
     """Execute groupby using shuffle-based redistribution."""
     nranks = context.comm().nranks
@@ -641,7 +641,7 @@ async def _shuffle_full_groupby(
     output_count: int,
     collective_id: int,
     key_indices: tuple[int, ...],
-    tracer: StreamingNodeTracer | None = None,
+    tracer: ActorTracer | None = None,
 ) -> None:
     """
     Execute non-decomposable groupby using shuffle-based redistribution.
