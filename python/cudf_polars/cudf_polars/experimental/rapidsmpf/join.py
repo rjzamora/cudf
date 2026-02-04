@@ -919,9 +919,9 @@ async def join_node(
             left_total_rows, right_total_rows = left_row_estimate, right_row_estimate
             left_total_chunks, right_total_chunks = left_local_count, right_local_count
 
-        # Cap at 2x the larger input side to allow for some join expansion
+        # Cap at 8x the larger input side to allow for some join expansion
         # while preventing runaway partition counts at large scale
-        max_output_chunks = 2 * max(left_total_chunks, right_total_chunks)
+        max_output_chunks = 8 * max(left_total_chunks, right_total_chunks)
 
         # =====================================================================
         # Strategy Selection
@@ -1036,7 +1036,7 @@ async def join_node(
             estimated_output_size = max(left_total, right_total)
             ideal_output_count = max(1, estimated_output_size // target_partition_size)
             ideal_modulus = nranks * ideal_output_count
-            min_modulus = max(nranks, min(ideal_modulus, max_output_chunks))
+            min_modulus = min(ideal_modulus, max_output_chunks)
 
             # Determine which modulus to use, preferring existing partitioning
             # if it provides at least the minimum needed partitions
