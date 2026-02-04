@@ -465,10 +465,6 @@ class DynamicPlanningOptions:
     These options can be configured via environment variables
     with the prefix ``CUDF_POLARS__EXECUTOR__DYNAMIC_PLANNING__``.
 
-    .. note::
-        Dynamic planning is not yet implemented. These options are
-        reserved for future use and currently have no effect.
-
     Parameters
     ----------
     sample_chunk_count
@@ -692,10 +688,6 @@ class StreamingExecutor:
     dynamic_planning
         Options controlling dynamic shuffle planning. See
         :class:`~cudf_polars.utils.config.DynamicPlanningOptions` for more.
-
-        .. note::
-            Dynamic planning is not yet implemented. These options are
-            reserved for future use and currently have no effect.
     max_io_threads
         Maximum number of IO threads for the rapidsmpf runtime. Default is 2.
         This controls the parallelism of IO operations when reading data.
@@ -801,7 +793,9 @@ class StreamingExecutor:
     stats_planning: StatsPlanningOptions = dataclasses.field(
         default_factory=StatsPlanningOptions
     )
-    dynamic_planning: DynamicPlanningOptions | None = None
+    dynamic_planning: DynamicPlanningOptions | None = dataclasses.field(
+        default_factory=DynamicPlanningOptions
+    )
     max_io_threads: int = dataclasses.field(
         default_factory=_make_default_factory(
             f"{_env_prefix}__MAX_IO_THREADS", int, default=2
@@ -1185,17 +1179,16 @@ class ConfigOptions:
                 )
 
                 # Handle dynamic_planning: check user config, then env var
+                # Dynamic planning is enabled by default; env var can disable it
                 user_dynamic_planning = user_executor_options.get(
                     "dynamic_planning", None
                 )
                 if user_dynamic_planning is None:
                     env_dynamic_planning = os.environ.get(
-                        "CUDF_POLARS__EXECUTOR__DYNAMIC_PLANNING", "0"
+                        "CUDF_POLARS__EXECUTOR__DYNAMIC_PLANNING", "1"
                     )
-                    if _bool_converter(env_dynamic_planning):
-                        user_executor_options["dynamic_planning"] = (
-                            DynamicPlanningOptions()
-                        )
+                    if not _bool_converter(env_dynamic_planning):
+                        user_executor_options["dynamic_planning"] = None
 
                 executor = StreamingExecutor(**user_executor_options)
             case _:  # pragma: no cover; Unreachable
