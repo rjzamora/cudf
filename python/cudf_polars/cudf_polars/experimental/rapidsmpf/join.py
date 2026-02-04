@@ -919,11 +919,9 @@ async def join_node(
             left_total_rows, right_total_rows = left_row_estimate, right_row_estimate
             left_total_chunks, right_total_chunks = left_local_count, right_local_count
 
-        # Find the sum of incoming chunks across all ranks.
-        # We will try not to produce more than this number of output chunks
-        # unless this number is less than nranks.
-        # TODO: Some joins may *need* more chunks to avoid memory issues.
-        total_global_chunk_count = left_total_chunks + right_total_chunks
+        # Cap at 2x the larger input side to allow for some join expansion
+        # while preventing runaway partition counts at large scale
+        max_output_chunks = 2 * max(left_total_chunks, right_total_chunks)
 
         # =====================================================================
         # Strategy Selection
@@ -1038,8 +1036,7 @@ async def join_node(
             estimated_output_size = max(left_total, right_total)
             ideal_output_count = max(1, estimated_output_size // target_partition_size)
             ideal_modulus = nranks * ideal_output_count
-            # Cap at global chunk count (don't create more partitions than chunks)
-            min_modulus = max(1, min(ideal_modulus, total_global_chunk_count))
+            min_modulus = max(nranks, min(ideal_modulus, max_output_chunks))
 
             # Determine which modulus to use, preferring existing partitioning
             # if it provides at least the minimum needed partitions
