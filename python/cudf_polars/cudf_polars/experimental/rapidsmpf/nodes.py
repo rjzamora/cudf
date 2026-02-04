@@ -99,11 +99,18 @@ async def default_node_single(
                 receiving = False
                 if received_any:
                     break
-                else:
+                elif metadata_in.duplicated or context.comm().nranks == 1:
                     # Make sure we have an empty chunk in case do_evaluate
-                    # always produces rows (e.g. aggregation)
+                    # always produces rows (e.g. aggregation).
+                    # Only do this if data is duplicated (all ranks have same data)
+                    # or single rank (no distributed coordination needed).
                     stream = ir_context.get_cuda_stream()
                     chunk = empty_table_chunk(ir.children[0], context, stream)
+                else:
+                    # Distributed with non-duplicated input and no local data:
+                    # Don't synthesize empty chunk - another rank has the real data.
+                    await ch_out.drain(context)
+                    return
             else:
                 received_any = True
                 chunk = TableChunk.from_message(msg).make_available_and_spill(
