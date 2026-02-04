@@ -117,17 +117,18 @@ def test_groupby_fallback(df, engine, fallback_mode):
 
     q = df.group_by("y").median()
 
-    if fallback_mode == "silent":
+    if fallback_mode == "foo":
+        ctx = pytest.raises(
+            pl.exceptions.ComputeError,
+            match="'foo' is not a valid StreamingFallbackMode",
+        )
+    elif fallback_mode == "silent" or DEFAULT_RUNTIME == "rapidsmpf":
+        # rapidsmpf handles non-decomposable aggregations via _concat_groupby
         ctx = contextlib.nullcontext()
     elif fallback_mode == "raise":
         ctx = pytest.raises(
             NotImplementedError,
             match=match,
-        )
-    elif fallback_mode == "foo":
-        ctx = pytest.raises(
-            pl.exceptions.ComputeError,
-            match="'foo' is not a valid StreamingFallbackMode",
         )
     else:
         ctx = pytest.warns(UserWarning, match=match)
