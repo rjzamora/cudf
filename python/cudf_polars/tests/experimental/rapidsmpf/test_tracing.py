@@ -75,6 +75,7 @@ def test_structlog_contains_expected_ir_types():
             "cluster": "single",
             "runtime": "rapidsmpf",
             "max_rows_per_partition": 10,
+            "dynamic_planning": None,  # Static lowering inserts Repartition
         },
         memory_resource=rmm.mr.ManagedMemoryResource(),
     )
@@ -88,7 +89,7 @@ def test_structlog_contains_expected_ir_types():
         [sys.executable, "-c", code], env=env, stderr=subprocess.STDOUT
     )
 
-    # Check for expected IR types in the query
+    # Check for expected IR types in the query (static lowering path)
     assert b"ir_type=DataFrameScan" in result
     assert b"ir_type=Filter" in result
     assert b"ir_type=GroupBy" in result
