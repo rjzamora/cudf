@@ -437,18 +437,42 @@ def _(
 def _(
     ir: Slice, rec: LowerIRTransformer
 ) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    config_options = rec.state["config_options"]
+
+    # RapidsMPF runtime: Always collapse to single partition for any offset
+    if (
+        config_options.executor.name == "streaming"
+        and config_options.executor.runtime == "rapidsmpf"
+    ):
+        (child,) = ir.children
+        child, partition_info = rec(child)
+        child_count = partition_info[child].count
+
+        if child_count > 1:
+            # Collapse to single partition before slicing
+            inter = Repartition(child.schema, child)
+            partition_info[inter] = PartitionInfo(count=1)
+            sliced = ir.reconstruct([inter])
+            partition_info[sliced] = PartitionInfo(count=1)
+            return sliced, partition_info
+
+        # Single partition - just reconstruct
+        sliced = ir.reconstruct([child])
+        partition_info[sliced] = PartitionInfo(count=1)
+        return sliced, partition_info
+
     if ir.offset == 0:
         # Taking the first N rows.
         # We don't know how large each partition is, so we reduce.
-        new_node, partition_info = _lower_ir_pwise(ir, rec)
-        if partition_info[new_node].count > 1:
+        result, partition_info = _lower_ir_pwise(ir, rec)
+        if partition_info[result].count > 1:
             # Collapse down to single partition
-            inter = Repartition(new_node.schema, new_node)
+            inter = Repartition(result.schema, result)
             partition_info[inter] = PartitionInfo(count=1)
             # Slice reduced partition
-            new_node = ir.reconstruct([inter])
-            partition_info[new_node] = PartitionInfo(count=1)
-        return new_node, partition_info
+            result = ir.reconstruct([inter])
+            partition_info[result] = PartitionInfo(count=1)
+        return result, partition_info
 
     # Fallback
     return _lower_ir_fallback(

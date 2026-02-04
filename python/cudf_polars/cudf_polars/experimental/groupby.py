@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 """Parallel GroupBy Logic."""
 
@@ -191,6 +191,26 @@ def _(
         partition_info[single_part_node] = partition_info[child]
         return single_part_node, partition_info
 
+    config_options = rec.state["config_options"]
+    assert config_options.executor.name == "streaming", (
+        "'in-memory' executor not supported in 'lower_ir_node'"
+    )
+
+    # Check for dynamic planning - defer decomposition and shuffle decisions to runtime
+    if (
+        config_options.executor.runtime == "rapidsmpf"
+        and config_options.executor.dynamic_planning is not None
+    ):
+        # Dynamic planning: Just reconstruct the GroupBy.
+        # The runtime GroupBy node will handle decomposition and shuffle decisions.
+        child_count = partition_info[child].count
+        dynamic_node = ir.reconstruct([child])
+        partition_info[dynamic_node] = PartitionInfo(
+            count=child_count,
+            partitioned_on=ir.keys,
+        )
+        return dynamic_node, partition_info
+
     # Check group-by keys
     if not all(
         expr.is_pointwise for expr in traversal([e.value for e in ir.keys])
@@ -205,11 +225,6 @@ def _(
     post_aggregation_count = 1  # Default tree reduction
     groupby_key_columns = [ne.name for ne in ir.keys]
     shuffled = partition_info[child].partitioned_on == ir.keys
-
-    config_options = rec.state["config_options"]
-    assert config_options.executor.name == "streaming", (
-        "'in-memory' executor not supported in 'lower_ir_node'"
-    )
 
     child_count = partition_info[child].count
     if unique_fraction_dict := _get_unique_fractions(
