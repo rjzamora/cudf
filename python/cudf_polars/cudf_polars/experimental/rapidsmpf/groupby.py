@@ -59,7 +59,23 @@ def _is_partitioned_on_keys(
     metadata: ChannelMetadata,
     key_indices: tuple[int, ...],
 ) -> tuple[bool, bool]:
-    """Check if data is already partitioned on the groupby keys."""
+    """
+    Check if data is already partitioned on the groupby keys.
+
+    Parameters
+    ----------
+    metadata
+        The metadata of the channel.
+    key_indices
+        The indices of the groupby keys.
+
+    Returns
+    -------
+    already_partitioned_inter_rank
+        Whether the data is already partitioned between ranks.
+    already_partitioned_local
+        Whether the data is already partitioned within a rank.
+    """
     if metadata.partitioning is None:
         return False, False
 
@@ -800,15 +816,12 @@ async def groupby_node(
         )
 
         # Check if already partitioned on keys
-        already_partitioned_global, already_partitioned_local = _is_partitioned_on_keys(
-            metadata_in, key_indices
-        )
-        already_partitioned_full = (
-            already_partitioned_global and already_partitioned_local
+        already_partitioned_inter_rank, already_partitioned_local = (
+            _is_partitioned_on_keys(metadata_in, key_indices)
         )
 
         # If already partitioned globally and locally, just do a chunk-wise groupby
-        if already_partitioned_full:
+        if already_partitioned_inter_rank and already_partitioned_local:
             await _chunkwise_groupby(
                 context,
                 ir,
@@ -839,7 +852,7 @@ async def groupby_node(
         # Determine if we can skip global communication
         # Yes if: single rank, OR data is duplicated, OR already globally partitioned
         can_skip_global_comm = (
-            nranks == 1 or metadata_in.duplicated or already_partitioned_global
+            nranks == 1 or metadata_in.duplicated or already_partitioned_inter_rank
         )
 
         # =====================================================================
@@ -884,12 +897,7 @@ async def groupby_node(
         # For n_unique etc., we need to shuffle by keys BEFORE piecewise
         # This ensures all instances of the same key are together
         # TODO: We can also do a pre-concat if the data is small enough
-        if (
-            need_preshuffle
-            and not already_partitioned_full
-            and collective_ids
-            and not can_skip_global_comm
-        ):
+        if need_preshuffle and collective_ids and not can_skip_global_comm:
             # Collect initial chunks (no piecewise yet)
             initial_chunks = []
             local_size = 0
@@ -995,7 +1003,7 @@ async def groupby_node(
         # Strategy Selection
         # =====================================================================
 
-        if already_partitioned_global:
+        if already_partitioned_inter_rank:
             # Already partitioned on groupby keys - use tree reduction (no allgather)
             if tracer is not None:
                 tracer.decision = "tree_local"
