@@ -89,7 +89,7 @@ def test_structlog_contains_expected_ir_types():
         [sys.executable, "-c", code], env=env, stderr=subprocess.STDOUT
     )
 
-    # Check for expected IR types in the query (static lowering path)
+    # Check for expected IR types in the query
     assert b"ir_type=DataFrameScan" in result
     assert b"ir_type=Filter" in result
     assert b"ir_type=GroupBy" in result
