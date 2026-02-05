@@ -58,14 +58,23 @@ if TYPE_CHECKING:
 def _is_partitioned_on_keys(
     metadata: ChannelMetadata,
     key_indices: tuple[int, ...],
-) -> bool:
+) -> tuple[bool, bool]:
     """Check if data is already partitioned on the groupby keys."""
     if metadata.partitioning is None:
-        return False
+        return False, False
+
     inter_rank = metadata.partitioning.inter_rank
-    if inter_rank is None or inter_rank == "inherit":
-        return False
-    return set(inter_rank.column_indices) == set(key_indices)
+    local = metadata.partitioning.local
+    if (
+        inter_rank is None
+        or inter_rank == "inherit"
+        or inter_rank.column_indices != key_indices
+    ):
+        return False, False
+    elif local == "inherit" or local.column_indices != key_indices:
+        return True, True
+    else:
+        return True, False
 
 
 def _apply_do_evaluate(
@@ -791,10 +800,15 @@ async def groupby_node(
         )
 
         # Check if already partitioned on keys
-        already_partitioned = _is_partitioned_on_keys(metadata_in, key_indices)
+        already_partitioned_global, already_partitioned_local = _is_partitioned_on_keys(
+            metadata_in, key_indices
+        )
+        already_partitioned_full = (
+            already_partitioned_global and already_partitioned_local
+        )
 
-        # If already partitioned, just do a chunk-wise groupby
-        if already_partitioned:
+        # If already partitioned globally and locally, just do a chunk-wise groupby
+        if already_partitioned_full:
             await _chunkwise_groupby(
                 context,
                 ir,
@@ -825,7 +839,7 @@ async def groupby_node(
         # Determine if we can skip global communication
         # Yes if: single rank, OR data is duplicated, OR already globally partitioned
         can_skip_global_comm = (
-            nranks == 1 or metadata_in.duplicated or already_partitioned
+            nranks == 1 or metadata_in.duplicated or already_partitioned_global
         )
 
         # =====================================================================
@@ -872,7 +886,7 @@ async def groupby_node(
         # TODO: We can also do a pre-concat if the data is small enough
         if (
             need_preshuffle
-            and not already_partitioned
+            and not already_partitioned_full
             and collective_ids
             and not can_skip_global_comm
         ):
@@ -981,7 +995,7 @@ async def groupby_node(
         # Strategy Selection
         # =====================================================================
 
-        if already_partitioned:
+        if already_partitioned_global:
             # Already partitioned on groupby keys - use tree reduction (no allgather)
             if tracer is not None:
                 tracer.decision = "tree_local"
