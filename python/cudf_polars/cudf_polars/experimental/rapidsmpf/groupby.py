@@ -172,38 +172,21 @@ class DecomposedGroupBy:
 # ============================================================================
 
 
-async def _partitionwise_groupby(
+async def _chunkwise_groupby(
     context: Context,
     ir: GroupBy,
     ir_context: IRExecutionContext,
     ch_out: Channel[TableChunk],
     ch_in: Channel[TableChunk],
     metadata_in: ChannelMetadata,
-    initial_chunks: list[TableChunk],
     tracer: ActorTracer | None = None,
 ) -> None:
-    """Execute partition-wise groupby (data already partitioned on keys)."""
+    """Execute chunk-wise groupby (data is already partitioned on keys)."""
     # Send output metadata preserving partitioning
     await send_metadata(ch_out, context, metadata_in)
 
-    # Process initial chunks
-    for seq_num, input_chunk in enumerate(initial_chunks):
-        chunk, extra = await make_table_chunks_available_or_wait(
-            context,
-            input_chunk,
-            reserve_extra=input_chunk.data_alloc_size(),
-            net_memory_delta=0,
-        )
-        with opaque_memory_usage(extra):
-            result = await asyncio.to_thread(_apply_do_evaluate, chunk, ir, ir_context)
-            del chunk
-        if tracer is not None:
-            tracer.add_chunk(table=result.table_view())
-        await ch_out.send(context, Message(seq_num, result))
-        del result
-
     # Process remaining chunks
-    seq_num = len(initial_chunks)
+    seq_num = 0
     while (msg := await ch_in.recv(context)) is not None:
         chunk = TableChunk.from_message(msg)
         del msg
@@ -809,6 +792,19 @@ async def groupby_node(
 
         # Check if already partitioned on keys
         already_partitioned = _is_partitioned_on_keys(metadata_in, key_indices)
+
+        # If already partitioned, just do a chunk-wise groupby
+        if already_partitioned:
+            await _chunkwise_groupby(
+                context,
+                ir,
+                ir_context,
+                ch_out,
+                ch_in,
+                metadata_in,
+                tracer,
+            )
+            return
 
         # Try to decompose for multi-phase execution
         # need_preconcat is True when:
