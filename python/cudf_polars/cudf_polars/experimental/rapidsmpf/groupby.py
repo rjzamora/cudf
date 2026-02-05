@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from rapidsmpf.memory.buffer import MemoryType
+from rapidsmpf.memory.memory_reservation import opaque_memory_usage
 from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.core.node import define_py_node
 from rapidsmpf.streaming.cudf.channel_metadata import (
@@ -16,7 +17,10 @@ from rapidsmpf.streaming.cudf.channel_metadata import (
     HashScheme,
     Partitioning,
 )
-from rapidsmpf.streaming.cudf.table_chunk import TableChunk
+from rapidsmpf.streaming.cudf.table_chunk import (
+    TableChunk,
+    make_table_chunks_available_or_wait,
+)
 
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.expr import Col, NamedExpr
@@ -31,7 +35,6 @@ from cudf_polars.experimental.rapidsmpf.dispatch import (
 from cudf_polars.experimental.rapidsmpf.utils import (
     ChannelManager,
     allgather_reduce,
-    opaque_reservation,
     process_children,
     recv_metadata,
     send_metadata,
@@ -184,27 +187,39 @@ async def _partitionwise_groupby(
     await send_metadata(ch_out, context, metadata_in)
 
     # Process initial chunks
-    for seq_num, chunk in enumerate(initial_chunks):
-        with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
+    for seq_num, input_chunk in enumerate(initial_chunks):
+        chunk, extra = await make_table_chunks_available_or_wait(
+            context,
+            input_chunk,
+            reserve_extra=input_chunk.data_alloc_size(),
+            net_memory_delta=0,
+        )
+        with opaque_memory_usage(extra):
             result = await asyncio.to_thread(_apply_do_evaluate, chunk, ir, ir_context)
-            if tracer is not None:
-                tracer.add_chunk(table=result.table_view())
-            await ch_out.send(context, Message(seq_num, result))
-            del chunk, result
+            del chunk
+        if tracer is not None:
+            tracer.add_chunk(table=result.table_view())
+        await ch_out.send(context, Message(seq_num, result))
+        del result
 
     # Process remaining chunks
     seq_num = len(initial_chunks)
     while (msg := await ch_in.recv(context)) is not None:
-        chunk = TableChunk.from_message(msg).make_available_and_spill(
-            context.br(), allow_overbooking=True
-        )
+        chunk = TableChunk.from_message(msg)
         del msg
-        with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
+        chunk, extra = await make_table_chunks_available_or_wait(
+            context,
+            chunk,
+            reserve_extra=chunk.data_alloc_size(),
+            net_memory_delta=0,
+        )
+        with opaque_memory_usage(extra):
             result = await asyncio.to_thread(_apply_do_evaluate, chunk, ir, ir_context)
-            if tracer is not None:
-                tracer.add_chunk(table=result.table_view())
-            await ch_out.send(context, Message(seq_num, result))
-            del chunk, result
+            del chunk
+        if tracer is not None:
+            tracer.add_chunk(table=result.table_view())
+        await ch_out.send(context, Message(seq_num, result))
+        del result
         seq_num += 1
 
     await ch_out.drain(context)
@@ -289,7 +304,13 @@ async def _concat_groupby(
 
     if chunks:
         # Reserve extra for groupby working memory (input + output)
-        with opaque_reservation(context, input_bytes * 2):
+        chunks, extra = await make_table_chunks_available_or_wait(
+            context,
+            chunks,
+            reserve_extra=input_bytes,
+            net_memory_delta=0,
+        )
+        with opaque_memory_usage(extra):
             multi_chunks = len(chunks) > 1
             input_schema = ir.children[0].schema
 
@@ -315,20 +336,20 @@ async def _concat_groupby(
                 ir.do_evaluate, *ir._non_child_args, concatenated, context=ir_context
             )
             del concatenated
-            if tracer is not None:
-                tracer.add_chunk(table=df.table)
-            await ch_out.send(
-                context,
-                Message(
-                    0,
-                    TableChunk.from_pylibcudf_table(
-                        df.table, df.stream, exclusive_view=True
-                    ),
-                ),
-            )
-            del df
             if not multi_chunks:
                 del chunks
+        if tracer is not None:
+            tracer.add_chunk(table=df.table)
+        await ch_out.send(
+            context,
+            Message(
+                0,
+                TableChunk.from_pylibcudf_table(
+                    df.table, df.stream, exclusive_view=True
+                ),
+            ),
+        )
+        del df
 
     await ch_out.drain(context)
 
@@ -370,11 +391,15 @@ async def _tree_groupby(
 
     # Apply piecewise to remaining chunks from input channel
     while (msg := await ch_in.recv(context)) is not None:
-        chunk = TableChunk.from_message(msg).make_available_and_spill(
-            context.br(), allow_overbooking=True
-        )
+        chunk = TableChunk.from_message(msg)
         del msg
-        with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
+        chunk, extra = await make_table_chunks_available_or_wait(
+            context,
+            chunk,
+            reserve_extra=chunk.data_alloc_size(),
+            net_memory_delta=0,
+        )
+        with opaque_memory_usage(extra):
             pwise_chunk = await asyncio.to_thread(
                 _apply_do_evaluate, chunk, decomposed.piecewise_ir, ir_context
             )
@@ -394,9 +419,14 @@ async def _tree_groupby(
             batch = pwise_chunks[i : i + k]
             # Concatenate and reduce (even single-chunk batches need reduction
             # to convert from piecewise to reduction schema on first pass)
-            input_bytes = sum(c.data_alloc_size(MemoryType.DEVICE) for c in batch)
             # Reserve extra for groupby working memory (input + output)
-            with opaque_reservation(context, input_bytes * 2):
+            batch, extra = await make_table_chunks_available_or_wait(
+                context,
+                batch,
+                reserve_extra=sum(c.data_alloc_size() for c in batch),
+                net_memory_delta=0,
+            )
+            with opaque_memory_usage(extra):
                 concatenated = await asyncio.to_thread(
                     _concat,
                     *[
@@ -440,11 +470,14 @@ async def _tree_groupby(
         reduction_schema = decomposed.reduction_ir.schema
         if pwise_chunks:
             # Construct DataFrames with correct schema based on whether tree reduction ran
-            input_bytes = sum(
-                c.data_alloc_size(MemoryType.DEVICE) for c in pwise_chunks
+            # Reserve extra for groupby working memory (2x for safety)
+            pwise_chunks, extra = await make_table_chunks_available_or_wait(
+                context,
+                pwise_chunks,
+                reserve_extra=sum(c.data_alloc_size() for c in pwise_chunks) * 2,
+                net_memory_delta=0,
             )
-            # Reserve extra for groupby working memory (3x for safety)
-            with opaque_reservation(context, input_bytes * 3):
+            with opaque_memory_usage(extra):
                 concatenated = await asyncio.to_thread(
                     _concat,
                     *[
@@ -489,9 +522,14 @@ async def _tree_groupby(
 
         # One more reduction round to merge results from all ranks
         chunk = pwise_chunks[0]
-        input_bytes = chunk.data_alloc_size(MemoryType.DEVICE)
         # Reserve extra for groupby working memory (input + output)
-        with opaque_reservation(context, input_bytes * 2):
+        chunk, extra = await make_table_chunks_available_or_wait(
+            context,
+            chunk,
+            reserve_extra=chunk.data_alloc_size(),
+            net_memory_delta=0,
+        )
+        with opaque_memory_usage(extra):
             reduction_schema = decomposed.reduction_ir.schema
             concatenated = DataFrame.from_table(
                 chunk.table_view(),
@@ -517,7 +555,13 @@ async def _tree_groupby(
     # Apply final selection and send
     if pwise_chunks:
         chunk = pwise_chunks[0]
-        with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
+        chunk, extra = await make_table_chunks_available_or_wait(
+            context,
+            chunk,
+            reserve_extra=chunk.data_alloc_size(),
+            net_memory_delta=0,
+        )
+        with opaque_memory_usage(extra):
             chunk = await asyncio.to_thread(
                 _apply_do_evaluate,
                 chunk,
@@ -525,10 +569,10 @@ async def _tree_groupby(
                 ir_context,
                 input_schema=decomposed.reduction_ir.schema,
             )
-            if tracer is not None:
-                tracer.add_chunk(table=chunk.table_view())
-            await ch_out.send(context, Message(0, chunk))
-            del chunk
+        if tracer is not None:
+            tracer.add_chunk(table=chunk.table_view())
+        await ch_out.send(context, Message(0, chunk))
+        del chunk
     else:
         # No data - send empty chunk
         from cudf_polars.experimental.rapidsmpf.utils import empty_table_chunk
@@ -583,11 +627,15 @@ async def _shuffle_groupby(
 
     # Process remaining chunks (need piecewise applied)
     while (msg := await ch_in.recv(context)) is not None:
-        chunk = TableChunk.from_message(msg).make_available_and_spill(
-            context.br(), allow_overbooking=True
-        )
+        chunk = TableChunk.from_message(msg)
         del msg
-        with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
+        chunk, extra = await make_table_chunks_available_or_wait(
+            context,
+            chunk,
+            reserve_extra=chunk.data_alloc_size(),
+            net_memory_delta=0,
+        )
+        with opaque_memory_usage(extra):
             pwise_chunk = await asyncio.to_thread(
                 _apply_do_evaluate, chunk, decomposed.piecewise_ir, ir_context
             )
@@ -606,7 +654,13 @@ async def _shuffle_groupby(
         )
 
         # Reserve extra for groupby working memory (input + output)
-        with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE) * 2):
+        chunk, extra = await make_table_chunks_available_or_wait(
+            context,
+            chunk,
+            reserve_extra=chunk.data_alloc_size(),
+            net_memory_delta=0,
+        )
+        with opaque_memory_usage(extra):
             # Apply reduction
             chunk = await asyncio.to_thread(
                 _apply_do_evaluate,
@@ -622,10 +676,10 @@ async def _shuffle_groupby(
                 ir_context,
                 input_schema=decomposed.reduction_ir.schema,
             )
-            if tracer is not None:
-                tracer.add_chunk(table=chunk.table_view())
-            await ch_out.send(context, Message(partition_id, chunk))
-            del chunk
+        if tracer is not None:
+            tracer.add_chunk(table=chunk.table_view())
+        await ch_out.send(context, Message(partition_id, chunk))
+        del chunk
 
     await ch_out.drain(context)
 
@@ -693,7 +747,13 @@ async def _shuffle_full_groupby(
             exclusive_view=True,
         )
         # Reserve extra for groupby working memory (input + output)
-        with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE) * 2):
+        chunk, extra = await make_table_chunks_available_or_wait(
+            context,
+            chunk,
+            reserve_extra=chunk.data_alloc_size(),
+            net_memory_delta=0,
+        )
+        with opaque_memory_usage(extra):
             # Apply full groupby (including zlice if present)
             chunk = await asyncio.to_thread(
                 _apply_do_evaluate,
@@ -701,10 +761,10 @@ async def _shuffle_full_groupby(
                 ir,
                 ir_context,
             )
-            if tracer is not None:
-                tracer.add_chunk(table=chunk.table_view())
-            await ch_out.send(context, Message(partition_id, chunk))
-            del chunk
+        if tracer is not None:
+            tracer.add_chunk(table=chunk.table_view())
+        await ch_out.send(context, Message(partition_id, chunk))
+        del chunk
 
     await ch_out.drain(context)
 
@@ -883,12 +943,16 @@ async def groupby_node(
             msg = await ch_in.recv(context)
             if msg is None:
                 break
-            chunk = TableChunk.from_message(msg).make_available_and_spill(
-                context.br(), allow_overbooking=True
-            )
+            chunk = TableChunk.from_message(msg)
             del msg
 
-            with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
+            chunk, extra = await make_table_chunks_available_or_wait(
+                context,
+                chunk,
+                reserve_extra=chunk.data_alloc_size(),
+                net_memory_delta=0,
+            )
+            with opaque_memory_usage(extra):
                 pwise_chunk = await asyncio.to_thread(
                     _apply_do_evaluate, chunk, decomposed.piecewise_ir, ir_context
                 )

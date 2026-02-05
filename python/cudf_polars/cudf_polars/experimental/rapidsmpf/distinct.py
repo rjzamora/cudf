@@ -8,10 +8,14 @@ import asyncio
 from typing import TYPE_CHECKING, Any
 
 from rapidsmpf.memory.buffer import MemoryType
+from rapidsmpf.memory.memory_reservation import opaque_memory_usage
 from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.core.node import define_py_node
 from rapidsmpf.streaming.cudf.channel_metadata import ChannelMetadata
-from rapidsmpf.streaming.cudf.table_chunk import TableChunk
+from rapidsmpf.streaming.cudf.table_chunk import (
+    TableChunk,
+    make_table_chunks_available_or_wait,
+)
 
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IR, Distinct
@@ -22,7 +26,6 @@ from cudf_polars.experimental.rapidsmpf.utils import (
     ChannelManager,
     allgather_reduce,
     empty_table_chunk,
-    opaque_reservation,
     process_children,
     recv_metadata,
     send_metadata,
@@ -100,11 +103,15 @@ async def _tree_distinct(
 
     # Apply distinct to remaining chunks from input channel
     while (msg := await ch_in.recv(context)) is not None:
-        chunk = TableChunk.from_message(msg).make_available_and_spill(
-            context.br(), allow_overbooking=True
-        )
+        chunk = TableChunk.from_message(msg)
         del msg
-        with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
+        chunk, extra = await make_table_chunks_available_or_wait(
+            context,
+            chunk,
+            reserve_extra=chunk.data_alloc_size(),
+            net_memory_delta=0,
+        )
+        with opaque_memory_usage(extra):
             distinct_chunk = await asyncio.to_thread(
                 _apply_distinct, chunk, ir, ir_context
             )
@@ -121,8 +128,13 @@ async def _tree_distinct(
             if len(batch) == 1:
                 new_chunks.append(batch[0])
             else:
-                input_bytes = sum(c.data_alloc_size(MemoryType.DEVICE) for c in batch)
-                with opaque_reservation(context, input_bytes):
+                batch, extra = await make_table_chunks_available_or_wait(
+                    context,
+                    batch,
+                    reserve_extra=sum(c.data_alloc_size() for c in batch),
+                    net_memory_delta=0,
+                )
+                with opaque_memory_usage(extra):
                     concatenated = await asyncio.to_thread(
                         _concat,
                         *[
@@ -175,8 +187,13 @@ async def _tree_distinct(
 
         # One more distinct round to merge results from all ranks
         chunk = distinct_chunks[0]
-        input_bytes = chunk.data_alloc_size(MemoryType.DEVICE)
-        with opaque_reservation(context, input_bytes):
+        chunk, extra = await make_table_chunks_available_or_wait(
+            context,
+            chunk,
+            reserve_extra=chunk.data_alloc_size(),
+            net_memory_delta=0,
+        )
+        with opaque_memory_usage(extra):
             df = await asyncio.to_thread(
                 ir.do_evaluate,
                 *ir._non_child_args,
@@ -281,8 +298,13 @@ async def _shuffle_distinct(
             exclusive_view=True,
         )
 
-        input_bytes = partition_chunk.data_alloc_size(MemoryType.DEVICE)
-        with opaque_reservation(context, input_bytes):
+        partition_chunk, extra = await make_table_chunks_available_or_wait(
+            context,
+            partition_chunk,
+            reserve_extra=partition_chunk.data_alloc_size(),
+            net_memory_delta=0,
+        )
+        with opaque_memory_usage(extra):
             df = await asyncio.to_thread(
                 ir.do_evaluate,
                 *ir._non_child_args,
@@ -360,12 +382,16 @@ async def unique_node(
             msg = await ch_in.recv(context)
             if msg is None:
                 break
-            chunk = TableChunk.from_message(msg).make_available_and_spill(
-                context.br(), allow_overbooking=True
-            )
+            chunk = TableChunk.from_message(msg)
             del msg
 
-            with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE)):
+            chunk, extra = await make_table_chunks_available_or_wait(
+                context,
+                chunk,
+                reserve_extra=chunk.data_alloc_size(),
+                net_memory_delta=0,
+            )
+            with opaque_memory_usage(extra):
                 distinct_chunk = await asyncio.to_thread(
                     _apply_distinct, chunk, ir, ir_context
                 )

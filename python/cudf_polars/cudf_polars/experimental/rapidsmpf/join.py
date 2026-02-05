@@ -8,9 +8,17 @@ import asyncio
 from typing import TYPE_CHECKING, Any, Literal
 
 from rapidsmpf.memory.buffer import MemoryType
+from rapidsmpf.memory.memory_reservation import opaque_memory_usage
+from rapidsmpf.streaming.core.memory_reserve_or_wait import (
+    missing_net_memory_delta,
+    reserve_memory,
+)
 from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.cudf.channel_metadata import ChannelMetadata
-from rapidsmpf.streaming.cudf.table_chunk import TableChunk
+from rapidsmpf.streaming.cudf.table_chunk import (
+    TableChunk,
+    make_table_chunks_available_or_wait,
+)
 
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IR, Join
@@ -27,7 +35,6 @@ from cudf_polars.experimental.rapidsmpf.utils import (
     allgather_reduce,
     chunk_to_frame,
     empty_table_chunk,
-    opaque_reservation,
     process_children,
     recv_metadata,
     remap_partitioning,
@@ -270,11 +277,11 @@ async def broadcast_join_node(
                     return
             else:
                 large_chunk_processed = True
-                large_chunk = TableChunk.from_message(msg).make_available_and_spill(
-                    context.br(), allow_overbooking=True
+                large_chunk = await TableChunk.from_message(msg).make_available_or_wait(
+                    context,
+                    net_memory_delta=missing_net_memory_delta,
                 )
                 seq_num = msg.sequence_number
-                del msg
 
             large_df = DataFrame.from_table(
                 large_chunk.table_view(),
@@ -282,6 +289,8 @@ async def broadcast_join_node(
                 list(large_child.schema.values()),
                 large_chunk.stream,
             )
+            large_chunk_size = large_chunk.data_alloc_size(MemoryType.DEVICE)
+            del large_chunk  # `large_df` keeps `large_chunk` alive.
 
             # Lazily create empty small table if small_dfs is empty
             if not small_dfs:
@@ -289,9 +298,10 @@ async def broadcast_join_node(
                 empty_small_chunk = empty_table_chunk(small_child, context, stream)
                 small_dfs = [chunk_to_frame(empty_small_chunk, small_child)]
 
-            large_chunk_size = large_chunk.data_alloc_size(MemoryType.DEVICE)
             input_bytes = large_chunk_size + small_size
-            with opaque_reservation(context, input_bytes):
+            with opaque_memory_usage(
+                await reserve_memory(context, size=input_bytes, net_memory_delta=0)
+            ):
                 df = _concat(
                     *[
                         await asyncio.to_thread(
@@ -308,18 +318,18 @@ async def broadcast_join_node(
                     ],
                     context=ir_context,
                 )
+                del large_df
 
-                # Send output chunk
-                await ch_out.send(
-                    context,
-                    Message(
-                        seq_num,
-                        TableChunk.from_pylibcudf_table(
-                            df.table, df.stream, exclusive_view=True
-                        ),
+            # Send output chunk
+            await ch_out.send(
+                context,
+                Message(
+                    seq_num,
+                    TableChunk.from_pylibcudf_table(
+                        df.table, df.stream, exclusive_view=True
                     ),
-                )
-                del df, large_df, large_chunk
+                ),
+            )
 
         del small_dfs, small_chunks
         await ch_out.drain(context)
@@ -429,7 +439,13 @@ async def _broadcast_join(
             # Safe to concatenate - produces single-element list
             # (_concat is a no-op for single element)
             # Reserve memory for concatenation (input + output ~= 2x input size)
-            with opaque_reservation(context, small_size * 2):
+            small_chunks, extra = await make_table_chunks_available_or_wait(
+                context,
+                small_chunks,
+                reserve_extra=small_size,
+                net_memory_delta=0,
+            )
+            with opaque_memory_usage(extra):
                 small_dfs = [
                     _concat(
                         *[chunk_to_frame(chunk, small_child) for chunk in small_chunks],
@@ -460,7 +476,9 @@ async def _broadcast_join(
         # Join large chunk with each small DataFrame
         join_results: list[DataFrame] = []
         input_bytes = large_chunk_size + small_size
-        with opaque_reservation(context, input_bytes):
+        with opaque_memory_usage(
+            await reserve_memory(context, size=input_bytes, net_memory_delta=0)
+        ):
             for sdf in dfs_to_join:
                 result = await asyncio.to_thread(
                     ir.do_evaluate,
@@ -478,18 +496,18 @@ async def _broadcast_join(
             df = _concat(*join_results, context=ir_context)
             del join_results
 
-            if tracer is not None:
-                tracer.add_chunk(table=df.table)
-            await ch_out.send(
-                context,
-                Message(
-                    seq_num,
-                    TableChunk.from_pylibcudf_table(
-                        df.table, df.stream, exclusive_view=True
-                    ),
+        if tracer is not None:
+            tracer.add_chunk(table=df.table)
+        await ch_out.send(
+            context,
+            Message(
+                seq_num,
+                TableChunk.from_pylibcudf_table(
+                    df.table, df.stream, exclusive_view=True
                 ),
-            )
-            del df
+            ),
+        )
+        del df
 
     # Process initial large chunks first
     for seq_num, chunk in enumerate(large_initial_chunks):
@@ -779,7 +797,9 @@ async def _shuffle_join(
             col.device_buffer_size()
             for col in (*left_df.table.columns(), *right_df.table.columns())
         )
-        with opaque_reservation(context, input_bytes):
+        with opaque_memory_usage(
+            await reserve_memory(context, size=input_bytes, net_memory_delta=0)
+        ):
             df = await asyncio.to_thread(
                 ir.do_evaluate,
                 *ir._non_child_args,
@@ -787,18 +807,19 @@ async def _shuffle_join(
                 right_df,
                 context=ir_context,
             )
-            if tracer is not None:
-                tracer.add_chunk(table=df.table)
-            await ch_out.send(
-                context,
-                Message(
-                    seq_num,
-                    TableChunk.from_pylibcudf_table(
-                        df.table, df.stream, exclusive_view=True
-                    ),
+            del left_df, right_df, left_table, right_table
+        if tracer is not None:
+            tracer.add_chunk(table=df.table)
+        await ch_out.send(
+            context,
+            Message(
+                seq_num,
+                TableChunk.from_pylibcudf_table(
+                    df.table, df.stream, exclusive_view=True
                 ),
-            )
-            del df, left_df, right_df, left_table, right_table
+            ),
+        )
+        del df
 
     await ch_out.drain(context)
 
