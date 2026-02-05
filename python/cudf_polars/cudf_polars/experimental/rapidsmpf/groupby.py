@@ -652,11 +652,15 @@ async def _shuffle_full_groupby(
     nranks = context.comm().nranks
     local_output_count = max(1, output_count // nranks)
 
+    # Get output key indices
+    output_names = list(ir.schema.keys())
+    output_key_indices = tuple(output_names.index(k.name) for k in ir.keys)
+
     # Output metadata with hash partitioning on groupby keys
     metadata_out = ChannelMetadata(
         local_count=local_output_count,
         partitioning=Partitioning(
-            inter_rank=HashScheme(key_indices, output_count),
+            inter_rank=HashScheme(output_key_indices, output_count),
             local="inherit",
         ),
         duplicated=False,
@@ -688,7 +692,6 @@ async def _shuffle_full_groupby(
             stream,
             exclusive_view=True,
         )
-
         # Reserve extra for groupby working memory (input + output)
         with opaque_reservation(context, chunk.data_alloc_size(MemoryType.DEVICE) * 2):
             # Apply full groupby (including zlice if present)
@@ -852,7 +855,9 @@ async def groupby_node(
                 tracer.decision = "shuffle_full"
             ideal_count = max(1, estimated_total_size // target_partition_size)
             # Cap at global chunk count, but use the rank count if it's larger
-            output_count = max(nranks, min(ideal_count, global_chunk_count))
+            output_count = max(1, min(ideal_count, global_chunk_count))
+            if output_count > 1:
+                output_count = max(nranks, output_count)
             await _shuffle_full_groupby(
                 context,
                 ir,
