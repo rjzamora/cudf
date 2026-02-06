@@ -13,7 +13,12 @@ from cudf_polars.experimental.base import PartitionInfo, get_key_name
 from cudf_polars.experimental.dispatch import generate_ir_tasks, lower_ir_node
 from cudf_polars.experimental.repartition import Repartition
 from cudf_polars.experimental.shuffle import Shuffle, _hash_partition_dataframe
-from cudf_polars.experimental.utils import _concat, _fallback_inform, _lower_ir_fallback
+from cudf_polars.experimental.utils import (
+    _concat,
+    _dynamic_planning_on,
+    _fallback_inform,
+    _lower_ir_fallback,
+)
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping
@@ -207,6 +212,9 @@ def _(
         )
 
     config_options = rec.state["config_options"]
+    assert config_options.executor.name == "streaming", (
+        "'in-memory' executor not supported in 'lower_ir_node'"
+    )
 
     # Lower children
     left, right = ir.children
@@ -214,11 +222,8 @@ def _(
     right, pi_right = rec(right)
 
     # For rapidsmpf runtime, always repartition both sides to single partition
-    # to handle dynamic planning correctly
-    if (
-        config_options.executor.name == "streaming"
-        and config_options.executor.runtime == "rapidsmpf"
-    ):  # pragma: no cover; Requires rapidsmpf runtime
+    # (ConditionalJoin can't be distributed, so we always need single partition)
+    if config_options.executor.runtime == "rapidsmpf":  # pragma: no cover
         # Repartition left if needed
         left = Repartition(left.schema, left)
         pi_left[left] = PartitionInfo(count=1)
@@ -279,14 +284,10 @@ def _(
     children, _partition_info = zip(*(rec(c) for c in ir.children), strict=True)
     partition_info = reduce(operator.or_, _partition_info)
 
+    # Check for dynamic planning - may have more partitions at runtime
     config_options = rec.state["config_options"]
-    assert config_options.executor.name == "streaming", (
-        "'in-memory' executor not supported in 'lower_join'"
-    )
-    dynamic_planning = (
-        config_options.executor.runtime == "rapidsmpf"
-        and config_options.executor.dynamic_planning is not None
-    )
+    assert config_options.executor.name == "streaming"
+    dynamic_planning = _dynamic_planning_on(config_options)
 
     left, right = children
     output_count = max(partition_info[left].count, partition_info[right].count)

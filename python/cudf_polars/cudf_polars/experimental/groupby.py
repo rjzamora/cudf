@@ -22,7 +22,11 @@ from cudf_polars.experimental.base import PartitionInfo
 from cudf_polars.experimental.dispatch import lower_ir_node
 from cudf_polars.experimental.repartition import Repartition
 from cudf_polars.experimental.shuffle import Shuffle
-from cudf_polars.experimental.utils import _get_unique_fractions, _lower_ir_fallback
+from cudf_polars.experimental.utils import (
+    _dynamic_planning_on,
+    _get_unique_fractions,
+    _lower_ir_fallback,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Generator, MutableMapping
@@ -189,10 +193,7 @@ def _(
     assert config_options.executor.name == "streaming", (
         "'in-memory' executor not supported in 'lower_ir_node'"
     )
-    dynamic_planning = (
-        config_options.executor.runtime == "rapidsmpf"
-        and config_options.executor.dynamic_planning is not None
-    )
+    dynamic_planning = _dynamic_planning_on(config_options)
 
     # Check for dynamic planning - defer decomposition and shuffle decisions to runtime
     if dynamic_planning:

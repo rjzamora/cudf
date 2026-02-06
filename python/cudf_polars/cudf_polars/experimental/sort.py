@@ -590,7 +590,7 @@ def _(
         )
 
     # Handle single-partition case
-    if partition_info[child].count == 1:
+    elif partition_info[child].count == 1:
         single_part_node = ir.reconstruct([child])
         partition_info[single_part_node] = partition_info[child]
         return single_part_node, partition_info

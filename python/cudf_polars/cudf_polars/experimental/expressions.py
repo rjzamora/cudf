@@ -48,7 +48,11 @@ from cudf_polars.dsl.traversal import (
 )
 from cudf_polars.experimental.base import PartitionInfo
 from cudf_polars.experimental.repartition import Repartition
-from cudf_polars.experimental.utils import _get_unique_fractions, _leaf_column_names
+from cudf_polars.experimental.utils import (
+    _dynamic_planning_on,
+    _get_unique_fractions,
+    _leaf_column_names,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Generator, MutableMapping, Sequence
@@ -453,11 +457,7 @@ def _decompose_expr_node(
     partition_count = partition_info[input_ir].count
 
     # Check for dynamic planning - may have more partitions at runtime
-    dynamic_planning = (
-        config_options.executor.name == "streaming"
-        and config_options.executor.runtime == "rapidsmpf"
-        and config_options.executor.dynamic_planning is not None
-    )
+    dynamic_planning = _dynamic_planning_on(config_options)
 
     if expr.is_pointwise:
         # Pointwise expressions are always supported as-is.

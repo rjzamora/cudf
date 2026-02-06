@@ -37,7 +37,12 @@ from cudf_polars.experimental.dispatch import (
 from cudf_polars.experimental.io import _clear_source_info_cache
 from cudf_polars.experimental.repartition import Repartition
 from cudf_polars.experimental.statistics import collect_statistics
-from cudf_polars.experimental.utils import _concat, _contains_over, _lower_ir_fallback
+from cudf_polars.experimental.utils import (
+    _concat,
+    _contains_over,
+    _dynamic_planning_on,
+    _lower_ir_fallback,
+)
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping
@@ -437,37 +442,31 @@ def _(
 def _(
     ir: Slice, rec: LowerIRTransformer
 ) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    # Check for dynamic planning - may have more partitions at runtime
     config_options = rec.state["config_options"]
-
-    # RapidsMPF runtime: Always collapse to single partition for any offset
-    if (
-        config_options.executor.name == "streaming"
-        and config_options.executor.runtime == "rapidsmpf"
-    ):
-        (child,) = ir.children
-        child, partition_info = rec(child)
-        inter = Repartition(child.schema, child)
-        partition_info[inter] = PartitionInfo(count=1)
-        sliced = ir.reconstruct([inter])
-        partition_info[sliced] = PartitionInfo(count=1)
-        return sliced, partition_info
+    dynamic_planning = _dynamic_planning_on(config_options)
 
     if ir.offset == 0:
         # Taking the first N rows.
         # We don't know how large each partition is, so we reduce.
-        result, partition_info = _lower_ir_pwise(ir, rec)
-        if partition_info[result].count > 1:
+        new_node, partition_info = _lower_ir_pwise(ir, rec)
+        if partition_info[new_node].count > 1 or dynamic_planning:
             # Collapse down to single partition
-            inter = Repartition(result.schema, result)
+            inter = Repartition(new_node.schema, new_node)
             partition_info[inter] = PartitionInfo(count=1)
             # Slice reduced partition
-            result = ir.reconstruct([inter])
-            partition_info[result] = PartitionInfo(count=1)
-        return result, partition_info
+            new_node = ir.reconstruct([inter])
+            partition_info[new_node] = PartitionInfo(count=1)
+        return new_node, partition_info
 
     # Fallback
+    msg = "This slice not supported for multiple partitions."
     return _lower_ir_fallback(
-        ir, rec, msg="This slice not supported for multiple partitions."
+        ir,
+        rec,
+        # TODO: May want to warn for any offset that is not 0,
+        # No matter the expected partition count.
+        msg=None if dynamic_planning else msg,
     )
 
 
