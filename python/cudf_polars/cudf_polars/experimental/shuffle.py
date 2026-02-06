@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 """Shuffle Logic."""
 
@@ -311,8 +311,19 @@ def _(
 
     (child,) = ir.children
 
+    config_options = rec.state["config_options"]
+    assert config_options.executor.name == "streaming", (
+        "'in-memory' executor not supported in 'lower_join'"
+    )
+    dynamic_planning = (
+        config_options.executor.runtime == "rapidsmpf"
+        and config_options.executor.dynamic_planning is not None
+    )
+
     new_child, pi = rec(child)
-    if pi[new_child].count == 1 or ir.keys == pi[new_child].partitioned_on:
+    if (pi[new_child].count == 1 and not dynamic_planning) or ir.keys == pi[
+        new_child
+    ].partitioned_on:
         # Already shuffled
         return new_child, pi
     new_node = ir.reconstruct([new_child])

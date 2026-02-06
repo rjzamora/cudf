@@ -446,18 +446,9 @@ def _(
     ):
         (child,) = ir.children
         child, partition_info = rec(child)
-        child_count = partition_info[child].count
-
-        if child_count > 1:
-            # Collapse to single partition before slicing
-            inter = Repartition(child.schema, child)
-            partition_info[inter] = PartitionInfo(count=1)
-            sliced = ir.reconstruct([inter])
-            partition_info[sliced] = PartitionInfo(count=1)
-            return sliced, partition_info
-
-        # Single partition - just reconstruct
-        sliced = ir.reconstruct([child])
+        inter = Repartition(child.schema, child)
+        partition_info[inter] = PartitionInfo(count=1)
+        sliced = ir.reconstruct([inter])
         partition_info[sliced] = PartitionInfo(count=1)
         return sliced, partition_info
 

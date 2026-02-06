@@ -185,22 +185,17 @@ def _(
     original_child = ir.children[0]
     child, partition_info = rec(ir.children[0])
 
-    # Handle single-partition case
-    if partition_info[child].count == 1:
-        single_part_node = ir.reconstruct([child])
-        partition_info[single_part_node] = partition_info[child]
-        return single_part_node, partition_info
-
     config_options = rec.state["config_options"]
     assert config_options.executor.name == "streaming", (
         "'in-memory' executor not supported in 'lower_ir_node'"
     )
-
-    # Check for dynamic planning - defer decomposition and shuffle decisions to runtime
-    if (
+    dynamic_planning = (
         config_options.executor.runtime == "rapidsmpf"
         and config_options.executor.dynamic_planning is not None
-    ):
+    )
+
+    # Check for dynamic planning - defer decomposition and shuffle decisions to runtime
+    if dynamic_planning:
         # Dynamic planning: Just reconstruct the GroupBy.
         # The runtime GroupBy node will handle decomposition and shuffle decisions.
         child_count = partition_info[child].count
@@ -210,6 +205,12 @@ def _(
             partitioned_on=ir.keys,
         )
         return dynamic_node, partition_info
+
+    # Handle single-partition case
+    elif partition_info[child].count == 1:
+        single_part_node = ir.reconstruct([child])
+        partition_info[single_part_node] = partition_info[child]
+        return single_part_node, partition_info
 
     # Check group-by keys
     if not all(
