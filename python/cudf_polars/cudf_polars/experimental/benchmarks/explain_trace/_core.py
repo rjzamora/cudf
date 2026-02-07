@@ -98,19 +98,42 @@ class QueryPlan:
 
             if scope == "plan":
                 # Query Plan / IR Structure event
-                nodes_list = event.get("nodes", [])
-                for node in nodes_list:
-                    ir_id = node["ir_id"]
-                    plan.nodes[ir_id] = node
-                    plan.stats[ir_id].ir_type = node.get("ir_type", "")
-                # First node is the root
-                if nodes_list:
-                    plan.root_id = nodes_list[0]["ir_id"]
+                # Handle both old format (nodes list) and new format (SerializablePlan)
+                if "plan" in event:
+                    # New SerializablePlan format
+                    ser_plan = event["plan"]
+                    nodes_dict = ser_plan.get("nodes", {})
+                    for ir_id, node in nodes_dict.items():
+                        # Convert new format to internal format
+                        plan.nodes[ir_id] = {
+                            "ir_id": ir_id,
+                            "ir_type": node.get("type", ""),
+                            "children_ir_ids": node.get("children", []),
+                            "schema": node.get("schema", {}),
+                            "properties": node.get("properties", {}),
+                        }
+                        plan.stats[ir_id].ir_type = node.get("type", "")
+                    # Root is in the roots list
+                    roots = ser_plan.get("roots", [])
+                    if roots:
+                        plan.root_id = roots[0]
+                else:
+                    # Old format (list of nodes)
+                    nodes_list = event.get("nodes", [])
+                    for node in nodes_list:
+                        ir_id = node["ir_id"]
+                        plan.nodes[ir_id] = node
+                        plan.stats[ir_id].ir_type = node.get("ir_type", "")
+                    # First node is the root
+                    if nodes_list:
+                        plan.root_id = nodes_list[0]["ir_id"]
 
             elif scope == "actor" or event_type == "Streaming Actor":
                 # Streaming Actor event (one per worker per IR node)
                 ir_id = event.get("actor_ir_id")
                 if ir_id is not None:
+                    # Convert to string for consistency with new format
+                    ir_id = str(ir_id) if isinstance(ir_id, int) else ir_id
                     plan.stats[ir_id].add_streaming_actor(event)
 
             elif scope == "evaluate_ir_node" or event_type == "Execute IR":
@@ -118,6 +141,8 @@ class QueryPlan:
                 # These events have actor_ir_id bound via contextvars
                 ir_id = event.get("actor_ir_id") or event.get("ir_id")
                 if ir_id is not None:
+                    # Convert to string for consistency with new format
+                    ir_id = str(ir_id) if isinstance(ir_id, int) else ir_id
                     plan.stats[ir_id].add_execute_ir(event)
 
         return plan
@@ -265,8 +290,16 @@ def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
 
 
 def _has_query_plan(traces: list[dict[str, Any]]) -> bool:
-    """Check if traces contain a Query Plan event."""
-    return any(t.get("scope") == "plan" for t in traces)
+    """Check if traces contain a Query Plan event with node structure."""
+    for t in traces:
+        if t.get("scope") == "plan":
+            # Check for new format (SerializablePlan with plan dict)
+            if "plan" in t and t["plan"].get("nodes"):
+                return True
+            # Check for old format (nodes list)
+            if t.get("nodes"):
+                return True
+    return False
 
 
 def get_traces_for_query(
