@@ -162,6 +162,7 @@ def test_join_conditional(reverse, max_rows_per_partition):
             "cluster": DEFAULT_CLUSTER,
             "runtime": DEFAULT_RUNTIME,
             "fallback_mode": "warn",
+            "dynamic_planning": None,
         },
     )
     left = pl.LazyFrame({"x": range(15), "y": [1, 2, 3] * 5})
