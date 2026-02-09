@@ -232,6 +232,21 @@ class QueryPlan:
         if stats.duplicated:
             annotations.append("duplicated")
 
+        # Add properties from the plan node (keys, is_pointwise, etc.)
+        properties = node.get("properties", {})
+
+        # Show keys for GROUPBY
+        if ir_type == "GroupBy" and "keys" in properties:
+            keys = properties["keys"]
+            if keys:
+                annotations.append(f"keys={tuple(keys)}")
+
+        # Show keys for JOIN
+        if ir_type == "Join" and "left_on" in properties:
+            left_on = properties.get("left_on", [])
+            if left_on:
+                annotations.append(f"on={tuple(left_on)}")
+
         # Format the line
         annotation_str = f" [{', '.join(annotations)}]" if annotations else ""
         lines.append(f"{indent}{ir_type.upper()}{annotation_str}")

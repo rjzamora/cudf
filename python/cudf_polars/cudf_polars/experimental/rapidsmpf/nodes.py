@@ -19,7 +19,8 @@ from rapidsmpf.streaming.cudf.table_chunk import (
 )
 
 from cudf_polars.containers import DataFrame
-from cudf_polars.dsl.ir import IR, Cache, Empty, Filter, Projection
+from cudf_polars.dsl.expr import Col
+from cudf_polars.dsl.ir import IR, Cache, Empty, Filter, Projection, Select
 from cudf_polars.experimental.rapidsmpf.dispatch import (
     generate_ir_sub_network,
 )
@@ -504,6 +505,7 @@ def _(
 
     if len(ir.children) == 1:
         # Single-channel default node
+        # Determine if we should preserve partitioning metadata
         preserve_partitioning = isinstance(
             # TODO: We don't need to worry about
             # non-pointwise Filter operations here,
@@ -511,6 +513,8 @@ def _(
             # collapsed to one partition anyway.
             ir,
             (Cache, Projection, Filter),
+        ) or (
+            isinstance(ir, Select) and all(isinstance(e.value, Col) for e in ir.exprs)
         )
         nodes[ir] = [
             default_node_single(
