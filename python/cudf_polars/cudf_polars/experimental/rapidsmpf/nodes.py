@@ -19,7 +19,6 @@ from rapidsmpf.streaming.cudf.table_chunk import (
 )
 
 from cudf_polars.containers import DataFrame
-from cudf_polars.dsl.expr import Col
 from cudf_polars.dsl.ir import IR, Cache, Empty, Filter, Projection, Select
 from cudf_polars.experimental.rapidsmpf.dispatch import (
     generate_ir_sub_network,
@@ -32,6 +31,7 @@ from cudf_polars.experimental.rapidsmpf.utils import (
     process_children,
     recv_metadata,
     remap_partitioning,
+    select_preserves_partitioning,
     send_metadata,
     shutdown_on_error,
 )
@@ -84,6 +84,11 @@ async def default_node_single(
             # Remap partitioning if schema has changed
             partitioning = remap_partitioning(
                 metadata_in.partitioning, ir.children[0].schema, ir.schema
+            )
+        elif isinstance(ir, Select):
+            # For Select, check if partition key columns are preserved as Col refs
+            partitioning = select_preserves_partitioning(
+                ir, metadata_in.partitioning, ir.children[0].schema, ir.schema
             )
         metadata_out = ChannelMetadata(
             local_count=metadata_in.local_count,
@@ -506,6 +511,8 @@ def _(
     if len(ir.children) == 1:
         # Single-channel default node
         # Determine if we should preserve partitioning metadata
+        # Note: Select is handled specially at runtime in default_node_single
+        # to check if partition key columns specifically are preserved.
         preserve_partitioning = isinstance(
             # TODO: We don't need to worry about
             # non-pointwise Filter operations here,
@@ -513,8 +520,6 @@ def _(
             # collapsed to one partition anyway.
             ir,
             (Cache, Projection, Filter),
-        ) or (
-            isinstance(ir, Select) and all(isinstance(e.value, Col) for e in ir.exprs)
         )
         nodes[ir] = [
             default_node_single(
