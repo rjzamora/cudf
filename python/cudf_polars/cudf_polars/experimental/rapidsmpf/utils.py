@@ -216,6 +216,42 @@ async def recv_metadata(ch: Channel[TableChunk], ctx: Context) -> ChannelMetadat
     return ChannelMetadata.from_message(msg)
 
 
+def evaluate_chunk(
+    chunk: TableChunk,
+    ir: IR,
+    ir_context: Any,
+    input_schema: Mapping[str, DataType] | None = None,
+) -> TableChunk:
+    """
+    Apply an IR node's do_evaluate to a table chunk.
+
+    Parameters
+    ----------
+    chunk
+        The input table chunk.
+    ir
+        The IR node to evaluate.
+    ir_context
+        The IR execution context.
+    input_schema
+        Optional schema override. If None, uses ir.children[0].schema.
+
+    Returns
+    -------
+    The resulting table chunk after evaluation.
+    """
+    if input_schema is None:
+        input_schema = ir.children[0].schema
+    names = list(input_schema.keys())
+    dtypes = list(input_schema.values())
+    df = ir.do_evaluate(
+        *ir._non_child_args,
+        DataFrame.from_table(chunk.table_view(), names, dtypes, chunk.stream),
+        context=ir_context,
+    )
+    return TableChunk.from_pylibcudf_table(df.table, chunk.stream, exclusive_view=True)
+
+
 def is_partitioned_on_keys(
     metadata: ChannelMetadata,
     key_indices: tuple[int, ...],

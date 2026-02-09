@@ -33,6 +33,7 @@ from cudf_polars.experimental.rapidsmpf.utils import (
     ChannelManager,
     allgather_reduce,
     empty_table_chunk,
+    evaluate_chunk,
     is_partitioned_on_keys,
     process_children,
     recv_metadata,
@@ -47,38 +48,6 @@ if TYPE_CHECKING:
 
     from cudf_polars.experimental.rapidsmpf.dispatch import SubNetGenerator
     from cudf_polars.experimental.rapidsmpf.tracing import ActorTracer
-
-
-def _apply_distinct(
-    chunk: TableChunk,
-    ir: Distinct,
-    ir_context: Any,
-) -> TableChunk:
-    """
-    Apply Distinct evaluation to a chunk.
-
-    Parameters
-    ----------
-    chunk
-        The input table chunk.
-    ir
-        The Distinct IR node.
-    ir_context
-        The IR execution context.
-
-    Returns
-    -------
-    The chunk with duplicates removed.
-    """
-    input_schema = ir.children[0].schema
-    names = list(input_schema.keys())
-    dtypes = list(input_schema.values())
-    df = ir.do_evaluate(
-        *ir._non_child_args,
-        DataFrame.from_table(chunk.table_view(), names, dtypes, chunk.stream),
-        context=ir_context,
-    )
-    return TableChunk.from_pylibcudf_table(df.table, chunk.stream, exclusive_view=True)
 
 
 # ============================================================================
@@ -155,7 +124,7 @@ async def _tree_distinct(
         )
         with opaque_memory_usage(extra):
             distinct_chunk = await asyncio.to_thread(
-                _apply_distinct, chunk, ir, ir_context
+                evaluate_chunk, chunk, ir, ir_context
             )
             distinct_chunks.append(distinct_chunk)
             del chunk
@@ -466,7 +435,7 @@ async def _chunkwise_distinct(
         )
         with opaque_memory_usage(extra):
             distinct_chunk = await asyncio.to_thread(
-                _apply_distinct, chunk, ir, ir_context
+                evaluate_chunk, chunk, ir, ir_context
             )
             del chunk
 
@@ -578,7 +547,7 @@ async def distinct_node(
             )
             with opaque_memory_usage(extra):
                 distinct_chunk = await asyncio.to_thread(
-                    _apply_distinct, chunk, ir, ir_context
+                    evaluate_chunk, chunk, ir, ir_context
                 )
                 total_distinct_size += distinct_chunk.data_alloc_size(MemoryType.DEVICE)
                 initial_chunks.append(distinct_chunk)

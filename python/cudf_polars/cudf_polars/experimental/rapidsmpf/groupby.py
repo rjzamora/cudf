@@ -35,6 +35,7 @@ from cudf_polars.experimental.rapidsmpf.dispatch import (
 from cudf_polars.experimental.rapidsmpf.utils import (
     ChannelManager,
     allgather_reduce,
+    evaluate_chunk,
     is_partitioned_on_keys,
     process_children,
     recv_metadata,
@@ -50,31 +51,6 @@ if TYPE_CHECKING:
     from cudf_polars.dsl.ir import IRExecutionContext
     from cudf_polars.experimental.rapidsmpf.dispatch import SubNetGenerator
     from cudf_polars.experimental.rapidsmpf.tracing import ActorTracer
-
-# ============================================================================
-# Helper Functions
-# ============================================================================
-
-
-def _apply_do_evaluate(
-    chunk: TableChunk,
-    ir: GroupBy | Select,
-    ir_context: IRExecutionContext,
-    *,
-    input_schema: dict[str, Any] | None = None,
-) -> TableChunk:
-    """Apply GroupBy or Select evaluation to a chunk."""
-    if input_schema is None:
-        input_schema = ir.children[0].schema
-    names = list(input_schema.keys())
-    dtypes = list(input_schema.values())
-    df = ir.do_evaluate(
-        *ir._non_child_args,
-        DataFrame.from_table(chunk.table_view(), names, dtypes, chunk.stream),
-        context=ir_context,
-    )
-    return TableChunk.from_pylibcudf_table(df.table, chunk.stream, exclusive_view=True)
-
 
 # ============================================================================
 # Decomposed GroupBy State
@@ -185,7 +161,7 @@ async def _chunkwise_groupby(
             net_memory_delta=0,
         )
         with opaque_memory_usage(extra):
-            result = await asyncio.to_thread(_apply_do_evaluate, chunk, ir, ir_context)
+            result = await asyncio.to_thread(evaluate_chunk, chunk, ir, ir_context)
             del chunk
         if tracer is not None:
             tracer.add_chunk(table=result.table_view())
@@ -372,7 +348,7 @@ async def _tree_groupby(
         )
         with opaque_memory_usage(extra):
             pwise_chunk = await asyncio.to_thread(
-                _apply_do_evaluate, chunk, decomposed.piecewise_ir, ir_context
+                evaluate_chunk, chunk, decomposed.piecewise_ir, ir_context
             )
             pwise_chunks.append(pwise_chunk)
             del chunk
@@ -534,7 +510,7 @@ async def _tree_groupby(
         )
         with opaque_memory_usage(extra):
             chunk = await asyncio.to_thread(
-                _apply_do_evaluate,
+                evaluate_chunk,
                 chunk,
                 decomposed.select_ir,
                 ir_context,
@@ -608,7 +584,7 @@ async def _shuffle_groupby(
         )
         with opaque_memory_usage(extra):
             pwise_chunk = await asyncio.to_thread(
-                _apply_do_evaluate, chunk, decomposed.piecewise_ir, ir_context
+                evaluate_chunk, chunk, decomposed.piecewise_ir, ir_context
             )
             shuffle.insert_chunk(pwise_chunk)
             del pwise_chunk, chunk
@@ -634,14 +610,14 @@ async def _shuffle_groupby(
         with opaque_memory_usage(extra):
             # Apply reduction
             chunk = await asyncio.to_thread(
-                _apply_do_evaluate,
+                evaluate_chunk,
                 chunk,
                 decomposed.reduction_ir,
                 ir_context,
             )
             # Apply selection
             chunk = await asyncio.to_thread(
-                _apply_do_evaluate,
+                evaluate_chunk,
                 chunk,
                 decomposed.select_ir,
                 ir_context,
@@ -727,7 +703,7 @@ async def _shuffle_full_groupby(
         with opaque_memory_usage(extra):
             # Apply full groupby (including zlice if present)
             chunk = await asyncio.to_thread(
-                _apply_do_evaluate,
+                evaluate_chunk,
                 chunk,
                 ir,
                 ir_context,
@@ -936,7 +912,7 @@ async def groupby_node(
             )
             with opaque_memory_usage(extra):
                 pwise_chunk = await asyncio.to_thread(
-                    _apply_do_evaluate, chunk, decomposed.piecewise_ir, ir_context
+                    evaluate_chunk, chunk, decomposed.piecewise_ir, ir_context
                 )
                 total_pwise_size += pwise_chunk.data_alloc_size(MemoryType.DEVICE)
                 initial_chunks.append(pwise_chunk)
