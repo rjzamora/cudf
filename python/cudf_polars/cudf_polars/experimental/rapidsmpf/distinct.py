@@ -32,6 +32,7 @@ from cudf_polars.experimental.rapidsmpf.dispatch import generate_ir_sub_network
 from cudf_polars.experimental.rapidsmpf.utils import (
     ChannelManager,
     allgather_reduce,
+    chunkwise_evaluate,
     empty_table_chunk,
     evaluate_chunk,
     is_partitioned_on_keys,
@@ -374,79 +375,6 @@ async def _shuffle_distinct(
     await ch_out.drain(context)
 
 
-async def _chunkwise_distinct(
-    context: Context,
-    ir: Distinct,
-    ir_context: Any,
-    ch_out: Channel[TableChunk],
-    ch_in: Channel[TableChunk],
-    metadata_in: ChannelMetadata,
-    initial_chunks: list[TableChunk],
-    *,
-    tracer: ActorTracer | None = None,
-) -> None:
-    """
-    Chunkwise distinct - apply distinct to each chunk independently.
-
-    Use when data is fully partitioned on the distinct keys (both inter-rank
-    and locally), meaning each chunk has a disjoint set of key values.
-
-    Parameters
-    ----------
-    context
-        The rapidsmpf streaming context.
-    ir
-        The Distinct IR node.
-    ir_context
-        The IR execution context.
-    ch_out
-        The output channel.
-    ch_in
-        The input channel.
-    metadata_in
-        The input channel metadata.
-    initial_chunks
-        Chunks already received during sampling.
-    tracer
-        Optional tracer for runtime metrics.
-    """
-    # Output: preserve input metadata (partitioning unchanged)
-    await send_metadata(ch_out, context, metadata_in)
-
-    seq_num = 0
-
-    # Process initial chunks (already distinct from sampling)
-    for chunk in initial_chunks:
-        if tracer is not None:
-            tracer.add_chunk(table=chunk.table_view())
-        await ch_out.send(context, Message(seq_num, chunk))
-        seq_num += 1
-
-    # Process remaining chunks
-    while (msg := await ch_in.recv(context)) is not None:
-        chunk = TableChunk.from_message(msg)
-        del msg
-
-        chunk, extra = await make_table_chunks_available_or_wait(
-            context,
-            chunk,
-            reserve_extra=chunk.data_alloc_size(),
-            net_memory_delta=0,
-        )
-        with opaque_memory_usage(extra):
-            distinct_chunk = await asyncio.to_thread(
-                evaluate_chunk, chunk, ir, ir_context
-            )
-            del chunk
-
-        if tracer is not None:
-            tracer.add_chunk(table=distinct_chunk.table_view())
-        await ch_out.send(context, Message(seq_num, distinct_chunk))
-        seq_num += 1
-
-    await ch_out.drain(context)
-
-
 # ============================================================================
 # Dynamic Distinct Node
 # ============================================================================
@@ -583,7 +511,7 @@ async def distinct_node(
             # Just apply distinct to each chunk independently
             if tracer is not None:
                 tracer.decision = "chunkwise"
-            await _chunkwise_distinct(
+            await chunkwise_evaluate(
                 context,
                 ir,
                 ir_context,

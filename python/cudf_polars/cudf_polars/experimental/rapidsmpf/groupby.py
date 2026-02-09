@@ -35,6 +35,7 @@ from cudf_polars.experimental.rapidsmpf.dispatch import (
 from cudf_polars.experimental.rapidsmpf.utils import (
     ChannelManager,
     allgather_reduce,
+    chunkwise_evaluate,
     evaluate_chunk,
     is_partitioned_on_keys,
     process_children,
@@ -134,42 +135,6 @@ class DecomposedGroupBy:
 # ============================================================================
 # GroupBy Strategies
 # ============================================================================
-
-
-async def _chunkwise_groupby(
-    context: Context,
-    ir: GroupBy,
-    ir_context: IRExecutionContext,
-    ch_out: Channel[TableChunk],
-    ch_in: Channel[TableChunk],
-    metadata_in: ChannelMetadata,
-    tracer: ActorTracer | None = None,
-) -> None:
-    """Execute chunk-wise groupby (data is already partitioned on keys)."""
-    # Send output metadata preserving partitioning
-    await send_metadata(ch_out, context, metadata_in)
-
-    # Process remaining chunks
-    seq_num = 0
-    while (msg := await ch_in.recv(context)) is not None:
-        chunk = TableChunk.from_message(msg)
-        del msg
-        chunk, extra = await make_table_chunks_available_or_wait(
-            context,
-            chunk,
-            reserve_extra=chunk.data_alloc_size(),
-            net_memory_delta=0,
-        )
-        with opaque_memory_usage(extra):
-            result = await asyncio.to_thread(evaluate_chunk, chunk, ir, ir_context)
-            del chunk
-        if tracer is not None:
-            tracer.add_chunk(table=result.table_view())
-        await ch_out.send(context, Message(seq_num, result))
-        del result
-        seq_num += 1
-
-    await ch_out.drain(context)
 
 
 async def _concat_groupby(
@@ -762,14 +727,14 @@ async def groupby_node(
 
         # If already partitioned globally and locally, just do a chunk-wise groupby
         if already_partitioned_inter_rank and already_partitioned_local:
-            await _chunkwise_groupby(
+            await chunkwise_evaluate(
                 context,
                 ir,
                 ir_context,
                 ch_out,
                 ch_in,
                 metadata_in,
-                tracer,
+                tracer=tracer,
             )
             return
 
