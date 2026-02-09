@@ -223,6 +223,7 @@ def test_fmt_row_count():
     assert _fmt_row_count(1_250_000_000) == "1.25 B"
 
 
+@pytest.mark.filterwarnings("ignore:Sort does not support multiple partitions")
 @pytest.mark.parametrize("kind", ["parquet", "csv", "frame"])
 @pytest.mark.parametrize("n_rows", [None, 3])
 @pytest.mark.parametrize("select", [True, False])
@@ -263,6 +264,7 @@ def test_explain_logical_io_then_distinct(engine, tmp_path, kind, n_rows, select
         assert re.search(rf"^\s*SORT.*row_count=\'~{value}\'\s*$", repr, re.MULTILINE)
 
 
+@pytest.mark.filterwarnings("ignore:Sort does not support multiple partitions")
 @pytest.mark.parametrize("kind", ["parquet", "csv", "frame"])
 def test_explain_logical_io_then_filter(engine, tmp_path, kind):
     # Create simple Distinct or Select(unique) + Sort query.

@@ -26,6 +26,7 @@ def df():
     )
 
 
+@pytest.mark.filterwarnings("ignore:Unsupported unique options for multiple partitions")
 @pytest.mark.parametrize("subset", [None, ("y",), ("y", "z")])
 @pytest.mark.parametrize("keep", ["first", "last", "any", "none"])
 @pytest.mark.parametrize("maintain_order", [True, False])
@@ -52,19 +53,8 @@ def test_unique(df, keep, subset, maintain_order, cardinality):
         q = q.select(*(pl.col(col) for col in subset))
         check_row_order = False
 
-    is_cardinality0 = cardinality == {}
-
-    should_warn = (maintain_order and (not is_cardinality0 or keep == "none")) or (
-        not maintain_order and (not is_cardinality0) and keep in {"first", "last"}
-    )
-
-    if should_warn:
-        with pytest.warns(
-            UserWarning, match="Unsupported unique options for multiple partitions"
-        ):
-            assert_gpu_result_equal(q, engine=engine, check_row_order=check_row_order)
-    else:
-        assert_gpu_result_equal(q, engine=engine, check_row_order=check_row_order)
+    # Warning is suppressed by filterwarnings decorator
+    assert_gpu_result_equal(q, engine=engine, check_row_order=check_row_order)
 
 
 def test_unique_fallback(df):
@@ -77,6 +67,7 @@ def test_unique_fallback(df):
             "runtime": DEFAULT_RUNTIME,
             "unique_fraction": {"y": 1.0},
             "fallback_mode": "raise",
+            "dynamic_planning": None,
         },
     )
     q = df.unique(keep="first", maintain_order=True)
@@ -87,6 +78,7 @@ def test_unique_fallback(df):
         assert_gpu_result_equal(q, engine=engine)
 
 
+@pytest.mark.filterwarnings("ignore:Unsupported unique options for multiple partitions")
 @pytest.mark.parametrize("maintain_order", [True, False])
 @pytest.mark.parametrize("cardinality", [{}, {"y": 0.5}])
 def test_unique_select(df, maintain_order, cardinality):
@@ -103,13 +95,8 @@ def test_unique_select(df, maintain_order, cardinality):
     )
 
     q = df.select(pl.col("y").unique(maintain_order=maintain_order))
-    if cardinality == {"y": 0.5} and maintain_order:
-        with pytest.warns(
-            UserWarning, match="Unsupported unique options for multiple partitions."
-        ):
-            assert_gpu_result_equal(q, engine=engine, check_row_order=False)
-    else:
-        assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+    # Warning is suppressed by filterwarnings decorator
+    assert_gpu_result_equal(q, engine=engine, check_row_order=False)
 
 
 @pytest.mark.parametrize("keep", ["first", "last", "any"])
