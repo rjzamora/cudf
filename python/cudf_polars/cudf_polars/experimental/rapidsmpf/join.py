@@ -682,6 +682,7 @@ async def _shuffle_join(
 
     # Drain shuffled sides completely (they need all data before extraction)
     async def drain_shuffled_left() -> None:
+        nonlocal left_shuffle
         if shuffle_left:
             assert left_shuffle is not None
             while (msg := await ch_left.recv(context)) is not None:
@@ -694,6 +695,7 @@ async def _shuffle_join(
             await left_shuffle.insert_finished()
 
     async def drain_shuffled_right() -> None:
+        nonlocal right_shuffle
         if shuffle_right:
             assert right_shuffle is not None
             while (msg := await ch_right.recv(context)) is not None:
@@ -709,7 +711,7 @@ async def _shuffle_join(
 
     # Helper to get next chunk from non-shuffled side (from pending or channel)
     async def get_left_chunk() -> TableChunk | None:
-        nonlocal left_channel_done
+        nonlocal left_channel_done, left_pending
         if left_pending:
             return left_pending.pop(0)
         if not left_channel_done:
@@ -725,7 +727,7 @@ async def _shuffle_join(
         return None
 
     async def get_right_chunk() -> TableChunk | None:
-        nonlocal right_channel_done
+        nonlocal right_channel_done, right_pending
         if right_pending:
             return right_pending.pop(0)
         if not right_channel_done:
@@ -804,6 +806,8 @@ async def _shuffle_join(
         )
         del df
 
+    # Explicit cleanup to free memory
+    del left_pending, right_pending, left_shuffle, right_shuffle
     await ch_out.drain(context)
 
 
