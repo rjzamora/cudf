@@ -35,6 +35,7 @@ from cudf_polars.experimental.rapidsmpf.dispatch import (
 from cudf_polars.experimental.rapidsmpf.utils import (
     ChannelManager,
     allgather_reduce,
+    is_partitioned_on_keys,
     process_children,
     recv_metadata,
     send_metadata,
@@ -53,44 +54,6 @@ if TYPE_CHECKING:
 # ============================================================================
 # Helper Functions
 # ============================================================================
-
-
-def _is_partitioned_on_keys(
-    metadata: ChannelMetadata,
-    key_indices: tuple[int, ...],
-) -> tuple[bool, bool]:
-    """
-    Check if data is already partitioned on the groupby keys.
-
-    Parameters
-    ----------
-    metadata
-        The metadata of the channel.
-    key_indices
-        The indices of the groupby keys.
-
-    Returns
-    -------
-    already_partitioned_inter_rank
-        Whether the data is already partitioned between ranks.
-    already_partitioned_local
-        Whether the data is already partitioned within a rank.
-    """
-    if metadata.partitioning is None:
-        return False, False
-
-    inter_rank = metadata.partitioning.inter_rank
-    local = metadata.partitioning.local
-    if (
-        inter_rank is None
-        or inter_rank == "inherit"
-        or inter_rank.column_indices != key_indices
-    ):
-        return False, False
-    elif local == "inherit" or local.column_indices != key_indices:
-        return True, True
-    else:
-        return True, False
 
 
 def _apply_do_evaluate(
@@ -816,8 +779,9 @@ async def groupby_node(
         )
 
         # Check if already partitioned on keys
+        nranks = context.comm().nranks
         already_partitioned_inter_rank, already_partitioned_local = (
-            _is_partitioned_on_keys(metadata_in, key_indices)
+            is_partitioned_on_keys(metadata_in, key_indices, nranks)
         )
 
         # If already partitioned globally and locally, just do a chunk-wise groupby
