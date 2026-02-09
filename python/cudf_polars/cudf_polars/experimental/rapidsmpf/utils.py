@@ -216,6 +216,54 @@ async def recv_metadata(ch: Channel[TableChunk], ctx: Context) -> ChannelMetadat
     return ChannelMetadata.from_message(msg)
 
 
+def is_partitioned_on_keys(
+    metadata: ChannelMetadata,
+    key_indices: tuple[int, ...],
+    nranks: int,
+) -> tuple[bool, bool]:
+    """
+    Check if data is already partitioned on the given keys.
+
+    Parameters
+    ----------
+    metadata
+        The channel metadata.
+    key_indices
+        The column indices of the keys.
+    nranks
+        The number of ranks.
+
+    Returns
+    -------
+    already_partitioned_inter_rank
+        Whether the data is already partitioned between ranks.
+    already_partitioned_local
+        Whether the data is already partitioned within a rank.
+    """
+    if metadata.partitioning is None:
+        return nranks == 1, False
+
+    inter_rank = metadata.partitioning.inter_rank
+    local = metadata.partitioning.local
+    if nranks > 1 and (
+        inter_rank is None
+        or inter_rank == "inherit"
+        or inter_rank.column_indices != key_indices
+    ):
+        return False, False
+
+    # Inter-rank is partitioned on keys. Check local.
+    if local == "inherit":
+        # Local inherits from inter_rank, which is partitioned on keys
+        return True, True
+    elif local is not None and local.column_indices == key_indices:
+        # Local is explicitly partitioned on the same keys
+        return True, True
+    else:
+        # Inter-rank matches but local doesn't
+        return True, False
+
+
 class ChannelManager:
     """A utility class for managing Channel objects."""
 
