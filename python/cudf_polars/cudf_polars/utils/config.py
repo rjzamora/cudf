@@ -471,14 +471,14 @@ class DynamicPlanningOptions:
         The maximum number of chunks to sample before deciding whether
         to shuffle. A higher value provides more accurate estimates but
         increases latency before the shuffle decision is made.
-        Default is 2.
+        Default is 1.
     """
 
     _env_prefix = "CUDF_POLARS__EXECUTOR__DYNAMIC_PLANNING"
 
     sample_chunk_count: int = dataclasses.field(
         default_factory=_make_default_factory(
-            f"{_env_prefix}__SAMPLE_CHUNK_COUNT", int, default=2
+            f"{_env_prefix}__SAMPLE_CHUNK_COUNT", int, default=1
         )
     )
 
