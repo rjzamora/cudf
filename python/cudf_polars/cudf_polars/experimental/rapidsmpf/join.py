@@ -646,24 +646,10 @@ async def _shuffle_join(
             context, output_count, right_key_indices, right_collective_id
         )
 
-    # For sides that don't need shuffling, collect chunks by partition
-    # (they're already partitioned, we just need to gather them locally)
-    left_by_partition: dict[int, list[TableChunk]] = {}
-    right_by_partition: dict[int, list[TableChunk]] = {}
-
-    def _get_partition_id(chunk: TableChunk, key_indices: tuple[int, ...]) -> int:
-        """Compute partition ID for a chunk based on its first row's hash."""
-        import pylibcudf as plc
-
-        if chunk.table_view().num_rows() == 0:
-            return 0
-        # Hash the key columns and get the partition
-        key_cols = [chunk.table_view().column(i) for i in key_indices]
-        hashes = plc.hashing.murmurhash3_x86_32(plc.Table(key_cols))
-        # Get first row's hash value modulo output_count
-        first_hash_scalar = plc.copying.get_element(hashes, 0)
-        first_hash: int = plc.interop.to_arrow(first_hash_scalar).as_py()
-        return (first_hash % modulus) // nranks
+    # For sides that don't need shuffling, collect chunks in order
+    # (they're already partitioned and arrive in partition order)
+    left_chunks: list[TableChunk] = []
+    right_chunks: list[TableChunk] = []
 
     # Insert initial chunks
     if shuffle_left:
@@ -673,12 +659,10 @@ async def _shuffle_join(
                 chunk.make_available_and_spill(context.br(), allow_overbooking=True)
             )
     else:
-        for chunk in left_initial_chunks:
-            spilled_chunk = chunk.make_available_and_spill(
-                context.br(), allow_overbooking=True
-            )
-            pid = _get_partition_id(spilled_chunk, left_key_indices)
-            left_by_partition.setdefault(pid, []).append(spilled_chunk)
+        left_chunks.extend(
+            chunk.make_available_and_spill(context.br(), allow_overbooking=True)
+            for chunk in left_initial_chunks
+        )
 
     if shuffle_right:
         assert right_shuffle is not None
@@ -687,12 +671,10 @@ async def _shuffle_join(
                 chunk.make_available_and_spill(context.br(), allow_overbooking=True)
             )
     else:
-        for chunk in right_initial_chunks:
-            spilled_chunk = chunk.make_available_and_spill(
-                context.br(), allow_overbooking=True
-            )
-            pid = _get_partition_id(spilled_chunk, right_key_indices)
-            right_by_partition.setdefault(pid, []).append(spilled_chunk)
+        right_chunks.extend(
+            chunk.make_available_and_spill(context.br(), allow_overbooking=True)
+            for chunk in right_initial_chunks
+        )
 
     # Drain remaining chunks from both channels concurrently
     async def drain_left() -> None:
@@ -708,11 +690,11 @@ async def _shuffle_join(
             await left_shuffle.insert_finished()
         else:
             while (msg := await ch_left.recv(context)) is not None:
-                chunk = TableChunk.from_message(msg).make_available_and_spill(
-                    context.br(), allow_overbooking=True
+                left_chunks.append(
+                    TableChunk.from_message(msg).make_available_and_spill(
+                        context.br(), allow_overbooking=True
+                    )
                 )
-                pid = _get_partition_id(chunk, left_key_indices)
-                left_by_partition.setdefault(pid, []).append(chunk)
                 del msg
 
     async def drain_right() -> None:
@@ -728,14 +710,18 @@ async def _shuffle_join(
             await right_shuffle.insert_finished()
         else:
             while (msg := await ch_right.recv(context)) is not None:
-                chunk = TableChunk.from_message(msg).make_available_and_spill(
-                    context.br(), allow_overbooking=True
+                right_chunks.append(
+                    TableChunk.from_message(msg).make_available_and_spill(
+                        context.br(), allow_overbooking=True
+                    )
                 )
-                pid = _get_partition_id(chunk, right_key_indices)
-                right_by_partition.setdefault(pid, []).append(chunk)
                 del msg
 
     await asyncio.gather(drain_left(), drain_right())
+
+    # Create iterators for pre-partitioned sides
+    left_chunk_iter = iter(left_chunks)
+    right_chunk_iter = iter(right_chunks)
 
     # Extract partitions and perform partition-wise joins
     stream = ir_context.get_cuda_stream()
@@ -747,20 +733,10 @@ async def _shuffle_join(
             assert left_shuffle is not None
             left_table = await left_shuffle.extract_chunk(partition_id, stream)
         else:
-            left_chunks = left_by_partition.get(partition_id, [])
-            if left_chunks:
-                left_table = _concat(
-                    *[
-                        DataFrame.from_table(
-                            c.table_view(),
-                            list(left.schema.keys()),
-                            list(left.schema.values()),
-                            c.stream,
-                        )
-                        for c in left_chunks
-                    ],
-                    context=ir_context,
-                ).table
+            # Pre-partitioned chunks arrive in partition order
+            chunk = next(left_chunk_iter, None)
+            if chunk is not None:
+                left_table = chunk.table_view()
             else:
                 left_table = empty_table_chunk(left, context, stream).table_view()
 
@@ -769,20 +745,10 @@ async def _shuffle_join(
             assert right_shuffle is not None
             right_table = await right_shuffle.extract_chunk(partition_id, stream)
         else:
-            right_chunks = right_by_partition.get(partition_id, [])
-            if right_chunks:
-                right_table = _concat(
-                    *[
-                        DataFrame.from_table(
-                            c.table_view(),
-                            list(right.schema.keys()),
-                            list(right.schema.values()),
-                            c.stream,
-                        )
-                        for c in right_chunks
-                    ],
-                    context=ir_context,
-                ).table
+            # Pre-partitioned chunks arrive in partition order
+            chunk = next(right_chunk_iter, None)
+            if chunk is not None:
+                right_table = chunk.table_view()
             else:
                 right_table = empty_table_chunk(right, context, stream).table_view()
 
