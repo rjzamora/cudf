@@ -646,12 +646,12 @@ async def _shuffle_join(
             context, output_count, right_key_indices, right_collective_id
         )
 
-    # For sides that don't need shuffling, collect chunks in order
+    # For sides that don't need shuffling, queue initial chunks
     # (they're already partitioned and arrive in partition order)
-    left_chunks: list[TableChunk] = []
-    right_chunks: list[TableChunk] = []
+    left_pending: list[TableChunk] = []
+    right_pending: list[TableChunk] = []
 
-    # Insert initial chunks
+    # Insert initial chunks into shufflers or pending queues
     if shuffle_left:
         assert left_shuffle is not None
         for chunk in left_initial_chunks:
@@ -659,7 +659,7 @@ async def _shuffle_join(
                 chunk.make_available_and_spill(context.br(), allow_overbooking=True)
             )
     else:
-        left_chunks.extend(
+        left_pending.extend(
             chunk.make_available_and_spill(context.br(), allow_overbooking=True)
             for chunk in left_initial_chunks
         )
@@ -671,13 +671,17 @@ async def _shuffle_join(
                 chunk.make_available_and_spill(context.br(), allow_overbooking=True)
             )
     else:
-        right_chunks.extend(
+        right_pending.extend(
             chunk.make_available_and_spill(context.br(), allow_overbooking=True)
             for chunk in right_initial_chunks
         )
 
-    # Drain remaining chunks from both channels concurrently
-    async def drain_left() -> None:
+    # Track channel drain status for non-shuffled sides
+    left_channel_done = shuffle_left  # If shuffled, we drain differently
+    right_channel_done = shuffle_right
+
+    # Drain shuffled sides completely (they need all data before extraction)
+    async def drain_shuffled_left() -> None:
         if shuffle_left:
             assert left_shuffle is not None
             while (msg := await ch_left.recv(context)) is not None:
@@ -688,16 +692,8 @@ async def _shuffle_join(
                 )
                 del msg
             await left_shuffle.insert_finished()
-        else:
-            while (msg := await ch_left.recv(context)) is not None:
-                left_chunks.append(
-                    TableChunk.from_message(msg).make_available_and_spill(
-                        context.br(), allow_overbooking=True
-                    )
-                )
-                del msg
 
-    async def drain_right() -> None:
+    async def drain_shuffled_right() -> None:
         if shuffle_right:
             assert right_shuffle is not None
             while (msg := await ch_right.recv(context)) is not None:
@@ -708,20 +704,41 @@ async def _shuffle_join(
                 )
                 del msg
             await right_shuffle.insert_finished()
-        else:
-            while (msg := await ch_right.recv(context)) is not None:
-                right_chunks.append(
-                    TableChunk.from_message(msg).make_available_and_spill(
-                        context.br(), allow_overbooking=True
-                    )
-                )
-                del msg
 
-    await asyncio.gather(drain_left(), drain_right())
+    await asyncio.gather(drain_shuffled_left(), drain_shuffled_right())
 
-    # Create iterators for pre-partitioned sides
-    left_chunk_iter = iter(left_chunks)
-    right_chunk_iter = iter(right_chunks)
+    # Helper to get next chunk from non-shuffled side (from pending or channel)
+    async def get_left_chunk() -> TableChunk | None:
+        nonlocal left_channel_done
+        if left_pending:
+            return left_pending.pop(0)
+        if not left_channel_done:
+            msg = await ch_left.recv(context)
+            if msg is None:
+                left_channel_done = True
+                return None
+            chunk = TableChunk.from_message(msg).make_available_and_spill(
+                context.br(), allow_overbooking=True
+            )
+            del msg
+            return chunk
+        return None
+
+    async def get_right_chunk() -> TableChunk | None:
+        nonlocal right_channel_done
+        if right_pending:
+            return right_pending.pop(0)
+        if not right_channel_done:
+            msg = await ch_right.recv(context)
+            if msg is None:
+                right_channel_done = True
+                return None
+            chunk = TableChunk.from_message(msg).make_available_and_spill(
+                context.br(), allow_overbooking=True
+            )
+            del msg
+            return chunk
+        return None
 
     # Extract partitions and perform partition-wise joins
     stream = ir_context.get_cuda_stream()
@@ -734,7 +751,7 @@ async def _shuffle_join(
             left_table = await left_shuffle.extract_chunk(partition_id, stream)
         else:
             # Pre-partitioned chunks arrive in partition order
-            chunk = next(left_chunk_iter, None)
+            chunk = await get_left_chunk()
             if chunk is not None:
                 left_table = chunk.table_view()
             else:
@@ -746,7 +763,7 @@ async def _shuffle_join(
             right_table = await right_shuffle.extract_chunk(partition_id, stream)
         else:
             # Pre-partitioned chunks arrive in partition order
-            chunk = next(right_chunk_iter, None)
+            chunk = await get_right_chunk()
             if chunk is not None:
                 right_table = chunk.table_view()
             else:
