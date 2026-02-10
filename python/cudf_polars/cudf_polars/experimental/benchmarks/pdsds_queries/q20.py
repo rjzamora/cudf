@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import TYPE_CHECKING
 
 import polars as pl
@@ -30,22 +31,19 @@ def duckdb_impl(run_config: RunConfig) -> str:
              item ,
              date_dim
     WHERE    cs_item_sk = i_item_sk
-    AND      i_category IN ('Children',
-                            'Women',
-                            'Electronics')
+    AND      i_category IN ('Sports', 'Books', 'Home')
     AND      cs_sold_date_sk = d_date_sk
-    AND      d_date BETWEEN Cast('2001-02-03' AS DATE) AND      (
-                      Cast('2001-02-03' AS DATE) + INTERVAL '30' day)
+    AND      d_date BETWEEN Cast('1999-02-22' AS DATE) AND Cast('1999-03-24' AS DATE)
     GROUP BY i_item_id ,
              i_item_desc ,
              i_category ,
              i_class ,
              i_current_price
-    ORDER BY i_category ,
-             i_class ,
-             i_item_id ,
-             i_item_desc ,
-             revenueratio
+    ORDER BY i_category NULLS FIRST,
+             i_class NULLS FIRST,
+             i_item_id NULLS FIRST,
+             i_item_desc NULLS FIRST,
+             revenueratio NULLS FIRST
     LIMIT 100;
     """
 
@@ -58,15 +56,13 @@ def polars_impl(run_config: RunConfig) -> pl.LazyFrame:
     )
     item = get_data(run_config.dataset_path, "item", run_config.suffix)
     date_dim = get_data(run_config.dataset_path, "date_dim", run_config.suffix)
-    from datetime import date, timedelta
-
-    start_date = date(2001, 2, 3)
-    end_date = start_date + timedelta(days=30)
+    start_date = date(1999, 2, 22)
+    end_date = date(1999, 3, 24)
     return (
         catalog_sales.join(item, left_on="cs_item_sk", right_on="i_item_sk")
         .join(date_dim, left_on="cs_sold_date_sk", right_on="d_date_sk")
         .filter(
-            pl.col("i_category").is_in(["Children", "Women", "Electronics"])
+            pl.col("i_category").is_in(["Sports", "Books", "Home"])
             & pl.col("d_date").is_between(start_date, end_date, closed="both")
         )
         .group_by(
@@ -88,7 +84,7 @@ def polars_impl(run_config: RunConfig) -> pl.LazyFrame:
         )
         .sort(
             ["i_category", "i_class", "i_item_id", "i_item_desc", "revenueratio"],
-            nulls_last=True,
+            nulls_last=False,
         )
         .limit(100)
     )

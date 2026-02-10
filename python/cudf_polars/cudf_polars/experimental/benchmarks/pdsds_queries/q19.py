@@ -31,8 +31,8 @@ def duckdb_impl(run_config: RunConfig) -> str:
            store
     WHERE  d_date_sk = ss_sold_date_sk
            AND ss_item_sk = i_item_sk
-           AND i_manager_id = 38
-           AND d_moy = 12
+           AND i_manager_id = 8
+           AND d_moy = 11
            AND d_year = 1998
            AND ss_customer_sk = c_customer_sk
            AND c_current_addr_sk = ca_address_sk
@@ -69,8 +69,8 @@ def polars_impl(run_config: RunConfig) -> pl.LazyFrame:
         .join(customer_address, left_on="c_current_addr_sk", right_on="ca_address_sk")
         .join(store, left_on="ss_store_sk", right_on="s_store_sk")
         .filter(
-            (pl.col("i_manager_id") == 38)
-            & (pl.col("d_moy") == 12)
+            (pl.col("i_manager_id") == 8)
+            & (pl.col("d_moy") == 11)
             & (pl.col("d_year") == 1998)
             & (pl.col("ca_zip").str.slice(0, 5) != pl.col("s_zip").str.slice(0, 5))
         )

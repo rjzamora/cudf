@@ -25,18 +25,16 @@ def duckdb_impl(run_config: RunConfig) -> str:
                    Avg(inv_quantity_on_hand) qoh
     FROM   inventory,
            date_dim,
-           item,
-           warehouse
+           item
     WHERE  inv_date_sk = d_date_sk
            AND inv_item_sk = i_item_sk
-           AND inv_warehouse_sk = w_warehouse_sk
-           AND d_month_seq BETWEEN 1205 AND 1205 + 11
+           AND d_month_seq BETWEEN 1200 AND 1200 + 11
     GROUP  BY rollup( i_product_name, i_brand, i_class, i_category )
-    ORDER  BY qoh,
-              i_product_name,
-              i_brand,
-              i_class,
-              i_category
+    ORDER  BY qoh NULLS FIRST,
+              i_product_name NULLS FIRST,
+              i_brand NULLS FIRST,
+              i_class NULLS FIRST,
+              i_category NULLS FIRST
     LIMIT 100;
     """
 
@@ -71,12 +69,10 @@ def polars_impl(run_config: RunConfig) -> pl.LazyFrame:
     inventory = get_data(run_config.dataset_path, "inventory", run_config.suffix)
     date_dim = get_data(run_config.dataset_path, "date_dim", run_config.suffix)
     item = get_data(run_config.dataset_path, "item", run_config.suffix)
-    warehouse = get_data(run_config.dataset_path, "warehouse", run_config.suffix)
     base_data = (
         inventory.join(date_dim, left_on="inv_date_sk", right_on="d_date_sk")
         .join(item, left_on="inv_item_sk", right_on="i_item_sk")
-        .join(warehouse, left_on="inv_warehouse_sk", right_on="w_warehouse_sk")
-        .filter(pl.col("d_month_seq").is_between(1205, 1205 + 11))
+        .filter(pl.col("d_month_seq").is_between(1200, 1200 + 11))
     )
     agg_exprs = [pl.col("inv_quantity_on_hand").mean().alias("qoh")]
 
@@ -92,7 +88,7 @@ def polars_impl(run_config: RunConfig) -> pl.LazyFrame:
         pl.concat([level1, level2, level3, level4, level5])
         .sort(
             ["qoh", "i_product_name", "i_brand", "i_class", "i_category"],
-            nulls_last=True,
+            nulls_last=False,
         )
         .limit(100)
     )

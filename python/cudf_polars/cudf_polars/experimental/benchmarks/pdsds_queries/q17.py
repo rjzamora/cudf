@@ -41,7 +41,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
                    catalog_sales_quantitycount,
                    Avg(cs_quantity)                                          AS
                    catalog_sales_quantityave,
-                   Stddev_samp(cs_quantity) / Avg(cs_quantity)               AS
+                   Stddev_samp(cs_quantity)                                  AS
                    catalog_sales_quantitystdev,
                    Stddev_samp(cs_quantity) / Avg(cs_quantity)               AS
                    catalog_sales_quantitycov
@@ -53,7 +53,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
            date_dim d3,
            store,
            item
-    WHERE  d1.d_quarter_name = '1999Q1'
+    WHERE  d1.d_quarter_name = '2001Q1'
            AND d1.d_date_sk = ss_sold_date_sk
            AND i_item_sk = ss_item_sk
            AND s_store_sk = ss_store_sk
@@ -61,17 +61,17 @@ def duckdb_impl(run_config: RunConfig) -> str:
            AND ss_item_sk = sr_item_sk
            AND ss_ticket_number = sr_ticket_number
            AND sr_returned_date_sk = d2.d_date_sk
-           AND d2.d_quarter_name IN ( '1999Q1', '1999Q2', '1999Q3' )
+           AND d2.d_quarter_name IN ( '2001Q1', '2001Q2', '2001Q3' )
            AND sr_customer_sk = cs_bill_customer_sk
            AND sr_item_sk = cs_item_sk
            AND cs_sold_date_sk = d3.d_date_sk
-           AND d3.d_quarter_name IN ( '1999Q1', '1999Q2', '1999Q3' )
+           AND d3.d_quarter_name IN ( '2001Q1', '2001Q2', '2001Q3' )
     GROUP  BY i_item_id,
               i_item_desc,
               s_state
-    ORDER  BY i_item_id,
-              i_item_desc,
-              s_state
+    ORDER  BY i_item_id NULLS FIRST,
+              i_item_desc NULLS FIRST,
+              s_state NULLS FIRST
     LIMIT 100;
     """
 
@@ -100,16 +100,16 @@ def polars_impl(run_config: RunConfig) -> pl.LazyFrame:
         )
         .join(item, left_on="ss_item_sk", right_on="i_item_sk")
         .join(store, left_on="ss_store_sk", right_on="s_store_sk")
-        .filter(pl.col("d_quarter_name") == "1999Q1")
+        .filter(pl.col("d_quarter_name") == "2001Q1")
     )
 
     store_returns_base = store_returns.join(
         date_dim, left_on="sr_returned_date_sk", right_on="d_date_sk", suffix="_d2"
-    ).filter(pl.col("d_quarter_name").is_in(["1999Q1", "1999Q2", "1999Q3"]))
+    ).filter(pl.col("d_quarter_name").is_in(["2001Q1", "2001Q2", "2001Q3"]))
 
     catalog_sales_base = catalog_sales.join(
         date_dim, left_on="cs_sold_date_sk", right_on="d_date_sk", suffix="_d3"
-    ).filter(pl.col("d_quarter_name").is_in(["1999Q1", "1999Q2", "1999Q3"]))
+    ).filter(pl.col("d_quarter_name").is_in(["2001Q1", "2001Q2", "2001Q3"]))
 
     # Now create the full combination following the SQL logic
     return (
@@ -163,6 +163,6 @@ def polars_impl(run_config: RunConfig) -> pl.LazyFrame:
                 ),
             ]
         )
-        .sort(["i_item_id", "i_item_desc", "s_state"], nulls_last=True)
+        .sort(["i_item_id", "i_item_desc", "s_state"], nulls_last=False)
         .limit(100)
     )

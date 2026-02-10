@@ -41,19 +41,17 @@ def duckdb_impl(run_config: RunConfig) -> str:
            AND cs_bill_cdemo_sk = cd1.cd_demo_sk
            AND cs_bill_customer_sk = c_customer_sk
            AND cd1.cd_gender = 'F'
-           AND cd1.cd_education_status = 'Secondary'
+           AND cd1.cd_education_status = 'Unknown'
            AND c_current_cdemo_sk = cd2.cd_demo_sk
            AND c_current_addr_sk = ca_address_sk
-           AND c_birth_month IN ( 8, 4, 2, 5,
-                                  11, 9 )
-           AND d_year = 2001
-           AND ca_state IN ( 'KS', 'IA', 'AL', 'UT',
-                             'VA', 'NC', 'TX' )
+           AND c_birth_month IN ( 1, 6, 8, 9, 12, 2 )
+           AND d_year = 1998
+           AND ca_state IN ( 'MS', 'IN', 'ND', 'OK', 'NM', 'VA' )
     GROUP  BY rollup ( i_item_id, ca_country, ca_state, ca_county )
-    ORDER  BY ca_country,
-              ca_state,
-              ca_county,
-              i_item_id
+    ORDER  BY ca_country NULLS FIRST,
+              ca_state NULLS FIRST,
+              ca_county NULLS FIRST,
+              i_item_id NULLS FIRST
     LIMIT 100;
     """
 
@@ -130,10 +128,10 @@ def polars_impl(run_config: RunConfig) -> pl.LazyFrame:
         .join(customer_address, left_on="c_current_addr_sk", right_on="ca_address_sk")
         .filter(
             (pl.col("cd_gender") == "F")
-            & (pl.col("cd_education_status") == "Secondary")
-            & pl.col("c_birth_month").is_in([8, 4, 2, 5, 11, 9])
-            & (pl.col("d_year") == 2001)
-            & pl.col("ca_state").is_in(["KS", "IA", "AL", "UT", "VA", "NC", "TX"])
+            & (pl.col("cd_education_status") == "Unknown")
+            & pl.col("c_birth_month").is_in([1, 2, 6, 8, 9, 12])
+            & (pl.col("d_year") == 1998)
+            & pl.col("ca_state").is_in(["MS", "IN", "ND", "OK", "NM", "VA"])
         )
     )
 
@@ -163,6 +161,6 @@ def polars_impl(run_config: RunConfig) -> pl.LazyFrame:
     return (
         pl.concat([level1, level2, level3, level4, level5])
         .filter(pl.col("i_item_id") != null_sentinel)
-        .sort(["ca_country", "ca_state", "ca_county", "i_item_id"], nulls_last=True)
+        .sort(["ca_country", "ca_state", "ca_county", "i_item_id"], nulls_last=False)
         .limit(100)
     )
