@@ -1,7 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
-# SPDX-License-Identifier: Apache-2.0
 """Explain logical and physical plans."""
 
 from __future__ import annotations
@@ -130,9 +128,43 @@ def serialize_query(
     --------
     >>> import polars as pl
     >>> import json
-    >>> q = pl.LazyFrame({"a": [1, 2, 3]}).select("a")
+    >>> import dataclasses
+    >>> q = pl.LazyFrame({"a": [1, 2, 3]}).select(pl.col("a") * 2)
     >>> engine = pl.GPUEngine(executor="streaming")
-    >>> dag = serialize_query(q, engine, physical=False)
+    >>> plan = serialize_query(q, engine, physical=False)
+    >>> print(json.dumps(dataclasses.asdict(plan), indent=2))
+    {
+      "roots": [
+        "1739020873"
+      ],
+      "nodes": {
+        "1739020873": {
+          "id": "1739020873",
+          "children": [
+            "2653195019"
+          ],
+          "schema": {
+            "a": "INT64"
+          },
+          "properties": {
+            "columns": [
+              "a"
+            ]
+          },
+          "type": "Select"
+        },
+        "2653195019": {
+          "id": "2653195019",
+          "children": [],
+          "schema": {
+            "a": "INT64"
+          },
+          "properties": {},
+          "type": "DataFrameScan"
+        }
+      },
+      "partition_info": null
+    }
     """
     return SerializablePlan.from_query(q, engine, lowered=physical)
 
@@ -421,7 +453,7 @@ class SerializablePlan:
         for ir_node in traversal([ir]):
             stable_id = str(ir_node.get_stable_id())
             nodes[stable_id] = SerializableIRNode.from_ir(ir_node)
-            if lowered and partition_info_dict is not None:
+            if partition_info_dict is not None:
                 partition_info_dict[stable_id] = SerializablePartitionInfo(
                     count=partition_info_d[ir_node].count,
                     partitioned_on=tuple(
