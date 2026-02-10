@@ -195,20 +195,8 @@ def _(
     )
     dynamic_planning = _dynamic_planning_on(config_options)
 
-    # Check for dynamic planning - defer decomposition and shuffle decisions to runtime
-    if dynamic_planning:
-        # Dynamic planning: Just reconstruct the GroupBy.
-        # The runtime GroupBy node will handle decomposition and shuffle decisions.
-        child_count = partition_info[child].count
-        dynamic_node = ir.reconstruct([child])
-        partition_info[dynamic_node] = PartitionInfo(
-            count=child_count,
-            partitioned_on=ir.keys,
-        )
-        return dynamic_node, partition_info
-
     # Handle single-partition case
-    elif partition_info[child].count == 1:
+    if partition_info[child].count == 1 and not dynamic_planning:
         single_part_node = ir.reconstruct([child])
         partition_info[single_part_node] = partition_info[child]
         return single_part_node, partition_info
@@ -227,18 +215,9 @@ def _(
     post_aggregation_count = 1  # Default tree reduction
     groupby_key_columns = [ne.name for ne in ir.keys]
     shuffled = partition_info[child].partitioned_on == ir.keys
-
     child_count = partition_info[child].count
-    if unique_fraction_dict := _get_unique_fractions(
-        groupby_key_columns,
-        config_options.executor.unique_fraction,
-        row_count=rec.state["stats"].row_count.get(original_child),
-        column_stats=rec.state["stats"].column_stats.get(original_child),
-    ):
-        # Use unique_fraction to determine output partitioning
-        unique_fraction = max(unique_fraction_dict.values())
-        post_aggregation_count = max(int(unique_fraction * child_count), 1)
 
+    # Decompose the aggregation requests into three distinct phases
     new_node: IR
     name_generator = unique_names(ir.schema.keys())
     # Decompose the aggregation requests into three distinct phases
@@ -274,6 +253,27 @@ def _(
             partitioned_on=ir.keys,
         )
         shuffled = True
+
+    # Check for dynamic planning
+    if dynamic_planning:
+        # Dynamic planning: Just reconstruct the GroupBy.
+        # The runtime GroupBy node will handle decomposition and shuffle decisions.
+        dynamic_node = ir.reconstruct([child])
+        partition_info[dynamic_node] = PartitionInfo(
+            count=child_count,
+            partitioned_on=ir.keys,
+        )
+        return dynamic_node, partition_info
+
+    if unique_fraction_dict := _get_unique_fractions(
+        groupby_key_columns,
+        config_options.executor.unique_fraction,
+        row_count=rec.state["stats"].row_count.get(original_child),
+        column_stats=rec.state["stats"].column_stats.get(original_child),
+    ):
+        # Use unique_fraction to determine output partitioning
+        unique_fraction = max(unique_fraction_dict.values())
+        post_aggregation_count = max(int(unique_fraction * child_count), 1)
 
     # Partition-wise groupby operation
     pwise_schema = {k.name: k.value.dtype for k in ir.keys} | {

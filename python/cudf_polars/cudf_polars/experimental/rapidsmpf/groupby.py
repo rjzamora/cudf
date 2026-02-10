@@ -43,6 +43,7 @@ from cudf_polars.experimental.rapidsmpf.utils import (
     send_metadata,
     shutdown_on_error,
 )
+from cudf_polars.experimental.repartition import Repartition
 from cudf_polars.experimental.utils import _concat
 
 if TYPE_CHECKING:
@@ -135,135 +136,6 @@ class DecomposedGroupBy:
 # ============================================================================
 # GroupBy Strategies
 # ============================================================================
-
-
-async def _concat_groupby(
-    context: Context,
-    ir: GroupBy,
-    ir_context: IRExecutionContext,
-    ch_out: Channel[TableChunk],
-    ch_in: Channel[TableChunk],
-    metadata_in: ChannelMetadata,
-    initial_chunks: list[TableChunk],
-    collective_id: int | None = None,
-    tracer: ActorTracer | None = None,
-) -> None:
-    """
-    Execute groupby by concatenating all data first.
-
-    Used when outputting a single partition, maintaining order, or when
-    aggregation cannot be decomposed for piecewise processing.
-
-    When collective_id is provided and data is not duplicated, uses allgather
-    to collect data from all ranks first, producing a single duplicated chunk.
-    """
-    nranks = context.comm().nranks
-
-    # Determine if allgather is needed
-    need_allgather = (
-        collective_id is not None and not metadata_in.duplicated and nranks > 1
-    )
-
-    # Set output metadata
-    if need_allgather:
-        # After allgather, all workers have identical data
-        metadata_out = ChannelMetadata(local_count=1, duplicated=True)
-    else:
-        # Local concat: single chunk per rank
-        metadata_out = ChannelMetadata(local_count=1, duplicated=metadata_in.duplicated)
-    await send_metadata(ch_out, context, metadata_out)
-
-    # Collect chunks
-    input_bytes = 0
-    chunks: list[TableChunk] = list(initial_chunks)
-    for chunk in chunks:
-        input_bytes += chunk.data_alloc_size(MemoryType.DEVICE)
-
-    if need_allgather:
-        assert collective_id is not None
-        allgather = AllGatherManager(context, collective_id)
-
-        # Insert initial chunks
-        for seq_num, chunk in enumerate(chunks):
-            allgather.insert(seq_num, chunk)
-
-        # Insert remaining chunks from channel
-        seq_num = len(chunks)
-        while (msg := await ch_in.recv(context)) is not None:
-            allgather.insert(seq_num, TableChunk.from_message(msg))
-            del msg
-            seq_num += 1
-
-        allgather.insert_finished()
-        stream = ir_context.get_cuda_stream()
-        chunks = [
-            TableChunk.from_pylibcudf_table(
-                await allgather.extract_concatenated(stream),
-                stream,
-                exclusive_view=True,
-            )
-        ]
-        input_bytes = chunks[0].data_alloc_size(MemoryType.DEVICE)
-    else:
-        # Local collection only
-        while (msg := await ch_in.recv(context)) is not None:
-            chunk = TableChunk.from_message(msg).make_available_and_spill(
-                context.br(), allow_overbooking=True
-            )
-            del msg
-            chunks.append(chunk)
-            input_bytes += chunk.data_alloc_size(MemoryType.DEVICE)
-
-    if chunks:
-        # Reserve extra for groupby working memory (input + output)
-        chunks, extra = await make_table_chunks_available_or_wait(
-            context,
-            chunks,
-            reserve_extra=input_bytes,
-            net_memory_delta=0,
-        )
-        with opaque_memory_usage(extra):
-            multi_chunks = len(chunks) > 1
-            input_schema = ir.children[0].schema
-
-            # Concatenate chunks
-            concatenated = await asyncio.to_thread(
-                _concat,
-                *[
-                    DataFrame.from_table(
-                        chunk.table_view(),
-                        list(input_schema.keys()),
-                        list(input_schema.values()),
-                        chunk.stream,
-                    )
-                    for chunk in chunks
-                ],
-                context=ir_context,
-            )
-            if multi_chunks:
-                del chunks
-
-            # Apply full groupby
-            df = await asyncio.to_thread(
-                ir.do_evaluate, *ir._non_child_args, concatenated, context=ir_context
-            )
-            del concatenated
-            if not multi_chunks:
-                del chunks
-        if tracer is not None:
-            tracer.add_chunk(table=df.table)
-        await ch_out.send(
-            context,
-            Message(
-                0,
-                TableChunk.from_pylibcudf_table(
-                    df.table, df.stream, exclusive_view=True
-                ),
-            ),
-        )
-        del df
-
-    await ch_out.drain(context)
 
 
 async def _tree_groupby(
@@ -596,91 +468,6 @@ async def _shuffle_groupby(
     await ch_out.drain(context)
 
 
-async def _shuffle_full_groupby(
-    context: Context,
-    ir: GroupBy,
-    ir_context: IRExecutionContext,
-    ch_out: Channel[TableChunk],
-    ch_in: Channel[TableChunk],
-    metadata_in: ChannelMetadata,
-    initial_chunks: list[TableChunk],
-    output_count: int,
-    collective_id: int,
-    key_indices: tuple[int, ...],
-    tracer: ActorTracer | None = None,
-) -> None:
-    """
-    Execute non-decomposable groupby using shuffle-based redistribution.
-
-    Unlike _shuffle_groupby, this doesn't use piecewise aggregation.
-    It shuffles raw data by keys, then applies the full groupby.
-    """
-    nranks = context.comm().nranks
-    local_output_count = max(1, output_count // nranks)
-
-    # Get output key indices
-    output_names = list(ir.schema.keys())
-    output_key_indices = tuple(output_names.index(k.name) for k in ir.keys)
-
-    # Output metadata with hash partitioning on groupby keys
-    metadata_out = ChannelMetadata(
-        local_count=local_output_count,
-        partitioning=Partitioning(
-            inter_rank=HashScheme(output_key_indices, output_count),
-            local="inherit",
-        ),
-        duplicated=False,
-    )
-    await send_metadata(ch_out, context, metadata_out)
-
-    # Create shuffle manager using input schema key indices
-    shuffle = ShuffleManager(context, output_count, key_indices, collective_id)
-
-    # Insert initial chunks (raw, not piecewise processed)
-    for chunk in initial_chunks:
-        shuffle.insert_chunk(chunk)
-
-    # Process remaining chunks
-    while (msg := await ch_in.recv(context)) is not None:
-        chunk = TableChunk.from_message(msg).make_available_and_spill(
-            context.br(), allow_overbooking=True
-        )
-        del msg
-        shuffle.insert_chunk(chunk)
-
-    await shuffle.insert_finished()
-
-    # Extract shuffled partitions and apply full groupby
-    for partition_id in range(context.comm().rank, output_count, nranks):
-        stream = ir_context.get_cuda_stream()
-        chunk = TableChunk.from_pylibcudf_table(
-            await shuffle.extract_chunk(partition_id, stream),
-            stream,
-            exclusive_view=True,
-        )
-        # Reserve extra for groupby working memory (input + output)
-        chunk, extra = await make_table_chunks_available_or_wait(
-            context,
-            chunk,
-            reserve_extra=chunk.data_alloc_size(),
-            net_memory_delta=0,
-        )
-        with opaque_memory_usage(extra):
-            # Apply full groupby (including zlice if present)
-            chunk = await asyncio.to_thread(
-                evaluate_chunk,
-                chunk,
-                ir,
-                ir_context,
-            )
-        if tracer is not None:
-            tracer.add_chunk(table=chunk.table_view())
-        await ch_out.send(context, Message(partition_id, chunk))
-        del chunk
-
-    await ch_out.drain(context)
-
-
 # ============================================================================
 # Main GroupBy Node
 # ============================================================================
@@ -724,9 +511,15 @@ async def groupby_node(
         already_partitioned_inter_rank, already_partitioned_local = (
             is_partitioned_on_keys(metadata_in, key_indices, nranks)
         )
+        fully_partitioned = already_partitioned_inter_rank and already_partitioned_local
+        fallback_case = (
+            metadata_in.local_count == 1
+            and (metadata_in.duplicated or nranks == 1)
+            and isinstance(ir.children[0], Repartition)
+        )
 
-        # If already partitioned globally and locally, just do a chunk-wise groupby
-        if already_partitioned_inter_rank and already_partitioned_local:
+        # If already partitioned or concatenated, just do a chunk-wise groupby
+        if fully_partitioned or fallback_case:
             await chunkwise_evaluate(
                 context,
                 ir,
@@ -738,21 +531,9 @@ async def groupby_node(
             )
             return
 
-        # Try to decompose for multi-phase execution
-        # need_preconcat is True when:
-        # - maintain_order is set (must preserve row ordering)
-        # - aggregations cannot be decomposed
-        # Note: zlice is handled at lowering time by extracting it to a Slice node
-        decomposed: DecomposedGroupBy | None = None
-        need_preconcat = ir.maintain_order
-        need_preshuffle = False
-        try:
-            decomposed = DecomposedGroupBy.from_groupby(ir)
-            need_preshuffle = decomposed.need_preshuffle
-        except NotImplementedError:
-            need_preconcat = True  # Cannot decompose
-
-        nranks = context.comm().nranks
+        # Decompose for multi-phase execution
+        # Note: Lowering guarantees decomposition succeeds and preshuffle is done
+        decomposed = DecomposedGroupBy.from_groupby(ir)
 
         # Determine if we can skip global communication
         # Yes if: single rank, OR data is duplicated, OR already globally partitioned
@@ -760,104 +541,11 @@ async def groupby_node(
             nranks == 1 or metadata_in.duplicated or already_partitioned_inter_rank
         )
 
-        # =====================================================================
-        # Handle need_preconcat case (maintain_order or non-decomposable)
-        # =====================================================================
-        if need_preconcat:
-            # Collect all initial chunks without transformation
-            initial_chunks: list[TableChunk] = []
-            for _ in range(sample_chunk_count):
-                msg = await ch_in.recv(context)
-                if msg is None:
-                    break
-                chunk = TableChunk.from_message(msg).make_available_and_spill(
-                    context.br(), allow_overbooking=True
-                )
-                del msg
-                initial_chunks.append(chunk)
-
-            # Use concat_groupby strategy
-            if tracer is not None:
-                tracer.decision = "concat"
-            collective_id = collective_ids.pop() if collective_ids else None
-            await _concat_groupby(
-                context,
-                ir,
-                ir_context,
-                ch_out,
-                ch_in,
-                metadata_in,
-                initial_chunks,
-                collective_id if not can_skip_global_comm else None,
-                tracer,
-            )
-            return
-
-        # From here on, decomposed is not None
-        assert decomposed is not None
+        # Check for ordering requirements (shuffle doesn't preserve order)
+        require_tree = ir.maintain_order
 
         # =====================================================================
-        # Handle need_preshuffle case (e.g., n_unique)
-        # =====================================================================
-        # For n_unique etc., we need to shuffle by keys BEFORE piecewise
-        # This ensures all instances of the same key are together
-        # TODO: We can also do a pre-concat if the data is small enough
-        if need_preshuffle and collective_ids and not can_skip_global_comm:
-            # Collect initial chunks (no piecewise yet)
-            initial_chunks = []
-            local_size = 0
-            for _ in range(sample_chunk_count):
-                msg = await ch_in.recv(context)
-                if msg is None:
-                    break
-                chunk = TableChunk.from_message(msg).make_available_and_spill(
-                    context.br(), allow_overbooking=True
-                )
-                del msg
-                initial_chunks.append(chunk)
-                local_size += chunk.data_alloc_size(MemoryType.DEVICE)
-
-            # Estimate total size and chunk count across all ranks
-            local_chunk_count = metadata_in.local_count
-            if initial_chunks:
-                avg_chunk_size = local_size / len(initial_chunks)
-                local_estimate = int(avg_chunk_size * local_chunk_count)
-            else:
-                local_estimate = 0
-
-            if nranks > 1:
-                estimated_total_size, global_chunk_count = await allgather_reduce(
-                    context, collective_ids.pop(), local_estimate, local_chunk_count
-                )
-            else:
-                estimated_total_size = local_estimate
-                global_chunk_count = local_chunk_count
-
-            # Use shuffle_full_groupby (shuffles raw data, then full groupby)
-            if tracer is not None:
-                tracer.decision = "shuffle_full"
-            ideal_count = max(1, estimated_total_size // target_partition_size)
-            # Cap at global chunk count, but use the rank count if it's larger
-            output_count = max(1, min(ideal_count, global_chunk_count))
-            if output_count > 1:
-                output_count = max(nranks, output_count)
-            await _shuffle_full_groupby(
-                context,
-                ir,
-                ir_context,
-                ch_out,
-                ch_in,
-                metadata_in,
-                initial_chunks,
-                output_count,
-                collective_ids.pop(),
-                key_indices,
-                tracer,
-            )
-            return
-
-        # =====================================================================
-        # Standard decomposed path: sample, estimate size, select strategy
+        # Sample, estimate size, select strategy
         # =====================================================================
         initial_chunks = []
         total_pwise_size = 0
@@ -923,23 +611,44 @@ async def groupby_node(
                 adaptive_n_ary,
                 tracer=tracer,
             )
-        elif can_skip_global_comm and estimated_total_size < target_partition_size:
-            # Single rank with small data - use tree reduction
-            if tracer is not None:
-                tracer.decision = "tree_local"
-            await _tree_groupby(
-                context,
-                decomposed,
-                ir_context,
-                ch_out,
-                ch_in,
-                metadata_in,
-                initial_chunks,
-                adaptive_n_ary,
-                tracer=tracer,
-            )
-        elif estimated_total_size < target_partition_size:
-            # Small output - use tree reduction with allgather to merge across ranks
+        elif can_skip_global_comm:
+            # Can skip global communication
+            if estimated_total_size < target_partition_size or require_tree:
+                # Small output or ordering required - use tree reduction
+                if tracer is not None:
+                    tracer.decision = "tree_local"
+                await _tree_groupby(
+                    context,
+                    decomposed,
+                    ir_context,
+                    ch_out,
+                    ch_in,
+                    metadata_in,
+                    initial_chunks,
+                    adaptive_n_ary,
+                    tracer=tracer,
+                )
+            else:
+                # Large output - use local shuffle
+                if tracer is not None:
+                    tracer.decision = "shuffle_local"
+                ideal_count = max(1, local_estimate // target_partition_size)
+                output_count = max(1, min(ideal_count, local_count))
+                await _shuffle_groupby(
+                    context,
+                    decomposed,
+                    ir_context,
+                    ch_out,
+                    ch_in,
+                    metadata_in,
+                    initial_chunks,
+                    output_count,
+                    collective_ids.pop() if collective_ids else 0,
+                    key_indices,
+                    tracer,
+                )
+        elif estimated_total_size < target_partition_size or require_tree:
+            # Small output or ordering required - use tree with allgather
             if tracer is not None:
                 tracer.decision = "tree_allgather"
             await _tree_groupby(

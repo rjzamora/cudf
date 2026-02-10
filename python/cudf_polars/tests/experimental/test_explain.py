@@ -354,6 +354,8 @@ def test_explain_logical_io_then_join(engine, tmp_path, kind):
         assert re.search(rf"^\s*SORT.*row_count=\'~{value}\'\s*$", repr, re.MULTILINE)
 
 
+@pytest.mark.filterwarnings("ignore:Failed to decompose groupby aggs")
+@pytest.mark.filterwarnings("ignore:Sort does not support multiple partitions")
 @pytest.mark.parametrize("kind", ["parquet", "csv", "frame"])
 def test_explain_logical_io_then_join_then_groupby(engine, tmp_path, kind):
     # Create simple Join + GroupBy + Sort query

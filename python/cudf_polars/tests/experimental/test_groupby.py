@@ -122,8 +122,7 @@ def test_groupby_fallback(df, engine, fallback_mode):
             pl.exceptions.ComputeError,
             match="'foo' is not a valid StreamingFallbackMode",
         )
-    elif fallback_mode == "silent" or DEFAULT_RUNTIME == "rapidsmpf":
-        # rapidsmpf handles non-decomposable aggregations via _concat_groupby
+    elif fallback_mode == "silent":
         ctx = contextlib.nullcontext()
     elif fallback_mode == "raise":
         ctx = pytest.raises(

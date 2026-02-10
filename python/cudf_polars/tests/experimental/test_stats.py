@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -460,6 +460,8 @@ def test_dataframescan_stats_pickle(engine):
 @pytest.mark.parametrize("use_sampling", [True, False])
 @pytest.mark.parametrize("default_selectivity", [0.5, 1.0])
 @pytest.mark.parametrize("kind", ["parquet", "csv", "frame"])
+@pytest.mark.filterwarnings("ignore:Failed to decompose groupby aggs")
+@pytest.mark.filterwarnings("ignore:Sort does not support multiple partitions")
 def test_stats_planning(
     tmp_path,
     kind,
