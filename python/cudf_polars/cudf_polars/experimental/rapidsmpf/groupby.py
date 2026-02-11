@@ -288,6 +288,7 @@ async def _shuffle_groupby(
     key_indices: tuple[int, ...],
     *,
     evaluated_chunks: list[TableChunk] | None = None,
+    reduction_ran: bool = False,
     tracer: ActorTracer | None = None,
 ) -> None:
     """Execute groupby using shuffle-based redistribution."""
@@ -313,12 +314,16 @@ async def _shuffle_groupby(
     for chunk in evaluated_chunks or []:
         shuffle.insert_chunk(chunk)
 
+    pwise_ir: list[IR] = [decomposed.piecewise_ir]
+    if reduction_ran:
+        pwise_ir.append(decomposed.reduction_ir)
+
     while (msg := await ch_in.recv(context)) is not None:
         shuffle.insert_chunk(
             await evaluate_chunk(
                 context,
                 TableChunk.from_message(msg),
-                decomposed.piecewise_ir,
+                pwise_ir,
                 ir_context,
             )
         )
@@ -523,6 +528,7 @@ async def groupby_node(
                     collective_ids.pop() if collective_ids else 0,
                     key_indices,
                     evaluated_chunks=evaluated_chunks,
+                    reduction_ran=merge_count > 0,
                     tracer=tracer,
                 )
         elif use_tree:
@@ -572,6 +578,7 @@ async def groupby_node(
                 collective_ids.pop(),
                 key_indices,
                 evaluated_chunks=evaluated_chunks,
+                reduction_ran=merge_count > 0,
                 tracer=tracer,
             )
 
