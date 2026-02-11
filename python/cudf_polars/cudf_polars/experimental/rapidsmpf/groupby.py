@@ -136,8 +136,9 @@ async def _tree_groupby(
     ch_out: Channel[TableChunk],
     ch_in: Channel[TableChunk],
     metadata_in: ChannelMetadata,
-    initial_chunks: list[TableChunk],
     groupby_n_ary: int,
+    *,
+    evaluated_chunks: list[TableChunk] | None = None,
     collective_id: int | None = None,
     tracer: ActorTracer | None = None,
 ) -> None:
@@ -152,7 +153,6 @@ async def _tree_groupby(
         collective_id is not None and not metadata_in.duplicated and nranks > 1
     )
 
-    # Output: single chunk, duplicated if allgather is used
     metadata_out = ChannelMetadata(
         local_count=1,
         partitioning=None,
@@ -160,9 +160,7 @@ async def _tree_groupby(
     )
     await send_metadata(ch_out, context, metadata_out)
 
-    # Collect all chunks, applying piecewise groupby
-    # Note: initial_chunks already have piecewise applied (done during sampling)
-    pwise_chunks: list[TableChunk] = list(initial_chunks)
+    pwise_chunks: list[TableChunk] = list(evaluated_chunks or [])
 
     # Apply piecewise to remaining chunks from input channel
     while (msg := await ch_in.recv(context)) is not None:
@@ -174,15 +172,14 @@ async def _tree_groupby(
 
     # Tree reduction
     # After first reduction pass, chunks are in reduction_ir schema (not piecewise_ir)
-    k = groupby_n_ary
     # Track current schema - starts as piecewise, becomes reduction after first pass
     chunk_schema = decomposed.piecewise_ir.schema
     tree_reduction_ran = False
 
     while len(pwise_chunks) > 1:
         new_chunks: list[TableChunk] = []
-        for i in range(0, len(pwise_chunks), k):
-            batch = pwise_chunks[i : i + k]
+        for i in range(0, len(pwise_chunks), groupby_n_ary):
+            batch = pwise_chunks[i : i + groupby_n_ary]
             # Concatenate and reduce (even single-chunk batches need reduction
             # to convert from piecewise to reduction schema on first pass)
             # Reserve extra for groupby working memory (input + output)
@@ -346,17 +343,17 @@ async def _shuffle_groupby(
     ch_out: Channel[TableChunk],
     ch_in: Channel[TableChunk],
     metadata_in: ChannelMetadata,
-    initial_chunks: list[TableChunk],
     output_count: int,
     collective_id: int,
     key_indices: tuple[int, ...],
+    *,
+    evaluated_chunks: list[TableChunk] | None = None,
     tracer: ActorTracer | None = None,
 ) -> None:
     """Execute groupby using shuffle-based redistribution."""
     nranks = context.comm().nranks
     local_output_count = max(1, output_count // nranks)
 
-    # Output metadata with hash partitioning
     pwise_schema_keys = list(decomposed.piecewise_ir.schema.keys())
     groupby_key_names = tuple(ne.name for ne in decomposed.grouped_keys)
     pwise_key_indices = tuple(pwise_schema_keys.index(k) for k in groupby_key_names)
@@ -371,20 +368,21 @@ async def _shuffle_groupby(
     )
     await send_metadata(ch_out, context, metadata_out)
 
-    # Create shuffle manager
     shuffle = ShuffleManager(context, output_count, pwise_key_indices, collective_id)
 
-    # Insert initial chunks (already have piecewise applied from sampling)
-    for chunk in initial_chunks:
+    for chunk in evaluated_chunks or []:
         shuffle.insert_chunk(chunk)
 
-    # Process remaining chunks (need piecewise applied)
     while (msg := await ch_in.recv(context)) is not None:
-        pwise_chunk = await evaluate_chunk(
-            context, TableChunk.from_message(msg), decomposed.piecewise_ir, ir_context
+        shuffle.insert_chunk(
+            await evaluate_chunk(
+                context,
+                TableChunk.from_message(msg),
+                decomposed.piecewise_ir,
+                ir_context,
+            )
         )
         del msg
-        shuffle.insert_chunk(pwise_chunk)
 
     await shuffle.insert_finished()
 
@@ -419,7 +417,6 @@ async def groupby_node(
     ch_in: Channel[TableChunk],
     sample_chunk_count: int,
     target_partition_size: int,
-    groupby_n_ary: int,
     collective_ids: list[int],
 ) -> None:
     """
@@ -429,6 +426,25 @@ async def groupby_node(
     - Partition-wise: Data already partitioned on groupby keys
     - Tree reduction: Small estimated output (< target_partition_size)
     - Shuffle: Large estimated output requiring redistribution
+
+    Parameters
+    ----------
+    context
+        The rapidsmpf context.
+    ir
+        The IR node to evaluate.
+    ir_context
+        The IR execution context.
+    ch_out
+        The output channel.
+    ch_in
+        The input channel.
+    sample_chunk_count
+        The number of chunks to sample.
+    target_partition_size
+        The target partition size.
+    collective_ids
+        The collective IDs.
     """
     async with shutdown_on_error(context, ch_in, ch_out, trace_ir=ir) as tracer:
         # Receive input metadata
@@ -481,12 +497,8 @@ async def groupby_node(
         # Check for ordering requirements (shuffle doesn't preserve order)
         require_tree = ir.maintain_order
 
-        # =====================================================================
-        # Sample, estimate size, select strategy
-        # =====================================================================
-        initial_chunks = []
+        evaluated_chunks: list[TableChunk] = []
         total_pwise_size = 0
-
         for _ in range(sample_chunk_count):
             msg = await ch_in.recv(context)
             if msg is None:
@@ -499,20 +511,17 @@ async def groupby_node(
             )
             del msg
             total_pwise_size += pwise_chunk.data_alloc_size(MemoryType.DEVICE)
-            initial_chunks.append(pwise_chunk)
+            evaluated_chunks.append(pwise_chunk)
 
-        # Estimate total size: avg_sample_size * local_count, summed across ranks
         local_count = metadata_in.local_count
-        if initial_chunks and total_pwise_size > 0:
-            avg_sample_size = total_pwise_size / len(initial_chunks)
+        if evaluated_chunks and total_pwise_size > 0:
+            avg_sample_size = total_pwise_size / len(evaluated_chunks)
             local_estimate = int(avg_sample_size * local_count)
-            # Adaptive n-ary: how many chunks can fit in target_partition_size?
-            # Bounded between 2 (minimum progress) and 256 (reasonable upper limit)
             chunks_per_partition = max(1, target_partition_size // avg_sample_size)
             adaptive_n_ary = max(2, min(256, int(chunks_per_partition)))
         else:
             local_estimate = 0
-            adaptive_n_ary = groupby_n_ary  # fallback to configured value
+            adaptive_n_ary = 32  # Reasonable default
 
         if collective_ids and nranks > 1:
             estimated_total_size, global_chunk_count = await allgather_reduce(
@@ -522,12 +531,7 @@ async def groupby_node(
             estimated_total_size = local_estimate
             global_chunk_count = local_count
 
-        # =====================================================================
-        # Strategy Selection
-        # =====================================================================
-
         if already_partitioned_inter_rank:
-            # Already partitioned on groupby keys - use tree reduction (no allgather)
             if tracer is not None:
                 tracer.decision = "tree_local"
             await _tree_groupby(
@@ -537,14 +541,12 @@ async def groupby_node(
                 ch_out,
                 ch_in,
                 metadata_in,
-                initial_chunks,
                 adaptive_n_ary,
+                evaluated_chunks=evaluated_chunks,
                 tracer=tracer,
             )
         elif can_skip_global_comm:
-            # Can skip global communication
             if estimated_total_size < target_partition_size or require_tree:
-                # Small output or ordering required - use tree reduction
                 if tracer is not None:
                     tracer.decision = "tree_local"
                 await _tree_groupby(
@@ -554,12 +556,11 @@ async def groupby_node(
                     ch_out,
                     ch_in,
                     metadata_in,
-                    initial_chunks,
                     adaptive_n_ary,
+                    evaluated_chunks=evaluated_chunks,
                     tracer=tracer,
                 )
             else:
-                # Large output - use local shuffle
                 if tracer is not None:
                     tracer.decision = "shuffle_local"
                 ideal_count = max(1, local_estimate // target_partition_size)
@@ -571,14 +572,13 @@ async def groupby_node(
                     ch_out,
                     ch_in,
                     metadata_in,
-                    initial_chunks,
                     output_count,
                     collective_ids.pop() if collective_ids else 0,
                     key_indices,
-                    tracer,
+                    evaluated_chunks=evaluated_chunks,
+                    tracer=tracer,
                 )
         elif estimated_total_size < target_partition_size or require_tree:
-            # Small output or ordering required - use tree with allgather
             if tracer is not None:
                 tracer.decision = "tree_allgather"
             await _tree_groupby(
@@ -588,13 +588,12 @@ async def groupby_node(
                 ch_out,
                 ch_in,
                 metadata_in,
-                initial_chunks,
                 adaptive_n_ary,
-                collective_ids.pop() if collective_ids else None,
-                tracer,
+                evaluated_chunks=evaluated_chunks,
+                collective_id=collective_ids.pop() if collective_ids else None,
+                tracer=tracer,
             )
         elif not collective_ids:
-            # No shuffle ID available - fall back to tree (no allgather)
             if tracer is not None:
                 tracer.decision = "tree_fallback"
             await _tree_groupby(
@@ -604,14 +603,12 @@ async def groupby_node(
                 ch_out,
                 ch_in,
                 metadata_in,
-                initial_chunks,
                 adaptive_n_ary,
+                evaluated_chunks=evaluated_chunks,
                 tracer=tracer,
             )
         else:
-            # Large output - use shuffle
             ideal_count = max(1, estimated_total_size // target_partition_size)
-            # Cap at global chunk count, but use the rank count if it's larger
             output_count = max(nranks, min(ideal_count, global_chunk_count))
             if tracer is not None:
                 tracer.decision = "shuffle"
@@ -622,17 +619,12 @@ async def groupby_node(
                 ch_out,
                 ch_in,
                 metadata_in,
-                initial_chunks,
                 output_count,
                 collective_ids.pop(),
                 key_indices,
-                tracer,
+                evaluated_chunks=evaluated_chunks,
+                tracer=tracer,
             )
-
-
-# ============================================================================
-# Network Generation
-# ============================================================================
 
 
 @generate_ir_sub_network.register(GroupBy)
@@ -670,7 +662,6 @@ def _(
             channels[ir.children[0]].reserve_output_slot(),
             dynamic_planning.sample_chunk_count,
             config_options.executor.target_partition_size,
-            config_options.executor.groupby_n_ary,
             collective_ids,
         )
     ]
