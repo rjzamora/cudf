@@ -492,19 +492,12 @@ def _(
         # Fall back to the default IR handler (bypass Distinct dispatch)
         return generate_ir_sub_network.dispatch(IR)(ir, rec)
 
-    # For type narrowing after the early return
-    dynamic_planning = executor.dynamic_planning
-
-    # Process children
     nodes, channels = process_children(ir, rec)
-
-    # Create output ChannelManager
     channels[ir] = ChannelManager(rec.state["context"])
-
-    # Get collective IDs for this Distinct (may be empty if not reserved)
     collective_ids = list(rec.state["collective_id_map"].get(ir, []))
-
-    # Create the dynamic unique node
+    assert len(collective_ids) == 2, (
+        f"Distinct requires 2 collective IDs, got {len(collective_ids)}"
+    )
     nodes[ir] = [
         distinct_node(
             rec.state["context"],
@@ -512,10 +505,9 @@ def _(
             rec.state["ir_context"],
             channels[ir].reserve_input_slot(),
             channels[ir.children[0]].reserve_output_slot(),
-            dynamic_planning.sample_chunk_count,
+            executor.dynamic_planning.sample_chunk_count,
             executor.target_partition_size,
             collective_ids,
         )
     ]
-
     return nodes, channels
