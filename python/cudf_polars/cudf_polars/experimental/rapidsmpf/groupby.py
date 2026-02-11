@@ -445,11 +445,13 @@ async def groupby_node(
         evaluated_chunks: list[TableChunk] = []
         total_size = 0
         merge_count = 0
+        chunks_sampled = 0
 
         for _ in range(sample_chunk_count):
             msg = await ch_in.recv(context)
             if msg is None:
                 break
+            chunks_sampled += 1
             chunk = await evaluate_chunk(
                 context,
                 TableChunk.from_message(msg),
@@ -472,12 +474,21 @@ async def groupby_node(
 
         local_count = metadata_in.local_count
         if collective_ids and nranks > 1:
-            global_size, global_chunk_count = await allgather_reduce(
-                context, collective_ids.pop(), total_size, local_count
+            (
+                total_size,
+                global_chunk_count,
+                global_chunks_sampled,
+            ) = await allgather_reduce(
+                context, collective_ids.pop(), total_size, local_count, chunks_sampled
             )
         else:
-            global_size = total_size
             global_chunk_count = local_count
+            global_chunks_sampled = chunks_sampled
+
+        if global_chunks_sampled > 0:
+            global_size = (total_size // global_chunks_sampled) * global_chunk_count
+        else:
+            global_size = 0
 
         use_tree = global_size < target_partition_size or require_tree
 
