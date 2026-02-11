@@ -54,10 +54,6 @@ if TYPE_CHECKING:
     from cudf_polars.experimental.rapidsmpf.dispatch import SubNetGenerator
     from cudf_polars.experimental.rapidsmpf.tracing import ActorTracer
 
-# ============================================================================
-# Decomposed GroupBy State
-# ============================================================================
-
 
 @dataclass
 class DecomposedGroupBy:
@@ -133,11 +129,6 @@ class DecomposedGroupBy:
         )
 
 
-# ============================================================================
-# GroupBy Strategies
-# ============================================================================
-
-
 async def _tree_groupby(
     context: Context,
     decomposed: DecomposedGroupBy,
@@ -175,20 +166,11 @@ async def _tree_groupby(
 
     # Apply piecewise to remaining chunks from input channel
     while (msg := await ch_in.recv(context)) is not None:
-        chunk = TableChunk.from_message(msg)
-        del msg
-        chunk, extra = await make_table_chunks_available_or_wait(
-            context,
-            chunk,
-            reserve_extra=chunk.data_alloc_size(),
-            net_memory_delta=0,
+        pwise_chunk = await evaluate_chunk(
+            context, TableChunk.from_message(msg), decomposed.piecewise_ir, ir_context
         )
-        with opaque_memory_usage(extra):
-            pwise_chunk = await asyncio.to_thread(
-                evaluate_chunk, chunk, decomposed.piecewise_ir, ir_context
-            )
-            pwise_chunks.append(pwise_chunk)
-            del chunk
+        del msg
+        pwise_chunks.append(pwise_chunk)
 
     # Tree reduction
     # After first reduction pass, chunks are in reduction_ir schema (not piecewise_ir)
@@ -338,25 +320,12 @@ async def _tree_groupby(
 
     # Apply final selection and send
     if pwise_chunks:
-        chunk = pwise_chunks[0]
-        chunk, extra = await make_table_chunks_available_or_wait(
-            context,
-            chunk,
-            reserve_extra=chunk.data_alloc_size(),
-            net_memory_delta=0,
+        chunk = await evaluate_chunk(
+            context, pwise_chunks[0], decomposed.select_ir, ir_context
         )
-        with opaque_memory_usage(extra):
-            chunk = await asyncio.to_thread(
-                evaluate_chunk,
-                chunk,
-                decomposed.select_ir,
-                ir_context,
-                input_schema=decomposed.reduction_ir.schema,
-            )
         if tracer is not None:
             tracer.add_chunk(table=chunk.table_view())
         await ch_out.send(context, Message(0, chunk))
-        del chunk
     else:
         # No data - send empty chunk
         from cudf_polars.experimental.rapidsmpf.utils import empty_table_chunk
@@ -411,66 +380,34 @@ async def _shuffle_groupby(
 
     # Process remaining chunks (need piecewise applied)
     while (msg := await ch_in.recv(context)) is not None:
-        chunk = TableChunk.from_message(msg)
-        del msg
-        chunk, extra = await make_table_chunks_available_or_wait(
-            context,
-            chunk,
-            reserve_extra=chunk.data_alloc_size(),
-            net_memory_delta=0,
+        pwise_chunk = await evaluate_chunk(
+            context, TableChunk.from_message(msg), decomposed.piecewise_ir, ir_context
         )
-        with opaque_memory_usage(extra):
-            pwise_chunk = await asyncio.to_thread(
-                evaluate_chunk, chunk, decomposed.piecewise_ir, ir_context
-            )
-            shuffle.insert_chunk(pwise_chunk)
-            del pwise_chunk, chunk
+        del msg
+        shuffle.insert_chunk(pwise_chunk)
 
     await shuffle.insert_finished()
 
     # Extract shuffled partitions and apply reduction + selection
     for partition_id in range(context.comm().rank, output_count, nranks):
         stream = ir_context.get_cuda_stream()
-        chunk = TableChunk.from_pylibcudf_table(
+        partition_chunk = TableChunk.from_pylibcudf_table(
             await shuffle.extract_chunk(partition_id, stream),
             stream,
             exclusive_view=True,
         )
-
-        # Reserve extra for groupby working memory (input + output)
-        chunk, extra = await make_table_chunks_available_or_wait(
+        chunk = await evaluate_chunk(
             context,
-            chunk,
-            reserve_extra=chunk.data_alloc_size(),
-            net_memory_delta=0,
+            partition_chunk,
+            [decomposed.reduction_ir, decomposed.select_ir],
+            ir_context,
         )
-        with opaque_memory_usage(extra):
-            # Apply reduction
-            chunk = await asyncio.to_thread(
-                evaluate_chunk,
-                chunk,
-                decomposed.reduction_ir,
-                ir_context,
-            )
-            # Apply selection
-            chunk = await asyncio.to_thread(
-                evaluate_chunk,
-                chunk,
-                decomposed.select_ir,
-                ir_context,
-                input_schema=decomposed.reduction_ir.schema,
-            )
+        del partition_chunk
         if tracer is not None:
             tracer.add_chunk(table=chunk.table_view())
         await ch_out.send(context, Message(partition_id, chunk))
-        del chunk
 
     await ch_out.drain(context)
-
-
-# ============================================================================
-# Main GroupBy Node
-# ============================================================================
 
 
 @define_py_node()
@@ -554,22 +491,15 @@ async def groupby_node(
             msg = await ch_in.recv(context)
             if msg is None:
                 break
-            chunk = TableChunk.from_message(msg)
-            del msg
-
-            chunk, extra = await make_table_chunks_available_or_wait(
+            pwise_chunk = await evaluate_chunk(
                 context,
-                chunk,
-                reserve_extra=chunk.data_alloc_size(),
-                net_memory_delta=0,
+                TableChunk.from_message(msg),
+                decomposed.piecewise_ir,
+                ir_context,
             )
-            with opaque_memory_usage(extra):
-                pwise_chunk = await asyncio.to_thread(
-                    evaluate_chunk, chunk, decomposed.piecewise_ir, ir_context
-                )
-                total_pwise_size += pwise_chunk.data_alloc_size(MemoryType.DEVICE)
-                initial_chunks.append(pwise_chunk)
-                del chunk
+            del msg
+            total_pwise_size += pwise_chunk.data_alloc_size(MemoryType.DEVICE)
+            initial_chunks.append(pwise_chunk)
 
         # Estimate total size: avg_sample_size * local_count, summed across ranks
         local_count = metadata_in.local_count

@@ -4,13 +4,11 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING, Any
 
 from rapidsmpf.communicator.single import new_communicator as single_comm
 from rapidsmpf.config import Options, get_environment_variables
 from rapidsmpf.memory.buffer import MemoryType
-from rapidsmpf.memory.memory_reservation import opaque_memory_usage
 from rapidsmpf.streaming.core.context import Context
 from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.core.node import define_py_node
@@ -19,14 +17,10 @@ from rapidsmpf.streaming.cudf.channel_metadata import (
     HashScheme,
     Partitioning,
 )
-from rapidsmpf.streaming.cudf.table_chunk import (
-    TableChunk,
-    make_table_chunks_available_or_wait,
-)
+from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
 import pylibcudf as plc
 
-from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IR, Distinct
 from cudf_polars.experimental.rapidsmpf.collectives.allgather import AllGatherManager
 from cudf_polars.experimental.rapidsmpf.collectives.shuffle import ShuffleManager
@@ -36,6 +30,7 @@ from cudf_polars.experimental.rapidsmpf.utils import (
     allgather_reduce,
     chunkwise_evaluate,
     empty_table_chunk,
+    evaluate_batch,
     evaluate_chunk,
     is_partitioned_on_keys,
     process_children,
@@ -44,7 +39,6 @@ from cudf_polars.experimental.rapidsmpf.utils import (
     shutdown_on_error,
 )
 from cudf_polars.experimental.repartition import Repartition
-from cudf_polars.experimental.utils import _concat
 from cudf_polars.utils.config import StreamingExecutor
 
 if TYPE_CHECKING:
@@ -52,11 +46,6 @@ if TYPE_CHECKING:
 
     from cudf_polars.experimental.rapidsmpf.dispatch import SubNetGenerator
     from cudf_polars.experimental.rapidsmpf.tracing import ActorTracer
-
-
-# ============================================================================
-# Distinct Strategies
-# ============================================================================
 
 
 async def _tree_distinct(
@@ -113,116 +102,41 @@ async def _tree_distinct(
     )
     await send_metadata(ch_out, context, metadata_out)
 
-    # Collect all chunks, applying local distinct
     distinct_chunks: list[TableChunk] = list(initial_chunks)
 
-    # Apply distinct to remaining chunks from input channel
     while (msg := await ch_in.recv(context)) is not None:
-        chunk = TableChunk.from_message(msg)
-        del msg
-        chunk, extra = await make_table_chunks_available_or_wait(
-            context,
-            chunk,
-            reserve_extra=chunk.data_alloc_size(),
-            net_memory_delta=0,
+        distinct_chunks.append(
+            await evaluate_chunk(context, TableChunk.from_message(msg), ir, ir_context)
         )
-        with opaque_memory_usage(extra):
-            distinct_chunk = await asyncio.to_thread(
-                evaluate_chunk, chunk, ir, ir_context
-            )
-            distinct_chunks.append(distinct_chunk)
-            del chunk
+        del msg
 
-    # Tree reduction
-    k = n_ary
-    input_schema = ir.children[0].schema
     while len(distinct_chunks) > 1:
         new_chunks: list[TableChunk] = []
-        for i in range(0, len(distinct_chunks), k):
-            batch = distinct_chunks[i : i + k]
+        for i in range(0, len(distinct_chunks), n_ary):
+            batch = distinct_chunks[i : i + n_ary]
             if len(batch) == 1:
                 new_chunks.append(batch[0])
             else:
-                batch, extra = await make_table_chunks_available_or_wait(
-                    context,
-                    batch,
-                    reserve_extra=sum(c.data_alloc_size() for c in batch),
-                    net_memory_delta=0,
-                )
-                with opaque_memory_usage(extra):
-                    concatenated = await asyncio.to_thread(
-                        _concat,
-                        *[
-                            DataFrame.from_table(
-                                c.table_view(),
-                                list(input_schema.keys()),
-                                list(input_schema.values()),
-                                c.stream,
-                            )
-                            for c in batch
-                        ],
-                        context=ir_context,
-                    )
-                    df = await asyncio.to_thread(
-                        ir.do_evaluate,
-                        *ir._non_child_args,
-                        concatenated,
-                        context=ir_context,
-                    )
-                    del concatenated
-                    new_chunks.append(
-                        TableChunk.from_pylibcudf_table(
-                            df.table, df.stream, exclusive_view=True
-                        )
-                    )
-                    del df
+                new_chunks.append(await evaluate_batch(batch, context, ir, ir_context))
         distinct_chunks = new_chunks
 
-    # Allgather partial results from all ranks if needed
     if collective_id is not None:
         allgather = AllGatherManager(context, collective_id)
         stream = ir_context.get_cuda_stream()
 
-        # Insert the local distinct result (or empty if no local data)
         if distinct_chunks:
-            chunk = distinct_chunks[0]
-            allgather.insert(0, chunk)
-        # else: No local data - don't insert anything into allgather
-        # Empty table chunks can have schema mismatches (e.g., STRING columns
-        # with 0 children vs 1 child), so we skip them entirely
+            allgather.insert(0, distinct_chunks[0])
         allgather.insert_finished()
 
-        # Extract concatenated results from all ranks
-        gathered_table = await allgather.extract_concatenated(stream)
-        distinct_chunks = [
-            TableChunk.from_pylibcudf_table(gathered_table, stream, exclusive_view=True)
-        ]
-
-        # One more distinct round to merge results from all ranks
-        chunk = distinct_chunks[0]
-        chunk, extra = await make_table_chunks_available_or_wait(
-            context,
-            chunk,
-            reserve_extra=chunk.data_alloc_size(),
-            net_memory_delta=0,
+        gathered_chunk = TableChunk.from_pylibcudf_table(
+            await allgather.extract_concatenated(stream),
+            stream,
+            exclusive_view=True,
         )
-        with opaque_memory_usage(extra):
-            df = await asyncio.to_thread(
-                ir.do_evaluate,
-                *ir._non_child_args,
-                DataFrame.from_table(
-                    chunk.table_view(),
-                    list(input_schema.keys()),
-                    list(input_schema.values()),
-                    chunk.stream,
-                ),
-                context=ir_context,
-            )
-            output_chunk = TableChunk.from_pylibcudf_table(
-                df.table, df.stream, exclusive_view=True
-            )
-            del df, chunk
-        distinct_chunks = [output_chunk]
+        distinct_chunks = [
+            await evaluate_chunk(context, gathered_chunk, ir, ir_context)
+        ]
+        del gathered_chunk
 
     # Send final result
     if distinct_chunks:
@@ -338,8 +252,6 @@ async def _shuffle_distinct(
 
     await shuffle.insert_finished()
 
-    # Extract shuffled partitions and apply local distinct
-    input_schema = ir.children[0].schema
     stream = ir_context.get_cuda_stream()
     for seq_num, partition_id in enumerate(range(shuf_rank, output_count, shuf_nranks)):
         partition_chunk = TableChunk.from_pylibcudf_table(
@@ -347,40 +259,13 @@ async def _shuffle_distinct(
             stream,
             exclusive_view=True,
         )
-
-        partition_chunk, extra = await make_table_chunks_available_or_wait(
-            context,
-            partition_chunk,
-            reserve_extra=partition_chunk.data_alloc_size(),
-            net_memory_delta=0,
-        )
-        with opaque_memory_usage(extra):
-            df = await asyncio.to_thread(
-                ir.do_evaluate,
-                *ir._non_child_args,
-                DataFrame.from_table(
-                    partition_chunk.table_view(),
-                    list(input_schema.keys()),
-                    list(input_schema.values()),
-                    partition_chunk.stream,
-                ),
-                context=ir_context,
-            )
-            output_chunk = TableChunk.from_pylibcudf_table(
-                df.table, df.stream, exclusive_view=True
-            )
-            if tracer is not None:
-                tracer.add_chunk(table=output_chunk.table_view())
-            del df, partition_chunk
-
+        output_chunk = await evaluate_chunk(context, partition_chunk, ir, ir_context)
+        del partition_chunk
+        if tracer is not None:
+            tracer.add_chunk(table=output_chunk.table_view())
         await ch_out.send(context, Message(seq_num, output_chunk))
 
     await ch_out.drain(context)
-
-
-# ============================================================================
-# Dynamic Distinct Node
-# ============================================================================
 
 
 @define_py_node()
@@ -488,22 +373,12 @@ async def distinct_node(
             msg = await ch_in.recv(context)
             if msg is None:
                 break
-            chunk = TableChunk.from_message(msg)
-            del msg
-
-            chunk, extra = await make_table_chunks_available_or_wait(
-                context,
-                chunk,
-                reserve_extra=chunk.data_alloc_size(),
-                net_memory_delta=0,
+            distinct_chunk = await evaluate_chunk(
+                context, TableChunk.from_message(msg), ir, ir_context
             )
-            with opaque_memory_usage(extra):
-                distinct_chunk = await asyncio.to_thread(
-                    evaluate_chunk, chunk, ir, ir_context
-                )
-                total_distinct_size += distinct_chunk.data_alloc_size(MemoryType.DEVICE)
-                initial_chunks.append(distinct_chunk)
-                del chunk
+            del msg
+            total_distinct_size += distinct_chunk.data_alloc_size(MemoryType.DEVICE)
+            initial_chunks.append(distinct_chunk)
 
         # Estimate total size: avg_sample_size * local_count, summed across ranks
         local_count = metadata_in.local_count
