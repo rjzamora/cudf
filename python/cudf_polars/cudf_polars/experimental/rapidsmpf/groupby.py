@@ -91,10 +91,13 @@ class DecomposedGroupBy:
             NamedExpr(k.name, Col(k.value.dtype, k.name)) for k in ir.keys
         )
 
-        # Reduction groupby schema and IR
+        # Reduction groupby schema and IR (must match pwise_schema for tree reduction)
         reduction_schema = {k.name: k.value.dtype for k in grouped_keys} | {
             k.name: k.value.dtype for k in reduction_exprs
         }
+        assert pwise_schema == reduction_schema, (
+            "piecewise and reduction schemas must match for tree reduction"
+        )
         reduction_ir = GroupBy(
             reduction_schema,
             grouped_keys,
@@ -132,18 +135,46 @@ async def _tree_groupby(
     ch_out: Channel[TableChunk],
     ch_in: Channel[TableChunk],
     metadata_in: ChannelMetadata,
-    groupby_n_ary: int,
+    target_partition_size: int,
     *,
     evaluated_chunks: list[TableChunk] | None = None,
     collective_id: int | None = None,
+    reduction_ran: bool = False,
     tracer: ActorTracer | None = None,
 ) -> None:
     """
-    Execute groupby using N-ary tree reduction to single output.
+    Execute groupby using tree reduction to single output.
 
+    Reads chunks, applies piecewise aggregation, and reduces incrementally.
     When collective_id is provided and data is not duplicated, uses allgather
     to collect partial results from all ranks before final reduction.
+
+    Parameters
+    ----------
+    context
+        The rapidsmpf streaming context.
+    decomposed
+        The decomposed groupby containing piecewise, reduction, and select IRs.
+    ir_context
+        The IR execution context.
+    ch_out
+        The output channel.
+    ch_in
+        The input channel.
+    metadata_in
+        The input channel metadata.
+    target_partition_size
+        Target size in bytes for output partitions.
+    evaluated_chunks
+        Chunks that have already been evaluated (e.g., during sampling).
+    collective_id
+        Optional collective ID for allgather. If None, no allgather is performed.
+    reduction_ran
+        Whether evaluated_chunks have already been through reduction_ir.
+    tracer
+        Optional tracer for runtime metrics.
     """
+    tree_reduction_ran = reduction_ran
     nranks = context.comm().nranks
     need_allgather = (
         collective_id is not None and not metadata_in.duplicated and nranks > 1
@@ -157,30 +188,34 @@ async def _tree_groupby(
     await send_metadata(ch_out, context, metadata_out)
 
     pwise_chunks: list[TableChunk] = list(evaluated_chunks or [])
+    total_size = sum(c.data_alloc_size() for c in pwise_chunks)
 
-    # Apply piecewise to remaining chunks from input channel
-    while (msg := await ch_in.recv(context)) is not None:
-        pwise_chunk = await evaluate_chunk(
-            context, TableChunk.from_message(msg), decomposed.piecewise_ir, ir_context
-        )
-        del msg
-        pwise_chunks.append(pwise_chunk)
-
-    tree_reduction_ran = False
-    while len(pwise_chunks) > 1:
-        new_chunks: list[TableChunk] = []
-        for i in range(0, len(pwise_chunks), groupby_n_ary):
-            batch = pwise_chunks[i : i + groupby_n_ary]
-            if len(batch) == 1:
-                new_chunks.append(batch[0])
+    receiving = True
+    while receiving or len(pwise_chunks) > 1:
+        if receiving:
+            msg = await ch_in.recv(context)
+            if msg is None:
+                receiving = False
             else:
-                new_chunks.append(
-                    await evaluate_batch(
-                        batch, context, decomposed.reduction_ir, ir_context
-                    )
+                chunk = await evaluate_chunk(
+                    context,
+                    TableChunk.from_message(msg),
+                    decomposed.piecewise_ir,
+                    ir_context,
                 )
-        pwise_chunks = new_chunks
-        tree_reduction_ran = True
+                del msg
+                pwise_chunks.append(chunk)
+                total_size += chunk.data_alloc_size()
+
+        if len(pwise_chunks) > 1 and (
+            not receiving or total_size > target_partition_size
+        ):
+            merged = await evaluate_batch(
+                pwise_chunks, context, decomposed.reduction_ir, ir_context
+            )
+            pwise_chunks = [merged]
+            total_size = merged.data_alloc_size()
+            tree_reduction_ran = True
 
     chunk_schema = (
         decomposed.reduction_ir.schema
@@ -403,38 +438,43 @@ async def groupby_node(
         require_tree = ir.maintain_order
 
         evaluated_chunks: list[TableChunk] = []
-        total_pwise_size = 0
+        total_size = 0
+        merge_count = 0
+
         for _ in range(sample_chunk_count):
             msg = await ch_in.recv(context)
             if msg is None:
                 break
-            pwise_chunk = await evaluate_chunk(
+            chunk = await evaluate_chunk(
                 context,
                 TableChunk.from_message(msg),
                 decomposed.piecewise_ir,
                 ir_context,
             )
             del msg
-            total_pwise_size += pwise_chunk.data_alloc_size(MemoryType.DEVICE)
-            evaluated_chunks.append(pwise_chunk)
+            total_size += chunk.data_alloc_size(MemoryType.DEVICE)
+            evaluated_chunks.append(chunk)
+
+            if total_size > target_partition_size and len(evaluated_chunks) > 1:
+                merged = await evaluate_batch(
+                    evaluated_chunks, context, decomposed.reduction_ir, ir_context
+                )
+                total_size = merged.data_alloc_size(MemoryType.DEVICE)
+                evaluated_chunks = [merged]
+                merge_count += 1
+                if total_size > target_partition_size:
+                    break
 
         local_count = metadata_in.local_count
-        if evaluated_chunks and total_pwise_size > 0:
-            avg_sample_size = total_pwise_size / len(evaluated_chunks)
-            local_estimate = int(avg_sample_size * local_count)
-            chunks_per_partition = max(1, target_partition_size // avg_sample_size)
-            adaptive_n_ary = max(2, min(256, int(chunks_per_partition)))
-        else:
-            local_estimate = 0
-            adaptive_n_ary = 32  # Reasonable default
-
         if collective_ids and nranks > 1:
-            estimated_total_size, global_chunk_count = await allgather_reduce(
-                context, collective_ids.pop(), local_estimate, local_count
+            global_size, global_chunk_count = await allgather_reduce(
+                context, collective_ids.pop(), total_size, local_count
             )
         else:
-            estimated_total_size = local_estimate
+            global_size = total_size
             global_chunk_count = local_count
+
+        use_tree = global_size < target_partition_size or require_tree
 
         if already_partitioned_inter_rank:
             if tracer is not None:
@@ -446,12 +486,13 @@ async def groupby_node(
                 ch_out,
                 ch_in,
                 metadata_in,
-                adaptive_n_ary,
+                target_partition_size,
                 evaluated_chunks=evaluated_chunks,
+                reduction_ran=merge_count > 0,
                 tracer=tracer,
             )
         elif can_skip_global_comm:
-            if estimated_total_size < target_partition_size or require_tree:
+            if use_tree:
                 if tracer is not None:
                     tracer.decision = "tree_local"
                 await _tree_groupby(
@@ -461,14 +502,15 @@ async def groupby_node(
                     ch_out,
                     ch_in,
                     metadata_in,
-                    adaptive_n_ary,
+                    target_partition_size,
                     evaluated_chunks=evaluated_chunks,
+                    reduction_ran=merge_count > 0,
                     tracer=tracer,
                 )
             else:
                 if tracer is not None:
                     tracer.decision = "shuffle_local"
-                ideal_count = max(1, local_estimate // target_partition_size)
+                ideal_count = max(1, global_size // target_partition_size)
                 output_count = max(1, min(ideal_count, local_count))
                 await _shuffle_groupby(
                     context,
@@ -483,7 +525,7 @@ async def groupby_node(
                     evaluated_chunks=evaluated_chunks,
                     tracer=tracer,
                 )
-        elif estimated_total_size < target_partition_size or require_tree:
+        elif use_tree:
             if tracer is not None:
                 tracer.decision = "tree_allgather"
             await _tree_groupby(
@@ -493,9 +535,10 @@ async def groupby_node(
                 ch_out,
                 ch_in,
                 metadata_in,
-                adaptive_n_ary,
+                target_partition_size,
                 evaluated_chunks=evaluated_chunks,
                 collective_id=collective_ids.pop() if collective_ids else None,
+                reduction_ran=merge_count > 0,
                 tracer=tracer,
             )
         elif not collective_ids:
@@ -508,15 +551,16 @@ async def groupby_node(
                 ch_out,
                 ch_in,
                 metadata_in,
-                adaptive_n_ary,
+                target_partition_size,
                 evaluated_chunks=evaluated_chunks,
+                reduction_ran=merge_count > 0,
                 tracer=tracer,
             )
         else:
-            ideal_count = max(1, estimated_total_size // target_partition_size)
-            output_count = max(nranks, min(ideal_count, global_chunk_count))
             if tracer is not None:
                 tracer.decision = "shuffle"
+            ideal_count = max(1, global_size // target_partition_size)
+            output_count = max(nranks, min(ideal_count, global_chunk_count))
             await _shuffle_groupby(
                 context,
                 decomposed,

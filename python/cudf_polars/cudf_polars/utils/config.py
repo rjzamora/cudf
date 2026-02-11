@@ -475,7 +475,7 @@ class DynamicPlanningOptions:
         to shuffle for distinct operations. Default is 32.
     sample_chunk_count_groupby
         The maximum number of chunks to sample before deciding whether
-        to shuffle for groupby operations. Default is 1.
+        to shuffle for groupby operations. Default is 32.
     """
 
     _env_prefix = "CUDF_POLARS__EXECUTOR__DYNAMIC_PLANNING"
@@ -492,7 +492,7 @@ class DynamicPlanningOptions:
     )
     sample_chunk_count_groupby: int = dataclasses.field(
         default_factory=_make_default_factory(
-            f"{_env_prefix}__SAMPLE_CHUNK_COUNT_GROUPBY", int, default=1
+            f"{_env_prefix}__SAMPLE_CHUNK_COUNT_GROUPBY", int, default=32
         )
     )
 

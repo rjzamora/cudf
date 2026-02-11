@@ -55,21 +55,41 @@ async def _tree_distinct(
     ch_out: Channel[TableChunk],
     ch_in: Channel[TableChunk],
     metadata_in: ChannelMetadata,
+    target_partition_size: int,
     *,
     evaluated_chunks: list[TableChunk] | None = None,
     collective_id: int | None = None,
-    n_ary: int = 32,
     tracer: ActorTracer | None = None,
 ) -> None:
     """
     Tree-based distinct reduction.
 
-    Collects all chunks, applies local distinct, then performs k-ary tree
-    reduction by concatenating and re-applying distinct until a single
-    chunk remains.
-
+    Reads chunks from input, applies distinct, and reduces incrementally.
     When collective_id is provided, uses allgather to collect partial
     results from all ranks before final distinct.
+
+    Parameters
+    ----------
+    context
+        The rapidsmpf streaming context.
+    ir
+        The Distinct IR node.
+    ir_context
+        The IR execution context.
+    ch_out
+        The output channel.
+    ch_in
+        The input channel.
+    metadata_in
+        The input channel metadata.
+    target_partition_size
+        Target size in bytes for output partitions.
+    evaluated_chunks
+        Chunks that have already been evaluated (e.g., during sampling).
+    collective_id
+        Optional collective ID for allgather. If None, no allgather is performed.
+    tracer
+        Optional tracer for runtime metrics.
     """
     metadata_out = ChannelMetadata(
         local_count=1,
@@ -79,22 +99,28 @@ async def _tree_distinct(
     await send_metadata(ch_out, context, metadata_out)
 
     distinct_chunks: list[TableChunk] = list(evaluated_chunks or [])
+    total_size = sum(c.data_alloc_size() for c in distinct_chunks)
 
-    while (msg := await ch_in.recv(context)) is not None:
-        distinct_chunks.append(
-            await evaluate_chunk(context, TableChunk.from_message(msg), ir, ir_context)
-        )
-        del msg
-
-    while len(distinct_chunks) > 1:
-        new_chunks: list[TableChunk] = []
-        for i in range(0, len(distinct_chunks), n_ary):
-            batch = distinct_chunks[i : i + n_ary]
-            if len(batch) == 1:
-                new_chunks.append(batch[0])
+    receiving = True
+    while receiving or len(distinct_chunks) > 1:
+        if receiving:
+            msg = await ch_in.recv(context)
+            if msg is None:
+                receiving = False
             else:
-                new_chunks.append(await evaluate_batch(batch, context, ir, ir_context))
-        distinct_chunks = new_chunks
+                chunk = await evaluate_chunk(
+                    context, TableChunk.from_message(msg), ir, ir_context
+                )
+                del msg
+                distinct_chunks.append(chunk)
+                total_size += chunk.data_alloc_size()
+
+        if len(distinct_chunks) > 1 and (
+            not receiving or total_size > target_partition_size
+        ):
+            merged = await evaluate_batch(distinct_chunks, context, ir, ir_context)
+            distinct_chunks = [merged]
+            total_size = merged.data_alloc_size()
 
     if collective_id is not None:
         allgather = AllGatherManager(context, collective_id)
@@ -347,7 +373,6 @@ async def distinct_node(
 
         evaluated_chunks: list[TableChunk] = []
         total_size = 0
-        chunks_processed = 0
         merge_count = 0
 
         for _ in range(sample_chunk_count):
@@ -360,7 +385,6 @@ async def distinct_node(
             del msg
             total_size += chunk.data_alloc_size(MemoryType.DEVICE)
             evaluated_chunks.append(chunk)
-            chunks_processed += 1
 
             if total_size > target_partition_size and len(evaluated_chunks) > 1:
                 merged = await evaluate_batch(evaluated_chunks, context, ir, ir_context)
@@ -369,13 +393,6 @@ async def distinct_node(
                 merge_count += 1
                 if total_size > target_partition_size:
                     break
-
-        if merge_count > 0:
-            adaptive_n_ary = max(2, chunks_processed // (merge_count + 1))
-        elif total_size > 0:
-            adaptive_n_ary = max(2, min(256, target_partition_size // total_size))
-        else:
-            adaptive_n_ary = 32
 
         local_count = metadata_in.local_count
         if can_skip_global_comm:
@@ -405,8 +422,8 @@ async def distinct_node(
                     ch_out,
                     ch_in,
                     metadata_in,
+                    target_partition_size,
                     evaluated_chunks=evaluated_chunks,
-                    n_ary=adaptive_n_ary,
                     tracer=tracer,
                 )
             else:
@@ -438,9 +455,9 @@ async def distinct_node(
                 ch_out,
                 ch_in,
                 metadata_in,
+                target_partition_size,
                 evaluated_chunks=evaluated_chunks,
                 collective_id=collective_ids.pop(),
-                n_ary=adaptive_n_ary,
                 tracer=tracer,
             )
         else:
