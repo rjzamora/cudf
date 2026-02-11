@@ -403,10 +403,6 @@ async def distinct_node(
                 estimated_total_size = min(estimated_total_size, max_zlice_size)
                 local_estimate = min(local_estimate, max_zlice_size)
 
-        # =====================================================================
-        # Strategy Selection
-        # =====================================================================
-
         # Check for ordering requirements (shuffle strategies are not stable)
         require_tree = ir.stable or ir.keep in (
             plc.stream_compaction.DuplicateKeepOption.KEEP_FIRST,
@@ -483,11 +479,6 @@ async def distinct_node(
                 shuffle_context=context,
                 tracer=tracer,
             )
-
-
-# ============================================================================
-# Network Generation
-# ============================================================================
 
 
 @generate_ir_sub_network.register(Distinct)

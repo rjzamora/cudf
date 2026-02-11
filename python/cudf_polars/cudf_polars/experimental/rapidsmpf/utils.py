@@ -363,6 +363,54 @@ async def evaluate_chunk(
         return chunk
 
 
+async def concat_batch(
+    batch: list[TableChunk],
+    context: Context,
+    schema: Mapping[str, DataType],
+    ir_context: Any,
+) -> TableChunk:
+    """
+    Concatenate a list of table chunks.
+
+    Parameters
+    ----------
+    batch
+        The list of table chunks to concatenate.
+    context
+        The rapidsmpf context.
+    schema
+        The schema of the table chunks.
+    ir_context
+        The IR execution context.
+
+    Returns
+    -------
+    The table chunk after concatenation.
+    """
+    batch, extra = await make_table_chunks_available_or_wait(
+        context,
+        batch,
+        reserve_extra=sum(c.data_alloc_size() for c in batch),
+        net_memory_delta=0,
+    )
+    with opaque_memory_usage(extra):
+        df = await asyncio.to_thread(
+            _concat,
+            *[
+                DataFrame.from_table(
+                    c.table_view(),
+                    list(schema.keys()),
+                    list(schema.values()),
+                    c.stream,
+                )
+                for c in batch
+            ],
+            context=ir_context,
+        )
+        del batch
+    return TableChunk.from_pylibcudf_table(df.table, df.stream, exclusive_view=True)
+
+
 async def evaluate_batch(
     batch: list[TableChunk],
     context: Context,
@@ -391,40 +439,9 @@ async def evaluate_batch(
     irs = ir if isinstance(ir, list) else [ir]
     first_ir = irs[0]
     input_schema = first_ir.children[0].schema
-    batch, extra = await make_table_chunks_available_or_wait(
-        context,
-        batch,
-        reserve_extra=sum(c.data_alloc_size() for c in batch),
-        net_memory_delta=0,
-    )
-    with opaque_memory_usage(extra):
-        df = await asyncio.to_thread(
-            first_ir.do_evaluate,
-            *first_ir._non_child_args,
-            await asyncio.to_thread(
-                _concat,
-                *[
-                    DataFrame.from_table(
-                        c.table_view(),
-                        list(input_schema.keys()),
-                        list(input_schema.values()),
-                        c.stream,
-                    )
-                    for c in batch
-                ],
-                context=ir_context,
-            ),
-            context=ir_context,
-        )
-        del batch
-        chunk = TableChunk.from_pylibcudf_table(
-            df.table, df.stream, exclusive_view=True
-        )
-        for remaining_ir in irs[1:]:
-            chunk = await asyncio.to_thread(
-                _evaluate_chunk_sync, chunk, remaining_ir, ir_context
-            )
-        return chunk
+    chunk = await concat_batch(batch, context, input_schema, ir_context)
+    del batch
+    return await evaluate_chunk(context, chunk, irs, ir_context)
 
 
 async def chunkwise_evaluate(
