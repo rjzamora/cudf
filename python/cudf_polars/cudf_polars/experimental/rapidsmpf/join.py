@@ -1224,7 +1224,7 @@ def _(
                 channels[ir].reserve_input_slot(),
                 channels[left].reserve_output_slot(),
                 channels[right].reserve_output_slot(),
-                executor.dynamic_planning.sample_chunk_count,
+                executor.dynamic_planning.sample_chunk_count_join,
                 broadcast_threshold,
                 executor.target_partition_size,
                 collective_ids,

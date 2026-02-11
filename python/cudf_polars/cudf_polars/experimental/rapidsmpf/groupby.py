@@ -565,7 +565,7 @@ def _(
             rec.state["ir_context"],
             channels[ir].reserve_input_slot(),
             channels[ir.children[0]].reserve_output_slot(),
-            dynamic_planning.sample_chunk_count,
+            dynamic_planning.sample_chunk_count_groupby,
             config_options.executor.target_partition_size,
             collective_ids,
         )
