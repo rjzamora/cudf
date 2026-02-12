@@ -470,12 +470,10 @@ class DynamicPlanningOptions:
     sample_chunk_count_join
         The maximum number of chunks to sample before deciding whether
         to shuffle for join operations. Default is 1.
-    sample_chunk_count_distinct
+    sample_chunk_count_reduce
         The maximum number of chunks to sample before deciding whether
-        to shuffle for distinct operations. Default is 32.
-    sample_chunk_count_groupby
-        The maximum number of chunks to sample before deciding whether
-        to shuffle for groupby operations. Default is 32.
+        to shuffle for keyed reduction operations (e.g. GroupBy, Distinct).
+        Default is 32.
     """
 
     _env_prefix = "CUDF_POLARS__EXECUTOR__DYNAMIC_PLANNING"
@@ -485,22 +483,16 @@ class DynamicPlanningOptions:
             f"{_env_prefix}__SAMPLE_CHUNK_COUNT_JOIN", int, default=1
         )
     )
-    sample_chunk_count_distinct: int = dataclasses.field(
+    sample_chunk_count_reduce: int = dataclasses.field(
         default_factory=_make_default_factory(
-            f"{_env_prefix}__SAMPLE_CHUNK_COUNT_DISTINCT", int, default=32
-        )
-    )
-    sample_chunk_count_groupby: int = dataclasses.field(
-        default_factory=_make_default_factory(
-            f"{_env_prefix}__SAMPLE_CHUNK_COUNT_GROUPBY", int, default=32
+            f"{_env_prefix}__SAMPLE_CHUNK_COUNT_REDUCE", int, default=32
         )
     )
 
     def __post_init__(self) -> None:  # noqa: D105
         for name in (
             "sample_chunk_count_join",
-            "sample_chunk_count_distinct",
-            "sample_chunk_count_groupby",
+            "sample_chunk_count_reduce",
         ):
             val = getattr(self, name)
             if not isinstance(val, int):

@@ -901,12 +901,12 @@ def test_validate_stats_planning(option: str) -> None:
 
 
 def test_validate_dynamic_planning() -> None:
-    with pytest.raises(TypeError, match="sample_chunk_count_distinct must be"):
+    with pytest.raises(TypeError, match="sample_chunk_count_reduce must be"):
         ConfigOptions.from_polars_engine(
             pl.GPUEngine(
                 executor="streaming",
                 executor_options={
-                    "dynamic_planning": {"sample_chunk_count_distinct": object()}
+                    "dynamic_planning": {"sample_chunk_count_reduce": object()}
                 },
             )
         )
@@ -914,14 +914,12 @@ def test_validate_dynamic_planning() -> None:
 
 def test_dynamic_planning_sample_chunk_count_min() -> None:
     with pytest.raises(
-        ValueError, match="sample_chunk_count_distinct must be at least 1"
+        ValueError, match="sample_chunk_count_reduce must be at least 1"
     ):
         ConfigOptions.from_polars_engine(
             pl.GPUEngine(
                 executor="streaming",
-                executor_options={
-                    "dynamic_planning": {"sample_chunk_count_distinct": 0}
-                },
+                executor_options={"dynamic_planning": {"sample_chunk_count_reduce": 0}},
             )
         )
 
@@ -932,8 +930,7 @@ def test_dynamic_planning_defaults() -> None:
     # Dynamic planning is enabled by default
     assert config.executor.dynamic_planning is not None
     assert config.executor.dynamic_planning.sample_chunk_count_join == 1
-    assert config.executor.dynamic_planning.sample_chunk_count_distinct == 32
-    assert config.executor.dynamic_planning.sample_chunk_count_groupby == 32
+    assert config.executor.dynamic_planning.sample_chunk_count_reduce == 32
 
 
 def test_dynamic_planning_disabled_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -947,14 +944,14 @@ def test_dynamic_planning_disabled_from_env(monkeypatch: pytest.MonkeyPatch) -> 
 def test_dynamic_planning_sample_chunk_count_from_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Test that sample_chunk_count_join can be configured via env var
+    # Test that sample_chunk_count_reduce can be configured via env var
     monkeypatch.setenv(
-        "CUDF_POLARS__EXECUTOR__DYNAMIC_PLANNING__SAMPLE_CHUNK_COUNT_DISTINCT", "3"
+        "CUDF_POLARS__EXECUTOR__DYNAMIC_PLANNING__SAMPLE_CHUNK_COUNT_REDUCE", "3"
     )
     config = ConfigOptions.from_polars_engine(pl.GPUEngine())
     assert config.executor.name == "streaming"
     assert config.executor.dynamic_planning is not None
-    assert config.executor.dynamic_planning.sample_chunk_count_distinct == 3
+    assert config.executor.dynamic_planning.sample_chunk_count_reduce == 3
 
 
 def test_dynamic_planning_from_instance() -> None:
@@ -968,7 +965,7 @@ def test_dynamic_planning_from_instance() -> None:
     )
     assert config.executor.name == "streaming"
     assert config.executor.dynamic_planning is not None
-    assert config.executor.dynamic_planning.sample_chunk_count_distinct == 32  # default
+    assert config.executor.dynamic_planning.sample_chunk_count_reduce == 32  # default
 
 
 def test_parse_memory_resource_config() -> None:
