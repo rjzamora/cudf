@@ -375,15 +375,17 @@ async def _shuffle_groupby(
         )
 
     if shuf_nranks == 1:
+        # Local shuffle
         inter_rank_scheme = metadata_in.partitioning.inter_rank
         local_scheme = HashScheme(column_indices=output_key_indices, modulus=modulus)
         local_output_count = modulus
     else:
+        # Global shuffle
         inter_rank_scheme = HashScheme(
             column_indices=output_key_indices, modulus=modulus
         )
         local_scheme = "inherit"
-        local_output_count = max(1, modulus // shuf_nranks)
+        local_output_count = (modulus - shuf_rank + shuf_nranks - 1) // shuf_nranks
 
     metadata_out = ChannelMetadata(
         local_count=local_output_count,
