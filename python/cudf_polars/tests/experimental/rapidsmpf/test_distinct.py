@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for dynamic Distinct node in rapidsmpf runtime."""
+"""Tests for dynamic Distinct operations using the rapidsmpf runtime."""
 
 from __future__ import annotations
 
