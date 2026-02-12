@@ -366,7 +366,6 @@ async def _shuffle_groupby(
     shuf_nranks = shuffle_context.comm().nranks
     shuf_rank = shuffle_context.comm().rank
 
-    is_local_shuffle = shuf_nranks == 1  # and metadata_in.partitioning is not None
     output_key_indices = _key_indices(decomposed.ir, decomposed.ir.schema)
     if isinstance(decomposed.ir, Distinct):
         shuffle_key_indices = output_key_indices
@@ -375,7 +374,7 @@ async def _shuffle_groupby(
             decomposed.piecewise_ir, decomposed.piecewise_ir.schema
         )
 
-    if is_local_shuffle:
+    if shuf_nranks == 1:
         inter_rank_scheme = metadata_in.partitioning.inter_rank
         local_scheme = HashScheme(column_indices=output_key_indices, modulus=modulus)
         local_output_count = modulus
