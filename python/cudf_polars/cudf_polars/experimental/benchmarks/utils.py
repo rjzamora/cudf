@@ -888,7 +888,7 @@ def parse_args(
     )
     parser.add_argument(
         "--rmm-release-threshold",
-        default=0.5,
+        default=None,
         type=float,
         help=textwrap.dedent("""\
             Passed to dask_cuda.LocalCUDACluster to control the release
