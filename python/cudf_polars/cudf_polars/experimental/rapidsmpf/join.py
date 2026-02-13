@@ -659,9 +659,11 @@ async def _shuffle_join(
     # Insert initial chunks into shufflers or pending queues
     if shuffle_left:
         assert left_shuffle is not None
-        for chunk in left_initial_chunks:
+        while len(left_initial_chunks) > 0:
             left_shuffle.insert_chunk(
-                chunk.make_available_and_spill(context.br(), allow_overbooking=True)
+                left_initial_chunks.pop(0).make_available_and_spill(
+                    context.br(), allow_overbooking=True
+                )
             )
     else:
         left_pending.extend(
@@ -671,9 +673,11 @@ async def _shuffle_join(
 
     if shuffle_right:
         assert right_shuffle is not None
-        for chunk in right_initial_chunks:
+        while len(right_initial_chunks) > 0:
             right_shuffle.insert_chunk(
-                chunk.make_available_and_spill(context.br(), allow_overbooking=True)
+                right_initial_chunks.pop(0).make_available_and_spill(
+                    context.br(), allow_overbooking=True
+                )
             )
     else:
         right_pending.extend(
