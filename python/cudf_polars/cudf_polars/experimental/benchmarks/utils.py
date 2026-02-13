@@ -888,7 +888,7 @@ def parse_args(
     )
     parser.add_argument(
         "--rmm-release-threshold",
-        default=None,
+        default=0.5,
         type=float,
         help=textwrap.dedent("""\
             Passed to dask_cuda.LocalCUDACluster to control the release
@@ -1086,7 +1086,9 @@ def run_polars(
             parquet_options = {}
         engine = pl.GPUEngine(
             raise_on_fail=True,
-            memory_resource=rmm.mr.CudaAsyncMemoryResource()
+            memory_resource=rmm.mr.CudaAsyncMemoryResource(
+                release_threshold=args.rmm_release_threshold
+            )
             if run_config.rmm_async
             else None,
             cuda_stream_policy=run_config.stream_policy,

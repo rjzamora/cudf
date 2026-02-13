@@ -349,8 +349,8 @@ async def _broadcast_join(
     ch_right: Channel[TableChunk],
     left_metadata: ChannelMetadata,
     right_metadata: ChannelMetadata,
-    left_initial_chunks: list[TableChunk],
-    right_initial_chunks: list[TableChunk],
+    left_sample_chunks: list[TableChunk],
+    right_sample_chunks: list[TableChunk],
     broadcast_side: Literal["left", "right"],
     collective_id: int,
     target_partition_size: int,
@@ -368,8 +368,8 @@ async def _broadcast_join(
         small_ch, large_ch = ch_right, ch_left
         small_child, large_child = right, left
         small_metadata, large_metadata = right_metadata, left_metadata
-        small_initial_chunks = right_initial_chunks
-        large_initial_chunks = left_initial_chunks
+        small_initial_chunks = right_sample_chunks
+        large_initial_chunks = left_sample_chunks
         local_count = left_metadata.local_count
         partitioning: Partitioning | None = remap_partitioning(
             left_metadata.partitioning, large_child.schema, ir.schema
@@ -378,8 +378,8 @@ async def _broadcast_join(
         small_ch, large_ch = ch_left, ch_right
         small_child, large_child = left, right
         small_metadata, large_metadata = left_metadata, right_metadata
-        small_initial_chunks = left_initial_chunks
-        large_initial_chunks = right_initial_chunks
+        small_initial_chunks = left_sample_chunks
+        large_initial_chunks = right_sample_chunks
         local_count = right_metadata.local_count
         partitioning = (
             remap_partitioning(
@@ -569,8 +569,8 @@ async def _shuffle_join(
     ch_right: Channel[TableChunk],
     left_metadata: ChannelMetadata,
     right_metadata: ChannelMetadata,
-    left_initial_chunks: list[TableChunk],
-    right_initial_chunks: list[TableChunk],
+    left_sample_chunks: list[TableChunk],
+    right_sample_chunks: list[TableChunk],
     output_count: int,
     left_collective_id: int | None,
     right_collective_id: int | None,
@@ -636,60 +636,32 @@ async def _shuffle_join(
     )
     await send_metadata(ch_out, context, metadata_out)
 
-    # Create shuffle managers only for sides that need shuffling
     left_shuffle: ShuffleManager | None = None
-    right_shuffle: ShuffleManager | None = None
-
     if shuffle_left:
         assert left_collective_id is not None
         left_shuffle = ShuffleManager(
             context, output_count, left_key_indices, left_collective_id
         )
+        while len(left_sample_chunks) > 0:
+            left_shuffle.insert_chunk(
+                left_sample_chunks.pop(0).make_available_and_spill(
+                    context.br(), allow_overbooking=True
+                )
+            )
+
+    right_shuffle: ShuffleManager | None = None
     if shuffle_right:
         assert right_collective_id is not None
         right_shuffle = ShuffleManager(
             context, output_count, right_key_indices, right_collective_id
         )
-
-    # For sides that don't need shuffling, queue initial chunks
-    # (they're already partitioned and arrive in partition order)
-    left_pending: list[TableChunk] = []
-    right_pending: list[TableChunk] = []
-
-    # Insert initial chunks into shufflers or pending queues
-    if shuffle_left:
-        assert left_shuffle is not None
-        while len(left_initial_chunks) > 0:
-            left_shuffle.insert_chunk(
-                left_initial_chunks.pop(0).make_available_and_spill(
-                    context.br(), allow_overbooking=True
-                )
-            )
-    else:
-        left_pending.extend(
-            chunk.make_available_and_spill(context.br(), allow_overbooking=True)
-            for chunk in left_initial_chunks
-        )
-
-    if shuffle_right:
-        assert right_shuffle is not None
-        while len(right_initial_chunks) > 0:
+        while len(right_sample_chunks) > 0:
             right_shuffle.insert_chunk(
-                right_initial_chunks.pop(0).make_available_and_spill(
+                right_sample_chunks.pop(0).make_available_and_spill(
                     context.br(), allow_overbooking=True
                 )
             )
-    else:
-        right_pending.extend(
-            chunk.make_available_and_spill(context.br(), allow_overbooking=True)
-            for chunk in right_initial_chunks
-        )
 
-    # Track channel drain status for non-shuffled sides
-    left_channel_done = shuffle_left  # If shuffled, we drain differently
-    right_channel_done = shuffle_right
-
-    # Drain shuffled sides completely (they need all data before extraction)
     async def drain_shuffled_left() -> None:
         nonlocal left_shuffle
         if shuffle_left:
@@ -718,11 +690,12 @@ async def _shuffle_join(
 
     await asyncio.gather(drain_shuffled_left(), drain_shuffled_right())
 
-    # Helper to get next chunk from non-shuffled side (from pending or channel)
-    async def get_left_chunk() -> TableChunk | None:
-        nonlocal left_channel_done, left_pending
-        if left_pending:
-            return left_pending.pop(0)
+    left_channel_done = shuffle_left
+
+    async def get_left_chunk(left_sample_chunks: list[TableChunk]) -> TableChunk | None:
+        nonlocal left_channel_done
+        if left_sample_chunks:
+            return left_sample_chunks.pop(0)
         if not left_channel_done:
             msg = await ch_left.recv(context)
             if msg is None:
@@ -735,10 +708,14 @@ async def _shuffle_join(
             return chunk
         return None
 
-    async def get_right_chunk() -> TableChunk | None:
-        nonlocal right_channel_done, right_pending
-        if right_pending:
-            return right_pending.pop(0)
+    right_channel_done = shuffle_right
+
+    async def get_right_chunk(
+        right_sample_chunks: list[TableChunk],
+    ) -> TableChunk | None:
+        nonlocal right_channel_done
+        if right_sample_chunks:
+            return right_sample_chunks.pop(0)
         if not right_channel_done:
             msg = await ch_right.recv(context)
             if msg is None:
@@ -761,8 +738,7 @@ async def _shuffle_join(
             assert left_shuffle is not None
             left_table = await left_shuffle.extract_chunk(partition_id, stream)
         else:
-            # Pre-partitioned chunks arrive in partition order
-            chunk = await get_left_chunk()
+            chunk = await get_left_chunk(left_sample_chunks)
             if chunk is not None:
                 left_table = chunk.table_view()
             else:
@@ -773,8 +749,7 @@ async def _shuffle_join(
             assert right_shuffle is not None
             right_table = await right_shuffle.extract_chunk(partition_id, stream)
         else:
-            # Pre-partitioned chunks arrive in partition order
-            chunk = await get_right_chunk()
+            chunk = await get_right_chunk(right_sample_chunks)
             if chunk is not None:
                 right_table = chunk.table_view()
             else:
@@ -815,8 +790,7 @@ async def _shuffle_join(
         )
         del df
 
-    # Explicit cleanup to free memory
-    del left_pending, right_pending, left_shuffle, right_shuffle
+    del left_shuffle, right_shuffle
     await ch_out.drain(context)
 
 
@@ -853,8 +827,8 @@ async def join_node(
         nranks = context.comm().nranks
 
         # Sample chunks from both sides concurrently
-        left_initial_chunks: list[TableChunk] = []
-        right_initial_chunks: list[TableChunk] = []
+        left_sample_chunks: list[TableChunk] = []
+        right_sample_chunks: list[TableChunk] = []
         left_sample_size = 0
         right_sample_size = 0
         left_sample_rows = 0
@@ -869,7 +843,7 @@ async def join_node(
                 chunk = TableChunk.from_message(msg).make_available_and_spill(
                     context.br(), allow_overbooking=True
                 )
-                left_initial_chunks.append(chunk)
+                left_sample_chunks.append(chunk)
                 left_sample_size += chunk.data_alloc_size(MemoryType.DEVICE)
                 left_sample_rows += chunk.table_view().num_rows()
                 del msg
@@ -883,7 +857,7 @@ async def join_node(
                 chunk = TableChunk.from_message(msg).make_available_and_spill(
                     context.br(), allow_overbooking=True
                 )
-                right_initial_chunks.append(chunk)
+                right_sample_chunks.append(chunk)
                 right_sample_size += chunk.data_alloc_size(MemoryType.DEVICE)
                 right_sample_rows += chunk.table_view().num_rows()
                 del msg
@@ -894,18 +868,18 @@ async def join_node(
         left_local_count = left_metadata.local_count
         right_local_count = right_metadata.local_count
 
-        if left_initial_chunks:
-            left_avg_size = left_sample_size / len(left_initial_chunks)
-            left_avg_rows = left_sample_rows / len(left_initial_chunks)
+        if left_sample_chunks:
+            left_avg_size = left_sample_size / len(left_sample_chunks)
+            left_avg_rows = left_sample_rows / len(left_sample_chunks)
             left_estimate = int(left_avg_size * left_local_count)
             left_row_estimate = int(left_avg_rows * left_local_count)
         else:
             left_estimate = 0
             left_row_estimate = 0
 
-        if right_initial_chunks:
-            right_avg_size = right_sample_size / len(right_initial_chunks)
-            right_avg_rows = right_sample_rows / len(right_initial_chunks)
+        if right_sample_chunks:
+            right_avg_size = right_sample_size / len(right_sample_chunks)
+            right_avg_rows = right_sample_rows / len(right_sample_chunks)
             right_estimate = int(right_avg_size * right_local_count)
             right_row_estimate = int(right_avg_rows * right_local_count)
         else:
@@ -1020,8 +994,8 @@ async def join_node(
                 ch_right,
                 left_metadata,
                 right_metadata,
-                left_initial_chunks,
-                right_initial_chunks,
+                left_sample_chunks,
+                right_sample_chunks,
                 broadcast_side,
                 bcast_collective_id,
                 target_partition_size,
@@ -1118,8 +1092,8 @@ async def join_node(
                     ch_right,
                     left_metadata,
                     right_metadata,
-                    left_initial_chunks,
-                    right_initial_chunks,
+                    left_sample_chunks,
+                    right_sample_chunks,
                     fallback_side,
                     collective_ids.pop() if collective_ids else 0,
                     target_partition_size,
@@ -1151,8 +1125,8 @@ async def join_node(
                 ch_right,
                 left_metadata,
                 right_metadata,
-                left_initial_chunks,
-                right_initial_chunks,
+                left_sample_chunks,
+                right_sample_chunks,
                 output_count,
                 left_collective_id,
                 right_collective_id,

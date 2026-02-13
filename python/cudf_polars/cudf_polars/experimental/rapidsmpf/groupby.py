@@ -398,8 +398,8 @@ async def _shuffle_groupby(
         shuffle_context, modulus, shuffle_key_indices, collective_id
     )
 
-    for chunk in evaluated_chunks or []:
-        shuffle.insert_chunk(chunk)
+    while evaluated_chunks:
+        shuffle.insert_chunk(evaluated_chunks.pop(0))
 
     pwise_ir: list[IR] = [decomposed.piecewise_ir]
     if reduction_ran:
