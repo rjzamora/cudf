@@ -467,38 +467,24 @@ class DynamicPlanningOptions:
 
     Parameters
     ----------
-    sample_chunk_count_join
+    sample_chunk_count
         The maximum number of chunks to sample before deciding whether
         to shuffle for join operations. Default is 1.
-    sample_chunk_count_reduce
-        The maximum number of chunks to sample before deciding whether
-        to shuffle for keyed reduction operations (e.g. GroupBy, Distinct).
-        Default is 32.
     """
 
     _env_prefix = "CUDF_POLARS__EXECUTOR__DYNAMIC_PLANNING"
 
-    sample_chunk_count_join: int = dataclasses.field(
+    sample_chunk_count: int = dataclasses.field(
         default_factory=_make_default_factory(
-            f"{_env_prefix}__SAMPLE_CHUNK_COUNT_JOIN", int, default=1
-        )
-    )
-    sample_chunk_count_reduce: int = dataclasses.field(
-        default_factory=_make_default_factory(
-            f"{_env_prefix}__SAMPLE_CHUNK_COUNT_REDUCE", int, default=32
+            f"{_env_prefix}__SAMPLE_CHUNK_COUNT", int, default=1
         )
     )
 
     def __post_init__(self) -> None:  # noqa: D105
-        for name in (
-            "sample_chunk_count_join",
-            "sample_chunk_count_reduce",
-        ):
-            val = getattr(self, name)
-            if not isinstance(val, int):
-                raise TypeError(f"{name} must be an int")
-            if val < 1:
-                raise ValueError(f"{name} must be at least 1")
+        if not isinstance(self.sample_chunk_count, int):
+            raise TypeError("sample_chunk_count must be an int")
+        if self.sample_chunk_count < 1:
+            raise ValueError("sample_chunk_count must be at least 1")
 
 
 @dataclasses.dataclass(frozen=True, eq=True)
@@ -708,6 +694,10 @@ class StreamingExecutor:
         or use regular pageable host memory. Pinned host memory offers higher
         bandwidth and lower latency for device to host transfers compared to
         regular pageable host memory.
+    rapidsmpf_py_executor_max_workers
+        Maximum number of workers for the Python ThreadPoolExecutor used by
+        the rapidsmpf runtime. Default is None, which uses ThreadPoolExecutor's
+        default behavior. This option is only used by the "rapidsmpf" runtime.
 
     Notes
     -----
@@ -816,6 +806,11 @@ class StreamingExecutor:
     spill_to_pinned_memory: bool = dataclasses.field(
         default_factory=_make_default_factory(
             f"{_env_prefix}__SPILL_TO_PINNED_MEMORY", bool, default=False
+        )
+    )
+    rapidsmpf_py_executor_max_workers: int | None = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__RAPIDSMPF_PY_EXECUTOR_MAX_WORKERS", int, default=None
         )
     )
 
@@ -965,6 +960,8 @@ class StreamingExecutor:
             raise TypeError("max_io_threads must be an int")
         if not isinstance(self.spill_to_pinned_memory, bool):
             raise TypeError("spill_to_pinned_memory must be bool")
+        if not isinstance(self.rapidsmpf_py_executor_max_workers, (int, type(None))):
+            raise TypeError("rapidsmpf_py_executor_max_workers must be int or None")
 
         # RapidsMPF spill is only supported for distributed clusters for now.
         # This is because the spilling API is still within the RMPF-Dask integration.
@@ -1191,7 +1188,6 @@ class ConfigOptions:
                 )
 
                 # Handle dynamic_planning: check user config, then env var
-                # Dynamic planning is enabled by default; env var can disable it
                 user_dynamic_planning = user_executor_options.get(
                     "dynamic_planning", None
                 )

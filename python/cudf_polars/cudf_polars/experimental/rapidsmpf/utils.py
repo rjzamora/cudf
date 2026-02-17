@@ -326,7 +326,7 @@ def _evaluate_chunk_sync(
 async def evaluate_chunk(
     context: Context,
     chunk: TableChunk,
-    ir: IR | list[IR],
+    *irs: IR,
     ir_context: Any,
 ) -> TableChunk:
     """
@@ -338,8 +338,8 @@ async def evaluate_chunk(
         The rapidsmpf streaming context.
     chunk
         The input table chunk.
-    ir
-        The IR node(s) to evaluate. If a list, evaluations are chained
+    irs
+        The IR node(s) to evaluate. Evaluations are chained
         in order within a single memory reservation.
     ir_context
         The IR execution context.
@@ -348,7 +348,7 @@ async def evaluate_chunk(
     -------
     The resulting table chunk after evaluation.
     """
-    irs = ir if isinstance(ir, list) else [ir]
+    assert len(irs) > 0, "Expected at least one IR node"
     chunk, extra = await make_table_chunks_available_or_wait(
         context,
         chunk,
@@ -414,7 +414,7 @@ async def concat_batch(
 async def evaluate_batch(
     batch: list[TableChunk],
     context: Context,
-    ir: IR | list[IR],
+    *irs: IR,
     ir_context: Any,
 ) -> TableChunk:
     """
@@ -426,8 +426,8 @@ async def evaluate_batch(
         The list of table chunks to evaluate.
     context
         The rapidsmpf context.
-    ir
-        The IR node(s) to evaluate. If a list, evaluations are chained
+    irs
+        The IR node(s) to evaluate. Evaluations are chained
         in order within a single memory reservation.
     ir_context
         The IR execution context.
@@ -436,12 +436,12 @@ async def evaluate_batch(
     -------
     The table chunk after evaluation.
     """
-    irs = ir if isinstance(ir, list) else [ir]
+    assert len(irs) > 0, "Expected at least one IR node"
     first_ir = irs[0]
     input_schema = first_ir.children[0].schema
     chunk = await concat_batch(batch, context, input_schema, ir_context)
     del batch
-    return await evaluate_chunk(context, chunk, irs, ir_context)
+    return await evaluate_chunk(context, chunk, *irs, ir_context=ir_context)
 
 
 async def chunkwise_evaluate(
@@ -451,7 +451,6 @@ async def chunkwise_evaluate(
     ch_out: Channel[TableChunk],
     ch_in: Channel[TableChunk],
     metadata: ChannelMetadata,
-    initial_chunks: list[TableChunk] | None = None,
     *,
     handle_empty_input: bool = False,
     tracer: ActorTracer | None = None,
@@ -476,36 +475,22 @@ async def chunkwise_evaluate(
         The input channel.
     metadata
         The channel metadata to forward (partitioning preserved).
-    initial_chunks
-        Optional chunks already received (e.g., during sampling) that should
-        be forwarded without re-evaluation.
     handle_empty_input
         If True and no chunks are received, create an empty chunk and evaluate
         it. Use for operations like aggregations that always produce output.
     tracer
         Optional tracer for runtime metrics.
     """
-    # Send output metadata preserving partitioning
     await send_metadata(ch_out, context, metadata)
     if tracer is not None and metadata.duplicated:
         tracer.set_duplicated()
 
     seq_num = 0
-    received_any = bool(initial_chunks)
-
-    # Forward initial chunks without re-evaluation (if any)
-    if initial_chunks:
-        for chunk in initial_chunks:
-            if tracer is not None:
-                tracer.add_chunk(table=chunk.table_view())
-            await ch_out.send(context, Message(seq_num, chunk))
-            seq_num += 1
-
-    # Process remaining chunks
+    received_any = False
     while (msg := await ch_in.recv(context)) is not None:
         received_any = True
         result = await evaluate_chunk(
-            context, TableChunk.from_message(msg), ir, ir_context
+            context, TableChunk.from_message(msg), ir, ir_context=ir_context
         )
         del msg
         if tracer is not None:
@@ -513,10 +498,9 @@ async def chunkwise_evaluate(
         await ch_out.send(context, Message(seq_num, result))
         seq_num += 1
 
-    # Handle empty input for aggregation-like operations
     if handle_empty_input and not received_any:
         chunk = empty_table_chunk(ir.children[0], context, ir_context.get_cuda_stream())
-        result = await evaluate_chunk(context, chunk, ir, ir_context)
+        result = await evaluate_chunk(context, chunk, ir, ir_context=ir_context)
         del chunk
         if tracer is not None:
             tracer.add_chunk(table=result.table_view())
