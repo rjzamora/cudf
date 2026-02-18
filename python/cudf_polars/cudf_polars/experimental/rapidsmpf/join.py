@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from rapidsmpf.memory.buffer import MemoryType
 from rapidsmpf.memory.memory_reservation import opaque_memory_usage
+from rapidsmpf.streaming.core.actor import define_actor
 from rapidsmpf.streaming.core.memory_reserve_or_wait import (
     missing_net_memory_delta,
     reserve_memory,
@@ -26,10 +27,7 @@ from cudf_polars.experimental.rapidsmpf.collectives.allgather import AllGatherMa
 from cudf_polars.experimental.rapidsmpf.dispatch import (
     generate_ir_sub_network,
 )
-from cudf_polars.experimental.rapidsmpf.nodes import (
-    default_node_multi,
-    define_py_node,
-)
+from cudf_polars.experimental.rapidsmpf.nodes import default_node_multi
 from cudf_polars.experimental.rapidsmpf.utils import (
     ChannelManager,
     allgather_reduce,
@@ -113,8 +111,8 @@ def _get_key_partitioning_modulus(
     return inter_rank.modulus
 
 
-@define_py_node()
-async def broadcast_join_node(
+@define_actor()
+async def broadcast_join_actor(
     context: Context,
     ir: Join,
     ir_context: IRExecutionContext,
@@ -126,7 +124,7 @@ async def broadcast_join_node(
     target_partition_size: int,
 ) -> None:
     """
-    Join node for rapidsmpf.
+    Broadcast-join actor for rapidsmpf.
 
     Parameters
     ----------
@@ -794,8 +792,8 @@ async def _shuffle_join(
     await ch_out.drain(context)
 
 
-@define_py_node()
-async def join_node(
+@define_actor()
+async def join_actor(
     context: Context,
     ir: Join,
     ir_context: Any,
@@ -808,7 +806,7 @@ async def join_node(
     collective_ids: list[int],
 ) -> None:
     """
-    Dynamic Join node that selects the best strategy at runtime.
+    Dynamic Join actor that selects the best strategy at runtime.
 
     Strategy selection based on sampled data:
     - Broadcast right: If right side is small (< broadcast_threshold)
@@ -1168,7 +1166,7 @@ def _(
     pwise_join = output_count == 1 or (left_partitioned and right_partitioned)
 
     # Process children
-    nodes, channels = process_children(ir, rec)
+    actors, channels = process_children(ir, rec)
 
     # Create output ChannelManager
     channels[ir] = ChannelManager(rec.state["context"])
@@ -1176,7 +1174,7 @@ def _(
     if pwise_join:
         # Partition-wise join (use default_node_multi)
         partitioning_index = 1 if ir.options[0] == "Right" else 0
-        nodes[ir] = [
+        actors[ir] = [
             default_node_multi(
                 rec.state["context"],
                 ir,
@@ -1189,7 +1187,7 @@ def _(
                 partitioning_index=partitioning_index,
             )
         ]
-        return nodes, channels
+        return actors, channels
 
     elif use_dynamic:
         # Dynamic join - decide strategy at runtime
@@ -1199,8 +1197,8 @@ def _(
         broadcast_threshold = (
             executor.target_partition_size * executor.broadcast_join_limit
         )
-        nodes[ir] = [
-            join_node(
+        actors[ir] = [
+            join_actor(
                 rec.state["context"],
                 ir,
                 rec.state["ir_context"],
@@ -1213,10 +1211,10 @@ def _(
                 collective_ids,
             )
         ]
-        return nodes, channels
+        return actors, channels
 
     else:
-        # Broadcast join (use broadcast_join_node)
+        # Broadcast join (use broadcast_join_actor)
         broadcast_side: Literal["left", "right"]
         if left_count >= right_count:
             # Broadcast right, stream left
@@ -1226,12 +1224,12 @@ def _(
 
         # Get target partition size
         assert isinstance(executor, StreamingExecutor), (
-            "Join node requires streaming executor"
+            "Join actor requires streaming executor"
         )
         target_partition_size = executor.target_partition_size
 
-        nodes[ir] = [
-            broadcast_join_node(
+        actors[ir] = [
+            broadcast_join_actor(
                 rec.state["context"],
                 ir,
                 rec.state["ir_context"],
@@ -1243,4 +1241,4 @@ def _(
                 target_partition_size=target_partition_size,
             )
         ]
-        return nodes, channels
+        return actors, channels
