@@ -1221,13 +1221,6 @@ def _(
             broadcast_side = "right"
         else:
             broadcast_side = "left"
-
-        # Get target partition size
-        assert isinstance(executor, StreamingExecutor), (
-            "Join actor requires streaming executor"
-        )
-        target_partition_size = executor.target_partition_size
-
         actors[ir] = [
             broadcast_join_actor(
                 rec.state["context"],
@@ -1238,7 +1231,7 @@ def _(
                 channels[right].reserve_output_slot(),
                 broadcast_side=broadcast_side,
                 collective_id=rec.state["collective_id_map"][ir][0],
-                target_partition_size=target_partition_size,
+                target_partition_size=executor.target_partition_size,
             )
         ]
         return actors, channels
