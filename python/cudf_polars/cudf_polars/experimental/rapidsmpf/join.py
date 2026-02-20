@@ -1183,10 +1183,8 @@ async def _sample_and_choose_strategy(
     collective_ids: list[int],
 ) -> _JoinStrategy:
     """Sample both sides, allgather estimates, and choose broadcast vs shuffle."""
-    left_sample, right_sample = await asyncio.gather(
-        _sample_chunks(context, ch_left, sample_chunk_count),
-        _sample_chunks(context, ch_right, sample_chunk_count),
-    )
+    left_sample = await _sample_chunks(context, ch_left, sample_chunk_count)
+    right_sample = await _sample_chunks(context, ch_right, sample_chunk_count)
     broadcast_side, min_shuffle_modulus = await _choose_strategy(
         context,
         ir,
