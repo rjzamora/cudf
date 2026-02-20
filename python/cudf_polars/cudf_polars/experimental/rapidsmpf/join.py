@@ -870,6 +870,7 @@ async def _shuffle_join(
             left_shuffle,
             right_shuffle,
             partition_id=partition_id,
+            tracer=tracer,
         )
 
     del left_shuffle, right_shuffle
