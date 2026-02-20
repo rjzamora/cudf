@@ -375,6 +375,13 @@ def _cudf_to_table(obj, preserve_index=None, **kwargs):
             "Ignoring the following arguments to "
             f"`to_pyarrow_table_dispatch`: {list(kwargs)}"
         )
+    if preserve_index and (
+        isinstance(obj.index, cudf.RangeIndex)
+        and obj.index.start == 0
+        and obj.index.step == 1
+        and obj.index.name is None
+    ):
+        preserve_index = False  # Don't preserve default index
     return obj.to_arrow(preserve_index=preserve_index)
 
 

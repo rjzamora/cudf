@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2021-2024, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION.
 # SPDX-License-Identifier: Apache-2.0
 
 from datetime import datetime
@@ -49,7 +49,7 @@ def test_pyarrow_conversion_dispatch(preserve_index, index):
     assert_eq(df1, df2)
 
     # Check that preserve_index does not produce a RangeIndex
-    if preserve_index:
+    if preserve_index and index is not None:
         assert not isinstance(df2.index, cudf.RangeIndex)
 
 
