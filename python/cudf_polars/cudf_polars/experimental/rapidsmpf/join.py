@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from math import e
 from typing import TYPE_CHECKING, Any, Literal
 
 from rapidsmpf.memory.buffer import MemoryType
@@ -720,8 +721,11 @@ async def get_dataframe_to_join(
         if table.num_rows() == 0 and len(table.columns()) == 0:
             table = empty_table_chunk(child, context, stream).table_view()
     else:
-        chunk = await get_unshuffled_chunk(context, ch, sample_chunks)
-        table = (chunk or empty_table_chunk(child, context, stream)).table_view()
+        chunk = (
+            await get_unshuffled_chunk(context, ch, sample_chunks)
+        ) or empty_table_chunk(child, context, stream)
+        table = chunk.table_view()
+        stream = chunk.stream
 
     return DataFrame.from_table(
         table, list(child.schema.keys()), list(child.schema.values()), stream
