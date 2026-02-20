@@ -325,7 +325,7 @@ async def _collect_small_side_for_broadcast(
 
     Returns (list of DataFrames to join against, total byte size of small side).
     """
-    small_chunks: list[TableChunk] = list(initial_chunks)
+    small_chunks: list[TableChunk] = initial_chunks
     small_size = sum(c.data_alloc_size(MemoryType.DEVICE) for c in small_chunks)
     small_row_count = sum(c.table_view().num_rows() for c in small_chunks)
     while (msg := await small_ch.recv(context)) is not None:
@@ -508,7 +508,8 @@ async def _broadcast_join(
     # Stream through large side
     large_chunk_processed = False
 
-    for seq_num, chunk in enumerate(large_initial_chunks):
+    seq_num = 0
+    while large_initial_chunks:
         large_chunk_processed = True
         await _broadcast_join_large_chunk(
             context,
@@ -517,14 +518,14 @@ async def _broadcast_join(
             ch_out,
             small_dfs,
             small_child,
-            chunk,
+            large_initial_chunks.pop(0),
             large_child,
             seq_num,
             small_size,
             broadcast_side,
             tracer=tracer,
         )
-
+        seq_num += 1
     while (msg := await large_ch.recv(context)) is not None:
         large_chunk_processed = True
         large_chunk = TableChunk.from_message(msg).make_available_and_spill(
