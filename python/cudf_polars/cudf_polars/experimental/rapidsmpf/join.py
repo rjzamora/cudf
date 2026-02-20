@@ -745,25 +745,23 @@ async def _join_chunks(
 ) -> None:
     left, right = ir.children
     stream = ir_context.get_cuda_stream()
-    left_df, right_df = await asyncio.gather(
-        get_dataframe_to_join(
-            context,
-            ch_left,
-            left_sample_chunks,
-            shuffle=left_shuffle,
-            partition_id=partition_id,
-            stream=stream,
-            child=left,
-        ),
-        get_dataframe_to_join(
-            context,
-            ch_right,
-            right_sample_chunks,
-            shuffle=right_shuffle,
-            partition_id=partition_id,
-            stream=stream,
-            child=right,
-        ),
+    left_df = await get_dataframe_to_join(
+        context,
+        ch_left,
+        left_sample_chunks,
+        shuffle=left_shuffle,
+        partition_id=partition_id,
+        stream=stream,
+        child=left,
+    )
+    right_df = await get_dataframe_to_join(
+        context,
+        ch_right,
+        right_sample_chunks,
+        shuffle=right_shuffle,
+        partition_id=partition_id,
+        stream=stream,
+        child=right,
     )
 
     input_bytes = sum(
@@ -845,9 +843,9 @@ async def _shuffle_join(
         collective_ids,
         tracer,
     )
-    await asyncio.gather(
-        drain_into_shuffle(context, ch_left, left_shuffle, left_sample_chunks or []),
-        drain_into_shuffle(context, ch_right, right_shuffle, right_sample_chunks or []),
+    await drain_into_shuffle(context, ch_left, left_shuffle, left_sample_chunks or [])
+    await drain_into_shuffle(
+        context, ch_right, right_shuffle, right_sample_chunks or []
     )
 
     partition_ids: list[int]
@@ -1104,8 +1102,8 @@ async def _choose_strategy(
     estimated_output_size = max(left_total, right_total)
     ideal_output_count = max(1, estimated_output_size // target_partition_size)
     ideal_modulus = nranks * ideal_output_count
-    # Limit the output count to 10x the larger input side
-    max_output_chunks = 10 * max(left_total_chunks, right_total_chunks)
+    # Limit the output count to 8x the larger input side
+    max_output_chunks = 8 * max(left_total_chunks, right_total_chunks)
     min_shuffle_modulus = min(ideal_modulus, max_output_chunks)
 
     return broadcast_side, min_shuffle_modulus
