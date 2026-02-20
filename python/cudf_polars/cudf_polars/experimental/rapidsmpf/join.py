@@ -740,11 +740,11 @@ async def _join_chunks(
     left_shuffle: ShuffleManager | None,
     right_shuffle: ShuffleManager | None,
     *,
+    stream: Stream,
     partition_id: int,
     tracer: ActorTracer | None = None,
 ) -> None:
     left, right = ir.children
-    stream = ir_context.get_cuda_stream()
     left_df = await get_dataframe_to_join(
         context,
         ch_left,
@@ -855,6 +855,7 @@ async def _shuffle_join(
         partition_ids = right_shuffle.local_partitions()
     else:
         partition_ids = list(range(local_count))
+    stream = ir_context.get_cuda_stream()
     for partition_id in partition_ids:
         await _join_chunks(
             context,
@@ -867,6 +868,7 @@ async def _shuffle_join(
             right_sample_chunks or [],
             left_shuffle,
             right_shuffle,
+            stream=stream,
             partition_id=partition_id,
             tracer=tracer,
         )
