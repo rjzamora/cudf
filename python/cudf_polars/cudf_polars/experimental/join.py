@@ -291,8 +291,7 @@ def _(
         )
 
     # Check for dynamic planning - defer broadcast vs shuffle decision to runtime
-    join_type = ir.options[0]
-    if dynamic_planning and join_type in ("Inner", "Left", "Semi", "Anti"):
+    if dynamic_planning:
         new_node = ir.reconstruct(children)
         partition_info[new_node] = PartitionInfo(count=output_count)
         return new_node, partition_info
