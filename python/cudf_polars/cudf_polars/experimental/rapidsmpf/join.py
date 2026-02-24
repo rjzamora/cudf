@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from math import e
 from typing import TYPE_CHECKING, Any, Literal
 
 from rapidsmpf.memory.buffer import MemoryType
@@ -509,8 +508,7 @@ async def _broadcast_join(
     # Stream through large side
     large_chunk_processed = False
 
-    seq_num = 0
-    while large_initial_chunks:
+    for seq_num, chunk in enumerate(large_initial_chunks):
         large_chunk_processed = True
         await _broadcast_join_large_chunk(
             context,
@@ -519,14 +517,14 @@ async def _broadcast_join(
             ch_out,
             small_dfs,
             small_child,
-            large_initial_chunks.pop(0),
+            chunk,
             large_child,
             seq_num,
             small_size,
             broadcast_side,
             tracer=tracer,
         )
-        seq_num += 1
+
     while (msg := await large_ch.recv(context)) is not None:
         large_chunk_processed = True
         large_chunk = TableChunk.from_message(msg).make_available_and_spill(
@@ -721,11 +719,8 @@ async def get_dataframe_to_join(
         if table.num_rows() == 0 and len(table.columns()) == 0:
             table = empty_table_chunk(child, context, stream).table_view()
     else:
-        chunk = (
-            await get_unshuffled_chunk(context, ch, sample_chunks)
-        ) or empty_table_chunk(child, context, stream)
-        table = chunk.table_view()
-        stream = chunk.stream
+        chunk = await get_unshuffled_chunk(context, ch, sample_chunks)
+        table = (chunk or empty_table_chunk(child, context, stream)).table_view()
 
     return DataFrame.from_table(
         table, list(child.schema.keys()), list(child.schema.values()), stream
@@ -744,28 +739,30 @@ async def _join_chunks(
     left_shuffle: ShuffleManager | None,
     right_shuffle: ShuffleManager | None,
     *,
-    stream: Stream,
     partition_id: int,
     tracer: ActorTracer | None = None,
 ) -> None:
     left, right = ir.children
-    left_df = await get_dataframe_to_join(
-        context,
-        ch_left,
-        left_sample_chunks,
-        shuffle=left_shuffle,
-        partition_id=partition_id,
-        stream=stream,
-        child=left,
-    )
-    right_df = await get_dataframe_to_join(
-        context,
-        ch_right,
-        right_sample_chunks,
-        shuffle=right_shuffle,
-        partition_id=partition_id,
-        stream=stream,
-        child=right,
+    stream = ir_context.get_cuda_stream()
+    left_df, right_df = await asyncio.gather(
+        get_dataframe_to_join(
+            context,
+            ch_left,
+            left_sample_chunks,
+            shuffle=left_shuffle,
+            partition_id=partition_id,
+            stream=stream,
+            child=left,
+        ),
+        get_dataframe_to_join(
+            context,
+            ch_right,
+            right_sample_chunks,
+            shuffle=right_shuffle,
+            partition_id=partition_id,
+            stream=stream,
+            child=right,
+        ),
     )
 
     input_bytes = sum(
@@ -818,7 +815,7 @@ async def _shuffle_join(
         left_state,
         right_state,
         min_shuffle_modulus,
-    )
+    )  # Global modulus
 
     left_key_indices, right_key_indices, output_key_indices = _get_key_indices(
         ir, n_partitioned_keys
@@ -847,9 +844,9 @@ async def _shuffle_join(
         collective_ids,
         tracer,
     )
-    await drain_into_shuffle(context, ch_left, left_shuffle, left_sample_chunks or [])
-    await drain_into_shuffle(
-        context, ch_right, right_shuffle, right_sample_chunks or []
+    await asyncio.gather(
+        drain_into_shuffle(context, ch_left, left_shuffle, left_sample_chunks or []),
+        drain_into_shuffle(context, ch_right, right_shuffle, right_sample_chunks or []),
     )
 
     partition_ids: list[int]
@@ -859,7 +856,6 @@ async def _shuffle_join(
         partition_ids = right_shuffle.local_partitions()
     else:
         partition_ids = list(range(local_count))
-    stream = ir_context.get_cuda_stream()
     for partition_id in partition_ids:
         await _join_chunks(
             context,
@@ -872,9 +868,7 @@ async def _shuffle_join(
             right_sample_chunks or [],
             left_shuffle,
             right_shuffle,
-            stream=stream,
             partition_id=partition_id,
-            tracer=tracer,
         )
 
     del left_shuffle, right_shuffle
@@ -1108,8 +1102,8 @@ async def _choose_strategy(
     estimated_output_size = max(left_total, right_total)
     ideal_output_count = max(1, estimated_output_size // target_partition_size)
     ideal_modulus = nranks * ideal_output_count
-    # Limit the output count to 8x the larger input side
-    max_output_chunks = 8 * max(left_total_chunks, right_total_chunks)
+    # Limit the output count to 10x the larger input side
+    max_output_chunks = 10 * max(left_total_chunks, right_total_chunks)
     min_shuffle_modulus = min(ideal_modulus, max_output_chunks)
 
     return broadcast_side, min_shuffle_modulus
@@ -1142,15 +1136,15 @@ def _choose_shuffle_modulus(
                 modulus = max(left_existing_modulus, right_existing_modulus)
     elif left_existing_modulus is not None:
         # Only left is partitioned - use its modulus if sufficient
-        modulus = max(left_existing_modulus, min_shuffle_modulus)
+        modulus = left_existing_modulus
     elif right_existing_modulus is not None:
         # Only right is partitioned - use its modulus if sufficient
-        modulus = max(right_existing_modulus, min_shuffle_modulus)
+        modulus = right_existing_modulus
     else:
         # Neither side partitioned - can choose freely
         # Use at least nranks for distributed efficiency
-        modulus = max(context.comm().nranks, min_shuffle_modulus)
-    return modulus
+        modulus = context.comm().nranks
+    return max(modulus, min_shuffle_modulus)
 
 
 async def _sample_chunks(
@@ -1189,8 +1183,10 @@ async def _sample_and_choose_strategy(
     collective_ids: list[int],
 ) -> _JoinStrategy:
     """Sample both sides, allgather estimates, and choose broadcast vs shuffle."""
-    left_sample = await _sample_chunks(context, ch_left, sample_chunk_count)
-    right_sample = await _sample_chunks(context, ch_right, sample_chunk_count)
+    left_sample, right_sample = await asyncio.gather(
+        _sample_chunks(context, ch_left, sample_chunk_count),
+        _sample_chunks(context, ch_right, sample_chunk_count),
+    )
     broadcast_side, min_shuffle_modulus = await _choose_strategy(
         context,
         ir,
