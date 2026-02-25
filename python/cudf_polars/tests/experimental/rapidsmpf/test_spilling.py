@@ -138,17 +138,7 @@ def test_make_spill_function(local_context: Context) -> None:
         local_context.br().spill_manager.remove_spill_function(func_id)
 
 
-def test_spill_gpu_memory_with_message_reference(local_context: Context) -> None:
-    """
-    Reproduce the behavior where keeping a Python reference to the original
-    Message prevents GPU memory from being freed when the extracted TableChunk
-    is spilled via a second Message.
-
-    Flow: create Message(msg1) with TableChunk -> extract chunk with
-    TableChunk.from_message(msg1) -> put chunk in Message(msg2) -> insert msg2
-    into SpillableMessages -> spill. If we keep msg1 alive, GPU memory may not
-    drop even though rapidsmpf reports the data as spilled.
-    """
+def test_spill_gpu_memory_with_python_reference(local_context: Context) -> None:
     table_nbytes = 4 * 1024 * 1024  # 4 MiB
     stream = local_context.get_stream_from_pool()
 
