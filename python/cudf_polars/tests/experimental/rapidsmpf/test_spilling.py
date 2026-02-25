@@ -8,6 +8,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
+import pynvml
+import pytest
 from rapidsmpf.memory.buffer import MemoryType
 from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.core.spillable_messages import SpillableMessages
@@ -23,6 +25,18 @@ if TYPE_CHECKING:
     from rapidsmpf.streaming.core.context import Context
 
     from rmm.pylibrmm.stream import Stream
+
+
+def _gpu_used_bytes(device_index: int = 0) -> int | None:
+    """Return current GPU used memory in bytes for the given device, or None if unavailable."""
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    except (pynvml.NVMLError_NotSupported, pynvml.NVMLError):
+        return None
+    else:
+        return info.used
 
 
 def create_test_table(nbytes: int, stream: Stream) -> plc.Table:
@@ -120,5 +134,62 @@ def test_make_spill_function(local_context: Context) -> None:
         # Verify we got a valid table back
         assert chunk_available.table_view().num_rows() > 0
 
+    finally:
+        local_context.br().spill_manager.remove_spill_function(func_id)
+
+
+def test_spill_gpu_memory_with_message_reference(local_context: Context) -> None:
+    """
+    Reproduce the behavior where keeping a Python reference to the original
+    Message prevents GPU memory from being freed when the extracted TableChunk
+    is spilled via a second Message.
+
+    Flow: create Message(msg1) with TableChunk -> extract chunk with
+    TableChunk.from_message(msg1) -> put chunk in Message(msg2) -> insert msg2
+    into SpillableMessages -> spill. If we keep msg1 alive, GPU memory may not
+    drop even though rapidsmpf reports the data as spilled.
+    """
+    table_nbytes = 4 * 1024 * 1024  # 4 MiB
+    stream = local_context.get_stream_from_pool()
+
+    # 1. Create Message with TableChunk (GPU data)
+    chunk = create_test_table(table_nbytes, stream)
+    msg1 = Message(
+        0,
+        TableChunk.from_pylibcudf_table(
+            chunk,
+            stream,
+            exclusive_view=True,
+        ),
+    )
+
+    del chunk  # Test fails if this line is not present
+
+    stream.synchronize()
+    mem_with_data = _gpu_used_bytes(0)
+    if mem_with_data is None:
+        pytest.skip("GPU memory info not available (e.g. NVML not supported)")
+
+    # 2. Extract chunk from message into a *second* message
+    msg2 = Message(0, TableChunk.from_message(msg1))
+    sm = SpillableMessages()
+    mid = sm.insert(msg2)
+    spill_func = make_spill_function([sm], local_context)
+    func_id = local_context.br().spill_manager.add_spill_function(
+        spill_func, priority=0
+    )
+    try:
+        # 3. Spill the second message (chunk is now reported as spilled)
+        spilled = local_context.br().spill_manager.spill(table_nbytes)
+        assert spilled >= table_nbytes * 0.9
+        descs = sm.get_content_descriptions()
+        assert mid in descs
+        assert descs[mid].content_sizes.get(MemoryType.DEVICE, 0) == 0
+        assert descs[mid].content_sizes.get(MemoryType.HOST, 0) > 0
+
+        stream.synchronize()
+        mem_after_spill = _gpu_used_bytes(0)
+        assert mem_after_spill is not None
+        assert mem_after_spill < mem_with_data
     finally:
         local_context.br().spill_manager.remove_spill_function(func_id)
