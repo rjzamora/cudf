@@ -718,6 +718,8 @@ def test_shuffle_properties():
             "shuffle_method": DEFAULT_RUNTIME,
             "broadcast_join_limit": 1,
             "shuffler_insertion_method": "insert_chunks",
+            # NOTE: Must disable dynamic planning
+            "dynamic_planning": None,
         },
     )
     dag = serialize_query(q, engine)

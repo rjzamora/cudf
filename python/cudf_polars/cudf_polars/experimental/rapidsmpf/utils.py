@@ -36,6 +36,7 @@ from rapidsmpf.streaming.cudf.table_chunk import (
 import pylibcudf as plc
 
 from cudf_polars.containers import DataFrame
+from cudf_polars.dsl.expr import Col
 from cudf_polars.experimental.utils import _concat
 
 if TYPE_CHECKING:
@@ -47,7 +48,7 @@ if TYPE_CHECKING:
 
     from rmm.pylibrmm.stream import Stream
 
-    from cudf_polars.dsl.ir import IR, IRExecutionContext
+    from cudf_polars.dsl.ir import IR, IRExecutionContext, Select
     from cudf_polars.experimental.rapidsmpf.dispatch import SubNetGenerator
     from cudf_polars.experimental.rapidsmpf.tracing import ActorTracer
     from cudf_polars.typing import DataType
@@ -166,71 +167,64 @@ def remap_partitioning(
     return Partitioning(inter_rank=new_inter_rank, local=new_local)
 
 
-def select_preserves_partitioning(
-    ir: IR,
-    partitioning: Partitioning | None,
-    old_schema: Mapping[str, DataType],
-    new_schema: Mapping[str, DataType],
+def remap_partitioning_select(
+    select: Select, partitioning: Partitioning | None
 ) -> Partitioning | None:
     """
-    Check if a Select node preserves partitioning and remap if so.
-
-    A Select preserves partitioning if all partition key columns are
-    output as simple Col references (unchanged values). Other columns
-    can be computed expressions - only the partition keys matter.
+    Remap partitioning for simple Select nodes.
 
     Parameters
     ----------
-    ir
-        The Select IR node.
+    select
+        The select node.
     partitioning
         The input partitioning.
-    old_schema
-        The input schema (child schema).
-    new_schema
-        The output schema (Select's schema).
 
     Returns
     -------
-    The remapped partitioning if partition keys are preserved, else None.
+    The remapped partitioning. When partition keys are not preserved,
+    inter_rank (and optionally local) will be None.
+
+    Notes
+    -----
+    A Select preserves partitioning if all partition key columns are
+    output as simple Col references (unchanged values). Other columns
+    can be computed expressions - only the partition keys matter.
     """
-    from cudf_polars.dsl.expr import Col
-    from cudf_polars.dsl.ir import Select
-
     if partitioning is None:
-        return None
+        return None  # Nothing to preserve
 
-    if not isinstance(ir, Select):
-        return None
+    old_schema = select.children[0].schema
 
-    inter_rank = partitioning.inter_rank
-    if inter_rank is None or inter_rank == "inherit":
-        # No specific partitioning to preserve
-        return remap_partitioning(partitioning, old_schema, new_schema)
-
-    # Get partition key column names from indices
-    old_names = list(old_schema.keys())
-    try:
-        partition_key_names = {old_names[i] for i in inter_rank.column_indices}
-    except IndexError:
-        return None
-
-    # Build a map from output column name to its expression
-    output_expr_map = {ne.name: ne.value for ne in ir.exprs}
-
-    # Check if each partition key column is output as a simple Col reference
-    # with the same name (meaning the values are unchanged)
-    for key_name in partition_key_names:
-        if key_name not in output_expr_map:
-            # Partition key column not in output
+    def _process_scheme(scheme: HashScheme | None | str) -> HashScheme | None | str:
+        if isinstance(scheme, HashScheme):
+            try:
+                old_names = list(old_schema.keys())
+                partition_key_names = {old_names[i] for i in scheme.column_indices}
+            except IndexError:
+                return None
+            # Map old key name -> output name
+            old_to_new: dict[str, str] = {}
+            for ne in select.exprs:
+                # Can preserve Col expressions - Even if the name changes
+                if isinstance(ne.value, Col) and ne.value.name in partition_key_names:
+                    old_to_new[ne.value.name] = ne.name
+            if set(old_to_new) != partition_key_names:
+                return None
+            output_names = list(select.schema.keys())
+            ordered_old = [old_names[i] for i in scheme.column_indices]
+            new_indices = tuple(
+                output_names.index(old_to_new[old]) for old in ordered_old
+            )
+            return HashScheme(new_indices, scheme.modulus)
+        if scheme not in (None, "inherit"):  # pragma: no cover
             return None
-        expr = output_expr_map[key_name]
-        if not isinstance(expr, Col) or expr.name != key_name:
-            # Not a simple Col reference or different source column
-            return None
+        return scheme
 
-    # All partition keys are preserved, remap the partitioning
-    return remap_partitioning(partitioning, old_schema, new_schema)
+    return Partitioning(
+        inter_rank=_process_scheme(partitioning.inter_rank),
+        local=_process_scheme(partitioning.local),
+    )
 
 
 async def send_metadata(
