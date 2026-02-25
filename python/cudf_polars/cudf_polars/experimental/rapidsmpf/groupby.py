@@ -220,7 +220,7 @@ async def _local_aggregation(
             decomposed.piecewise_ir,
             ir_context=ir_context,
         )
-        del msg
+
         total_size += chunk.data_alloc_size(MemoryType.DEVICE)
         evaluated_chunks.append(chunk)
         if total_size > target_partition_size and len(evaluated_chunks) > 1:
@@ -252,7 +252,6 @@ async def _local_aggregation(
             context,
             ir_context.get_cuda_stream(),
         )
-    del evaluated_chunks
 
     return aggregated, input_drained, chunks_received
 
@@ -333,7 +332,6 @@ async def _tree_reduce(
     if tracer is not None:
         tracer.add_chunk(table=aggregated.table_view())
     await ch_out.send(context, Message(0, aggregated))
-    del aggregated
 
     await ch_out.drain(context)
 
@@ -432,7 +430,6 @@ async def _shuffle_reduce(
             decomposed.reduction_ir.schema,
         )
     )
-    del aggregated
 
     while not input_drained:
         aggregated, input_drained, _ = await _local_aggregation(
@@ -445,7 +442,6 @@ async def _shuffle_reduce(
         shuffle.insert_chunk(
             _enforce_schema(aggregated, decomposed.reduction_ir.schema)
         )
-        del aggregated
 
     await shuffle.insert_finished()
     extract_irs = [decomposed.reduction_ir] + (
@@ -458,16 +454,15 @@ async def _shuffle_reduce(
             stream,
             exclusive_view=True,
         )
-        output_chunk = await evaluate_chunk(
+        partition_chunk = await evaluate_chunk(
             context,
             partition_chunk,
             *extract_irs,
             ir_context=ir_context,
         )
-        del partition_chunk
         if tracer is not None:
-            tracer.add_chunk(table=output_chunk.table_view())
-        await ch_out.send(context, Message(partition_id, output_chunk))
+            tracer.add_chunk(table=partition_chunk.table_view())
+        await ch_out.send(context, Message(partition_id, partition_chunk))
 
     await ch_out.drain(context)
 
