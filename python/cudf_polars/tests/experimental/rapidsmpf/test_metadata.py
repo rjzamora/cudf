@@ -20,7 +20,7 @@ from cudf_polars.dsl import expr
 from cudf_polars.dsl.ir import Select
 from cudf_polars.experimental.rapidsmpf.core import evaluate_logical_plan
 from cudf_polars.experimental.rapidsmpf.utils import (
-    get_partitioning_moduli,
+    NormalizedPartitioning,
     remap_partitioning,
     remap_partitioning_select,
 )
@@ -195,12 +195,15 @@ def test_rapidsmpf_join_metadata(
 def test_get_partitioning_moduli(
     local_count, partitioning, key_indices, nranks, expected
 ) -> None:
-    """get_partitioning_moduli returns (inter_rank_modulus, local_modulus)."""
+    """NormalizedPartitioning.resolve_from_indices returns (inter_rank_modulus, local_modulus) (allow_subset=False)."""
     metadata = ChannelMetadata(
         local_count=local_count,
         partitioning=partitioning,
     )
-    assert get_partitioning_moduli(metadata, key_indices, nranks) == expected
+    state = NormalizedPartitioning.resolve_from_indices(
+        metadata, nranks, indices=key_indices, allow_subset=False
+    )
+    assert (state.inter_rank_modulus, state.local_modulus) == expected
 
 
 @pytest.mark.parametrize(
@@ -262,15 +265,15 @@ def test_get_partitioning_moduli(
 def test_get_partitioning_moduli_allow_subset(
     local_count, partitioning, key_indices, nranks, expected
 ) -> None:
-    """get_partitioning_moduli with allow_subset=True matches on prefix of key_indices."""
+    """NormalizedPartitioning.resolve_from_indices with allow_subset=True matches on prefix of key_indices."""
     metadata = ChannelMetadata(
         local_count=local_count,
         partitioning=partitioning,
     )
-    assert (
-        get_partitioning_moduli(metadata, key_indices, nranks, allow_subset=True)
-        == expected
+    state = NormalizedPartitioning.resolve_from_indices(
+        metadata, nranks, indices=key_indices, allow_subset=True
     )
+    assert (state.inter_rank_modulus, state.local_modulus) == expected
 
 
 def _make_select_ir(engine: pl.GPUEngine, output_columns: tuple[str, ...]):
