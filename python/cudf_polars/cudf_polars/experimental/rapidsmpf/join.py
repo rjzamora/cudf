@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from rapidsmpf.memory.buffer import MemoryType
@@ -28,7 +28,7 @@ from rapidsmpf.streaming.cudf.table_chunk import (
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IR, Join
 from cudf_polars.experimental.rapidsmpf.collectives.allgather import AllGatherManager
-from cudf_polars.experimental.rapidsmpf.collectives.shuffle import ShuffleManager
+from cudf_polars.experimental.rapidsmpf.collectives.shuffle import _global_shuffle
 from cudf_polars.experimental.rapidsmpf.dispatch import (
     generate_ir_sub_network,
 )
@@ -39,7 +39,9 @@ from cudf_polars.experimental.rapidsmpf.utils import (
     allgather_reduce,
     chunk_to_frame,
     empty_table_chunk,
+    iterate_over_buffered_channel,
     maybe_remap_partitioning,
+    names_to_indices,
     process_children,
     recv_metadata,
     send_metadata,
@@ -52,8 +54,6 @@ if TYPE_CHECKING:
     from rapidsmpf.streaming.core.channel import Channel
     from rapidsmpf.streaming.core.context import Context
 
-    from rmm.pylibrmm.stream import Stream
-
     from cudf_polars.dsl.ir import IR, IRExecutionContext
     from cudf_polars.experimental.rapidsmpf.dispatch import SubNetGenerator
     from cudf_polars.experimental.rapidsmpf.tracing import ActorTracer
@@ -63,7 +63,7 @@ MAX_BROADCAST_ROWS = 1_500_000_000
 
 
 @dataclass(frozen=True)
-class ChildSample:
+class JoinChunkSample:
     """Sampled chunks and aggregate size/row stats for one side of a join."""
 
     chunks: list[TableChunk]
@@ -78,13 +78,17 @@ class ChildSample:
 class JoinStrategy:
     """Summary of sampling and strategy selection for a dynamic join."""
 
-    broadcast_side: Literal["left", "right"] | None
-    """The side to broadcast. If None, the strategy is not a broadcast join."""
-    min_shuffle_modulus: int
+    broadcast_side: Literal["left", "right"] | None = None
+    """The side to broadcast. If None, the strategy is a shuffle join."""
+    min_shuffle_modulus: int = 0
     """The minimum shuffle modulus."""
-    left_sample: ChildSample
+    left_sample: JoinChunkSample = field(
+        default_factory=lambda: JoinChunkSample(chunks=[], total_size=0, total_rows=0)
+    )
     """Left-side sample information."""
-    right_sample: ChildSample
+    right_sample: JoinChunkSample = field(
+        default_factory=lambda: JoinChunkSample(chunks=[], total_size=0, total_rows=0)
+    )
     """Right-side sample information."""
 
 
@@ -140,9 +144,7 @@ async def broadcast_join_actor(
             ch_right,
             left_metadata,
             right_metadata,
-            [],  # No sampled chunks
-            [],  # No sampled chunks
-            broadcast_side,
+            JoinStrategy(broadcast_side=broadcast_side),
             [collective_id],
             target_partition_size,
             tracer=tracer,
@@ -165,7 +167,7 @@ async def _collect_small_side_for_broadcast(
 
     Returns (list of DataFrames to join against, total byte size of small side).
     """
-    small_chunks: list[TableChunk] = initial_chunks
+    small_chunks = initial_chunks
     small_size = sum(c.data_alloc_size(MemoryType.DEVICE) for c in small_chunks)
     small_row_count = sum(c.table_view().num_rows() for c in small_chunks)
     while (msg := await small_ch.recv(context)) is not None:
@@ -213,7 +215,6 @@ async def _collect_small_side_for_broadcast(
                 ]
         else:
             small_dfs = [chunk_to_frame(c, small_child) for c in small_chunks]
-        small_chunks.clear()
 
     return small_dfs, small_size
 
@@ -281,9 +282,7 @@ async def _broadcast_join(
     ch_right: Channel[TableChunk],
     left_metadata: ChannelMetadata,
     right_metadata: ChannelMetadata,
-    left_sample_chunks: list[TableChunk],
-    right_sample_chunks: list[TableChunk],
-    broadcast_side: Literal["left", "right"],
+    strategy: JoinStrategy,
     collective_ids: list[int],
     target_partition_size: int,
     *,
@@ -297,6 +296,8 @@ async def _broadcast_join(
     Pops one collective ID from collective_ids for allgather when needed.
     """
     collective_id = collective_ids.pop(0) if collective_ids else 0
+    broadcast_side = strategy.broadcast_side
+    assert broadcast_side is not None
     left, right = ir.children
     if tracer is not None:
         tracer.decision = f"broadcast_{broadcast_side}"
@@ -305,23 +306,21 @@ async def _broadcast_join(
         small_ch, large_ch = ch_right, ch_left
         small_child, large_child = right, left
         small_metadata, large_metadata = right_metadata, left_metadata
-        small_initial_chunks = right_sample_chunks
-        large_initial_chunks = left_sample_chunks
+        small_initial_chunks = strategy.right_sample.chunks
+        large_initial_chunks = strategy.left_sample.chunks
         local_count = left_metadata.local_count
-        partitioning: Partitioning | None = remap_partitioning(
-            left_metadata.partitioning, large_child.schema, ir.schema
+        partitioning: Partitioning | None = maybe_remap_partitioning(
+            ir, left_metadata.partitioning, child_index=0
         )
     else:
         small_ch, large_ch = ch_left, ch_right
         small_child, large_child = left, right
         small_metadata, large_metadata = left_metadata, right_metadata
-        small_initial_chunks = left_sample_chunks
-        large_initial_chunks = right_sample_chunks
+        small_initial_chunks = strategy.left_sample.chunks
+        large_initial_chunks = strategy.right_sample.chunks
         local_count = right_metadata.local_count
         partitioning = (
-            remap_partitioning(
-                right_metadata.partitioning, large_child.schema, ir.schema
-            )
+            maybe_remap_partitioning(ir, right_metadata.partitioning, child_index=1)
             if ir.options[0] == "Right"
             else None
         )
@@ -350,11 +349,9 @@ async def _broadcast_join(
         concat_size_limit=(target_partition_size if ir.options[0] == "Inner" else None),
     )
 
-    # Stream through large side
-    large_chunk_processed = False
-
-    for seq_num, chunk in enumerate(large_initial_chunks):
-        large_chunk_processed = True
+    async for seq_num, chunk in iterate_over_buffered_channel(
+        context, large_ch, large_initial_chunks
+    ):
         await _broadcast_join_large_chunk(
             context,
             ir,
@@ -370,49 +367,6 @@ async def _broadcast_join(
             tracer=tracer,
         )
 
-    while (msg := await large_ch.recv(context)) is not None:
-        large_chunk_processed = True
-        large_chunk = TableChunk.from_message(msg).make_available_and_spill(
-            context.br(), allow_overbooking=True
-        )
-        msg_seq = msg.sequence_number
-
-        await _broadcast_join_large_chunk(
-            context,
-            ir,
-            ir_context,
-            ch_out,
-            small_dfs,
-            small_child,
-            large_chunk,
-            large_child,
-            msg_seq,
-            small_size,
-            broadcast_side,
-            tracer=tracer,
-        )
-        del large_chunk
-
-    if not large_chunk_processed and small_dfs:
-        stream = ir_context.get_cuda_stream()
-        large_chunk = empty_table_chunk(large_child, context, stream)
-        await _broadcast_join_large_chunk(
-            context,
-            ir,
-            ir_context,
-            ch_out,
-            small_dfs,
-            small_child,
-            large_chunk,
-            large_child,
-            0,
-            small_size,
-            broadcast_side,
-            tracer=tracer,
-        )
-        del large_chunk
-
-    del small_dfs
     await ch_out.drain(context)
 
 
@@ -421,160 +375,21 @@ def _get_key_indices(
     n_partitioned_keys: int | None,
 ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
     left, right = ir.children
-    left_schema_keys = list(left.schema.keys())
-    right_schema_keys = list(right.schema.keys())
-    left_key_indices = tuple(left_schema_keys.index(expr.name) for expr in ir.left_on)
-    right_key_indices = tuple(
-        right_schema_keys.index(expr.name) for expr in ir.right_on
-    )
+    left_key_indices = names_to_indices(ir.left_on, left.schema)
+    right_key_indices = names_to_indices(ir.right_on, right.schema)
+
     n_keys = (
         n_partitioned_keys if n_partitioned_keys is not None else len(left_key_indices)
     )
-    output_schema_keys = list(ir.schema.keys())
-    if ir.options[0] in ("Inner", "Left", "Full", "Semi", "Anti"):
-        join_keys_for_output = ir.left_on
-    else:
+    if ir.options == "Right":
         join_keys_for_output = ir.right_on
-    output_key_indices = tuple(
-        output_schema_keys.index(expr.name)
-        for expr in join_keys_for_output
-        if expr.name in output_schema_keys
-    )
+    else:
+        join_keys_for_output = ir.left_on
+    output_key_indices = names_to_indices(join_keys_for_output, ir.schema)
     return (
         left_key_indices[:n_keys],
         right_key_indices[:n_keys],
         output_key_indices[:n_keys],
-    )
-
-
-def _create_shuffle_managers(
-    context: Context,
-    modulus: int,
-    left_key_indices: tuple[int, ...],
-    right_key_indices: tuple[int, ...],
-    left_partitioning: NormalizedPartitioning,
-    right_partitioning: NormalizedPartitioning,
-    collective_ids: list[int],
-    tracer: ActorTracer | None,
-) -> tuple[ShuffleManager | None, ShuffleManager | None]:
-    left_partitioning_desired = NormalizedPartitioning(
-        inter_rank_modulus=modulus,
-        inter_rank_indices=left_key_indices,
-        local_modulus=None,
-        local_indices=(),
-    )
-    right_partitioning_desired = NormalizedPartitioning(
-        inter_rank_modulus=modulus,
-        inter_rank_indices=right_key_indices,
-        local_modulus=None,
-        local_indices=(),
-    )
-
-    shuffle_left = (
-        not left_partitioning or left_partitioning != left_partitioning_desired
-    )
-    shuffle_right = (
-        not right_partitioning or right_partitioning != right_partitioning_desired
-    )
-
-    left_shuffle = (
-        ShuffleManager(
-            context,
-            modulus,
-            left_partitioning_desired.inter_rank_indices,
-            collective_ids.pop(0),
-        )
-        if shuffle_left
-        else None
-    )
-
-    right_shuffle = (
-        ShuffleManager(
-            context,
-            modulus,
-            right_partitioning_desired.inter_rank_indices,
-            collective_ids.pop(0),
-        )
-        if shuffle_right
-        else None
-    )
-
-    if tracer is not None:
-        if shuffle_left and shuffle_right:
-            tracer.decision = "shuffle"
-        elif shuffle_left:
-            tracer.decision = "shuffle_left"
-        elif shuffle_right:
-            tracer.decision = "shuffle_right"
-        else:
-            tracer.decision = "chunkwise"
-
-    return left_shuffle, right_shuffle
-
-
-async def drain_into_shuffle(
-    context: Context,
-    ch: Channel[TableChunk],
-    shuffle: ShuffleManager | None,
-    sample_chunks: list[TableChunk],
-) -> None:
-    """Drain sample chunks and channel into a shuffle manager, then mark finished."""
-    if shuffle is not None:
-        while sample_chunks:
-            shuffle.insert_chunk(
-                sample_chunks.pop(0).make_available_and_spill(
-                    context.br(), allow_overbooking=True
-                )
-            )
-        while (msg := await ch.recv(context)) is not None:
-            shuffle.insert_chunk(
-                TableChunk.from_message(msg).make_available_and_spill(
-                    context.br(), allow_overbooking=True
-                )
-            )
-        await shuffle.insert_finished()
-
-
-async def get_unshuffled_chunk(
-    context: Context,
-    ch: Channel[TableChunk],
-    sample_chunks: list[TableChunk],
-) -> TableChunk | None:
-    """Return next chunk from sample list or channel."""
-    if sample_chunks:
-        return sample_chunks.pop(0)
-    if (msg := await ch.recv(context)) is not None:
-        return TableChunk.from_message(msg).make_available_and_spill(
-            context.br(), allow_overbooking=True
-        )
-    return None
-
-
-async def get_dataframe_to_join(
-    context: Context,
-    ch: Channel[TableChunk],
-    sample_chunks: list[TableChunk],
-    *,
-    shuffle: ShuffleManager | None,
-    partition_id: int,
-    stream: Stream,
-    child: IR,
-) -> DataFrame:
-    """Get the next DataFrame (from shuffle or channel) for one side of the join."""
-    if shuffle is not None:
-        table = await shuffle.extract_chunk(partition_id, stream)
-        if table.num_rows() == 0 and len(table.columns()) == 0:
-            table = empty_table_chunk(child, context, stream).table_view()
-    else:
-        chunk = await get_unshuffled_chunk(context, ch, sample_chunks)
-        if chunk is None:
-            chunk = empty_table_chunk(child, context, stream)
-        else:
-            stream = chunk.stream
-        table = chunk.table_view()
-
-    return DataFrame.from_table(
-        table, list(child.schema.keys()), list(child.schema.values()), stream
     )
 
 
@@ -585,62 +400,94 @@ async def _join_chunks(
     ch_out: Channel[TableChunk],
     ch_left: Channel[TableChunk],
     ch_right: Channel[TableChunk],
-    left_sample_chunks: list[TableChunk],
-    right_sample_chunks: list[TableChunk],
-    left_shuffle: ShuffleManager | None,
-    right_shuffle: ShuffleManager | None,
-    *,
-    partition_id: int,
     tracer: ActorTracer | None,
 ) -> None:
+    # Consume metadata from both shuffle outputs before reading data
+    await asyncio.gather(
+        recv_metadata(ch_left, context),
+        recv_metadata(ch_right, context),
+    )
+    seq_num = 0
     left, right = ir.children
-    stream = ir_context.get_cuda_stream()
-    left_df, right_df = await asyncio.gather(
-        get_dataframe_to_join(
-            context,
-            ch_left,
-            left_sample_chunks,
-            shuffle=left_shuffle,
-            partition_id=partition_id,
-            stream=stream,
-            child=left,
-        ),
-        get_dataframe_to_join(
-            context,
-            ch_right,
-            right_sample_chunks,
-            shuffle=right_shuffle,
-            partition_id=partition_id,
-            stream=stream,
-            child=right,
-        ),
-    )
-
-    input_bytes = sum(
-        col.device_buffer_size()
-        for col in (*left_df.table.columns(), *right_df.table.columns())
-    )
-    with opaque_memory_usage(
-        await reserve_memory(context, size=input_bytes, net_memory_delta=0)
-    ):
-        df = await asyncio.to_thread(
-            ir.do_evaluate,
-            *ir._non_child_args,
-            left_df,
-            right_df,
-            context=ir_context,
+    while True:
+        left_msg, right_msg = await asyncio.gather(
+            ch_left.recv(context), ch_right.recv(context)
         )
-        del left_df, right_df
-    if tracer is not None:
-        tracer.add_chunk(table=df.table)
-    await ch_out.send(
-        context,
-        Message(
-            partition_id,
-            TableChunk.from_pylibcudf_table(df.table, df.stream, exclusive_view=True),
-        ),
+        if left_msg is None or right_msg is None:
+            break
+
+        left_chunk = TableChunk.from_message(left_msg).make_available_and_spill(
+            context.br(), allow_overbooking=True
+        )
+        right_chunk = TableChunk.from_message(right_msg).make_available_and_spill(
+            context.br(), allow_overbooking=True
+        )
+
+        input_bytes = sum(
+            col.device_buffer_size()
+            for col in (
+                *left_chunk.table_view().columns(),
+                *right_chunk.table_view().columns(),
+            )
+        )
+        with opaque_memory_usage(
+            await reserve_memory(context, size=input_bytes, net_memory_delta=0)
+        ):
+            df = await asyncio.to_thread(
+                ir.do_evaluate,
+                *ir._non_child_args,
+                chunk_to_frame(left_chunk, left),
+                chunk_to_frame(right_chunk, right),
+                context=ir_context,
+            )
+            del left_chunk, right_chunk
+        if tracer is not None:
+            tracer.add_chunk(table=df.table)
+        await ch_out.send(
+            context,
+            Message(
+                seq_num,
+                TableChunk.from_pylibcudf_table(
+                    df.table, df.stream, exclusive_view=True
+                ),
+            ),
+        )
+        seq_num += 1
+        del df
+
+    await ch_out.drain(context)
+
+
+def _log_strategy_decision(
+    tracer: ActorTracer,
+    partitioning_left: NormalizedPartitioning,
+    partitioning_right: NormalizedPartitioning,
+    indices_left: tuple[int, ...],
+    indices_right: tuple[int, ...],
+    modulus: int,
+) -> None:
+    left_partitioning_desired = NormalizedPartitioning(
+        inter_rank_modulus=modulus,
+        inter_rank_indices=indices_left,
+        local_modulus=None,
+        local_indices=(),
     )
-    del df
+    right_partitioning_desired = NormalizedPartitioning(
+        inter_rank_modulus=modulus,
+        inter_rank_indices=indices_right,
+        local_modulus=None,
+        local_indices=(),
+    )
+    left_partitioned = partitioning_left == left_partitioning_desired
+    right_partitioned = partitioning_right == right_partitioning_desired
+    if left_partitioned and right_partitioned:
+        tracer.decision = "chunkwise"
+    elif left_partitioned:
+        tracer.decision = "shuffle_right"
+    elif right_partitioned:
+        tracer.decision = "shuffle_left"
+    else:
+        tracer.decision = "shuffle"
 
 
 async def _shuffle_join(
@@ -650,22 +497,22 @@ async def _shuffle_join(
     ch_out: Channel[TableChunk],
     ch_left: Channel[TableChunk],
     ch_right: Channel[TableChunk],
+    left_metadata: ChannelMetadata,
+    right_metadata: ChannelMetadata,
     left_partitioning: NormalizedPartitioning,
     right_partitioning: NormalizedPartitioning,
-    min_shuffle_modulus: int,
+    strategy: JoinStrategy,
     collective_ids: list[int],
     *,
     tracer: ActorTracer | None,
     n_partitioned_keys: int | None = None,
-    left_sample_chunks: list[TableChunk] | None = None,
-    right_sample_chunks: list[TableChunk] | None = None,
 ) -> None:
     """Execute a shuffle (hash) join."""
     modulus = _choose_shuffle_modulus(
         context,
         left_partitioning,
         right_partitioning,
-        min_shuffle_modulus,
+        strategy.min_shuffle_modulus,
     )  # Global modulus
 
     left_key_indices, right_key_indices, output_key_indices = _get_key_indices(
@@ -685,46 +532,56 @@ async def _shuffle_join(
     )
     await send_metadata(ch_out, context, metadata_out)
 
-    left_shuffle, right_shuffle = _create_shuffle_managers(
-        context,
-        modulus,
-        left_key_indices,
-        right_key_indices,
-        left_partitioning,
-        right_partitioning,
-        collective_ids,
-        tracer,
-    )
-    await asyncio.gather(
-        drain_into_shuffle(context, ch_left, left_shuffle, left_sample_chunks or []),
-        drain_into_shuffle(context, ch_right, right_shuffle, right_sample_chunks or []),
-    )
-
-    partition_ids: list[int]
-    if left_shuffle is not None:
-        partition_ids = left_shuffle.local_partitions()
-    elif right_shuffle is not None:
-        partition_ids = right_shuffle.local_partitions()
-    else:
-        partition_ids = list(range(local_count))
-    for partition_id in partition_ids:
-        await _join_chunks(
-            context,
-            ir,
-            ir_context,
-            ch_out,
-            ch_left,
-            ch_right,
-            left_sample_chunks or [],
-            right_sample_chunks or [],
-            left_shuffle,
-            right_shuffle,
-            partition_id=partition_id,
-            tracer=tracer,
+    if tracer is not None:
+        _log_strategy_decision(
+            tracer,
+            left_partitioning,
+            right_partitioning,
+            left_key_indices,
+            right_key_indices,
+            modulus,
         )
 
-    del left_shuffle, right_shuffle
-    await ch_out.drain(context)
+    # Construct a shuffle-shuffle-join pipeline.
+    # The shuffle operations will pass chunks through unchanged
+    # if the data is already partitioned correctly.
+    ch_left_shuffle = context.create_channel()
+    ch_right_shuffle = context.create_channel()
+    async with shutdown_on_error(context, ch_left_shuffle, ch_right_shuffle):
+        tasks = [
+            _global_shuffle(
+                context,
+                ir_context,
+                ch_left,
+                ch_left_shuffle,
+                left_key_indices,
+                modulus,
+                collective_ids.pop(0),
+                left_metadata,
+                buffered_chunks=strategy.left_sample.chunks,
+            ),
+            _global_shuffle(
+                context,
+                ir_context,
+                ch_right,
+                ch_right_shuffle,
+                right_key_indices,
+                modulus,
+                collective_ids.pop(0),
+                right_metadata,
+                buffered_chunks=strategy.right_sample.chunks,
+            ),
+            _join_chunks(
+                context,
+                ir,
+                ir_context,
+                ch_out,
+                ch_left_shuffle,
+                ch_right_shuffle,
+                tracer=tracer,
+            ),
+        ]
+        await asyncio.gather(*tasks)
 
 
 async def _choose_strategy(
@@ -732,12 +589,11 @@ async def _choose_strategy(
     ir: Join,
     left_metadata: ChannelMetadata,
     right_metadata: ChannelMetadata,
-    left_sample: ChildSample,
-    right_sample: ChildSample,
+    left_sample: JoinChunkSample,
+    right_sample: JoinChunkSample,
+    executor: StreamingExecutor,
     collective_ids: list[int],
-    broadcast_threshold: int,
-    target_partition_size: int,
-) -> tuple[Literal["left", "right"] | None, int]:
+) -> JoinStrategy:
     """Choose potential broadcast side and minimum shuffle modulus."""
     left_local_count = left_metadata.local_count
     right_local_count = right_metadata.local_count
@@ -793,78 +649,50 @@ async def _choose_strategy(
     # - Right: must broadcast left (stream right to preserve all right rows)
     # - Full: cannot broadcast (must shuffle both to preserve both sides)
 
-    join_type = ir.options[0]
-    can_broadcast_left = join_type in ("Inner", "Right")
-    can_broadcast_right = join_type in ("Inner", "Left", "Semi", "Anti")
-
-    # Check if one side is already duplicated
-    left_duplicated = left_metadata.duplicated
-    right_duplicated = right_metadata.duplicated
-
-    # Check row counts - can't broadcast if concatenated rows exceed cuDF limit
-    left_rows_ok = left_total_rows < MAX_BROADCAST_ROWS
-    right_rows_ok = right_total_rows < MAX_BROADCAST_ROWS
+    # Determine which sides may be broadcasted
+    broadcast_threshold = executor.target_partition_size * executor.broadcast_join_limit
+    left_size_ok = left_total < broadcast_threshold and (
+        left_total_rows < MAX_BROADCAST_ROWS or left_metadata.duplicated
+    )
+    right_size_ok = right_total < broadcast_threshold and (
+        right_total_rows < MAX_BROADCAST_ROWS or right_metadata.duplicated
+    )
+    can_broadcast_left = left_size_ok and ir.options[0] in ("Inner", "Right")
+    can_broadcast_right = right_size_ok and ir.options[0] in (
+        "Inner",
+        "Left",
+        "Semi",
+        "Anti",
+    )
 
     # Determine strategy
     broadcast_side: Literal["left", "right"] | None = None
-
-    if nranks == 1:
-        # Single rank - no network cost, but still prefer smaller side for
-        # hash table efficiency. Also check broadcast threshold.
-        left_ok = (
-            left_total < broadcast_threshold and left_rows_ok and can_broadcast_left
-        )
-        right_ok = right_total < broadcast_threshold and right_rows_ok
-
-        if left_ok and right_ok:
-            # Both sides OK - broadcast the side with fewer rows
-            # Row count is a better indicator of hash table size than byte size
-            broadcast_side = (
-                "left"
-                if (not can_broadcast_right or left_total_rows <= right_total_rows)
-                else "right"
-            )
-        elif right_ok and can_broadcast_right:
-            broadcast_side = "right"
-        elif left_ok:
+    if can_broadcast_left and can_broadcast_right:
+        # Choose side that is already duplicated.
+        # If both or neither are duplicated, choose the side with fewer rows.
+        if left_metadata.duplicated == right_metadata.duplicated:
+            broadcast_side = "right" if right_total_rows <= left_total_rows else "left"
+        elif left_metadata.duplicated:
             broadcast_side = "left"
-        # else: fall through to shuffle
-    elif right_duplicated and right_rows_ok and can_broadcast_right:
-        # Right already duplicated - broadcast right (no allgather needed)
-        broadcast_side = "right"
-    elif left_duplicated and can_broadcast_left and left_rows_ok:
-        # Left already duplicated - broadcast left (only for Inner)
+        else:
+            broadcast_side = "right"
+    elif can_broadcast_left:
         broadcast_side = "left"
-    else:
-        # Decide based on size estimates - broadcast the smaller side if possible
-        # Must also check row counts to avoid exceeding cuDF column size limit
-        left_small_enough = (
-            left_total < broadcast_threshold and can_broadcast_left and left_rows_ok
-        )
-        right_small_enough = right_total < broadcast_threshold and right_rows_ok
-
-        if left_small_enough and right_small_enough:
-            # Both are small enough - broadcast the smaller one (if both allowed)
-            broadcast_side = (
-                "left"
-                if (not can_broadcast_right or left_total <= right_total)
-                else "right"
-            )
-        elif right_small_enough and can_broadcast_right:
-            # Only right is small enough
-            broadcast_side = "right"
-        elif left_small_enough:
-            # Only left is small enough (Inner or Right join)
-            broadcast_side = "left"
-        # else: shuffle both sides
+    elif can_broadcast_right:
+        broadcast_side = "right"
 
     estimated_output_size = max(left_total, right_total)
-    ideal_output_count = max(1, estimated_output_size // target_partition_size)
+    ideal_output_count = max(1, estimated_output_size // executor.target_partition_size)
     # Limit the output count to 10x the larger input side
     max_output_chunks = 10 * max(left_total_chunks, right_total_chunks)
     min_shuffle_modulus = min(ideal_output_count, max_output_chunks)
 
-    return broadcast_side, min_shuffle_modulus
+    return JoinStrategy(
+        broadcast_side=broadcast_side,
+        min_shuffle_modulus=min_shuffle_modulus,
+        left_sample=left_sample,
+        right_sample=right_sample,
+    )
 
 
 def _choose_shuffle_modulus(
@@ -874,47 +702,25 @@ def _choose_shuffle_modulus(
     min_shuffle_modulus: int,
 ) -> int:
     """Choose an appropriate modulus for a shuffle join."""
-    left_existing_modulus = (
-        left_partitioning.inter_rank_modulus if left_partitioning else None
-    )
-    right_existing_modulus = (
+    left_modulus = left_partitioning.inter_rank_modulus if left_partitioning else None
+    right_modulus = (
         right_partitioning.inter_rank_modulus if right_partitioning else None
     )
-
-    # Determine which modulus to use, preferring existing partitioning
-    # if it provides at least the minimum needed partitions
-    if left_existing_modulus and right_existing_modulus:
-        # Both sides partitioned - use the larger modulus if compatible
-        # (one must be a multiple of the other for compatibility)
-        if left_existing_modulus >= right_existing_modulus:
-            if left_existing_modulus % right_existing_modulus == 0:
-                modulus = left_existing_modulus
-            else:
-                # Incompatible - use whichever is larger
-                modulus = max(left_existing_modulus, right_existing_modulus)
-        else:
-            if right_existing_modulus % left_existing_modulus == 0:
-                modulus = right_existing_modulus
-            else:
-                modulus = max(left_existing_modulus, right_existing_modulus)
-    elif left_existing_modulus is not None:
-        # Only left is partitioned - use its modulus if sufficient
-        modulus = left_existing_modulus
-    elif right_existing_modulus is not None:
-        # Only right is partitioned - use its modulus if sufficient
-        modulus = right_existing_modulus
+    default_modulus = max(context.comm().nranks, min_shuffle_modulus)
+    small, large = sorted(
+        [left_modulus or default_modulus, right_modulus or default_modulus]
+    )
+    if large % small == 0:
+        return small
     else:
-        # Neither side partitioned - can choose freely
-        # Use at least nranks for distributed efficiency
-        modulus = context.comm().nranks
-    return max(modulus, min_shuffle_modulus)
+        return large
 
 
 async def _sample_chunks(
     context: Context,
     ch: Channel[TableChunk],
     sample_chunk_count: int,
-) -> ChildSample:
+) -> JoinChunkSample:
     """Sample up to sample_chunk_count chunks from a channel; return chunks and stats."""
     chunks: list[TableChunk] = []
     total_size = 0
@@ -929,7 +735,7 @@ async def _sample_chunks(
         chunks.append(chunk)
         total_size += chunk.data_alloc_size(MemoryType.DEVICE)
         total_rows += chunk.table_view().num_rows()
-    return ChildSample(chunks=chunks, total_size=total_size, total_rows=total_rows)
+    return JoinChunkSample(chunks=chunks, total_size=total_size, total_rows=total_rows)
 
 
 async def _sample_and_choose_strategy(
@@ -939,32 +745,25 @@ async def _sample_and_choose_strategy(
     ch_right: Channel[TableChunk],
     left_metadata: ChannelMetadata,
     right_metadata: ChannelMetadata,
-    sample_chunk_count: int,
-    broadcast_threshold: int,
-    target_partition_size: int,
+    executor: StreamingExecutor,
     collective_ids: list[int],
 ) -> JoinStrategy:
     """Sample both sides, allgather estimates, and choose broadcast vs shuffle."""
+    assert executor.dynamic_planning is not None
+    sample_chunk_count = executor.dynamic_planning.sample_chunk_count
     left_sample, right_sample = await asyncio.gather(
         _sample_chunks(context, ch_left, sample_chunk_count),
         _sample_chunks(context, ch_right, sample_chunk_count),
     )
-    broadcast_side, min_shuffle_modulus = await _choose_strategy(
+    return await _choose_strategy(
         context,
         ir,
         left_metadata,
         right_metadata,
         left_sample,
         right_sample,
+        executor,
         collective_ids,
-        broadcast_threshold,
-        target_partition_size,
-    )
-    return JoinStrategy(
-        broadcast_side=broadcast_side,
-        min_shuffle_modulus=min_shuffle_modulus,
-        left_sample=left_sample,
-        right_sample=right_sample,
     )
 
 
@@ -976,9 +775,7 @@ async def join_actor(
     ch_out: Channel[TableChunk],
     ch_left: Channel[TableChunk],
     ch_right: Channel[TableChunk],
-    sample_chunk_count: int,
-    broadcast_threshold: int,
-    target_partition_size: int,
+    executor: StreamingExecutor,
     collective_ids: list[int],
 ) -> None:
     """
@@ -1002,12 +799,8 @@ async def join_actor(
         Input channel for the left side.
     ch_right
         Input channel for the right side.
-    sample_chunk_count
-        Number of chunks to sample per side for strategy selection.
-    broadcast_threshold
-        Max rows on one side to allow broadcast join (small side sent to all ranks).
-    target_partition_size
-        Target partition size used when choosing shuffle modulus.
+    executor
+        Streaming executor configuration.
     collective_ids
         List of collective IDs for shuffle/broadcast; consumed as needed.
     """
@@ -1019,97 +812,37 @@ async def join_actor(
             recv_metadata(ch_right, context),
         )
 
-        partitioning: Partitioning | None = None
-        if broadcast_side == "right":
-            # Broadcast right, stream left
-            small_ch = ch_right
-            large_ch = ch_left
-            small_child = ir.children[1]
-            large_child = ir.children[0]
-            # Preserve left-side partitioning metadata
-            local_count = left_metadata.local_count
-            # Remap partitioning from child schema to output schema
-            partitioning = maybe_remap_partitioning(
-                ir,
-                left_metadata.partitioning,
-                child_index=0,
-            )
-            # Check if the right-side is already broadcasted
-            small_duplicated = right_metadata.duplicated
-        else:
-            # Broadcast left, stream right
-            small_ch = ch_left
-            large_ch = ch_right
-            small_child = ir.children[0]
-            large_child = ir.children[1]
-            # Preserve right-side partitioning metadata
-            local_count = right_metadata.local_count
-            if ir.options[0] == "Right":
-                # Remap partitioning from child schema to output schema
-                partitioning = maybe_remap_partitioning(
-                    ir,
-                    right_metadata.partitioning,
-                    child_index=1,
-                )
-            # Check if the right-side is already broadcasted
-            small_duplicated = left_metadata.duplicated
-
-        if tracer is not None:
-            tracer.decision = f"broadcast_{broadcast_side}"
-
-        # Determine which metadata belongs to the large side
-        large_metadata = left_metadata if broadcast_side == "right" else right_metadata
-
-        # Allgather is a collective - all ranks must participate even with no local data
-        need_allgather = context.comm().nranks > 1 and not small_duplicated
-
-        # The result is duplicated if:
-        # - The small side is/will be duplicated (already duplicated OR will be AllGathered)
-        # - AND the large side is already duplicated
-        output_duplicated = (
-            small_duplicated or need_allgather
-        ) and large_metadata.duplicated
-
-        # Send metadata.
-        output_metadata = ChannelMetadata(
-            local_count=local_count,
-            partitioning=partitioning,
-            duplicated=output_duplicated,
+        nranks = context.comm().nranks
+        left_partitioning = NormalizedPartitioning.from_indices(
+            left_metadata.partitioning,
+            nranks,
+            indices=names_to_indices(ir.left_on, ir.children[0].schema),
+        )
+        right_partitioning = NormalizedPartitioning.from_indices(
+            right_metadata.partitioning,
+            nranks,
+            indices=names_to_indices(ir.right_on, ir.children[1].schema),
         )
 
-        # Skip sampling when both sides have aligned partitioning
-        if left_partitioning and left_partitioning == right_partitioning:
-            await _shuffle_join(
+        if left_partitioning.is_compatible_with(right_partitioning):
+            # Both sides already partitioned - skip sampling
+            strategy = JoinStrategy(
+                min_shuffle_modulus=left_partitioning.inter_rank_modulus
+            )
+        else:
+            strategy = await _sample_and_choose_strategy(
                 context,
                 ir,
-                ir_context,
-                ch_out,
                 ch_left,
                 ch_right,
-                left_partitioning,
-                right_partitioning,
-                left_partitioning.inter_rank_modulus,
+                left_metadata,
+                right_metadata,
+                executor,
                 collective_ids,
-                n_partitioned_keys=len(left_partitioning.inter_rank_indices),
-                tracer=tracer,
             )
-            return
-
-        strategy = await _sample_and_choose_strategy(
-            context,
-            ir,
-            ch_left,
-            ch_right,
-            left_metadata,
-            right_metadata,
-            sample_chunk_count,
-            broadcast_threshold,
-            target_partition_size,
-            collective_ids,
-        )
 
         if strategy.broadcast_side is not None:
-            await _broadcast_join(
+            return await _broadcast_join(
                 context,
                 ir,
                 ir_context,
@@ -1118,27 +851,25 @@ async def join_actor(
                 ch_right,
                 left_metadata,
                 right_metadata,
-                strategy.left_sample.chunks,
-                strategy.right_sample.chunks,
-                strategy.broadcast_side,
+                strategy,
                 collective_ids,
-                target_partition_size,
+                executor.target_partition_size,
                 tracer=tracer,
             )
         else:
-            await _shuffle_join(
+            return await _shuffle_join(
                 context,
                 ir,
                 ir_context,
                 ch_out,
                 ch_left,
                 ch_right,
+                left_metadata,
+                right_metadata,
                 left_partitioning,
                 right_partitioning,
-                strategy.min_shuffle_modulus,
+                strategy,
                 collective_ids,
-                left_sample_chunks=strategy.left_sample.chunks,
-                right_sample_chunks=strategy.right_sample.chunks,
                 tracer=tracer,
             )
 
@@ -1209,9 +940,6 @@ def _(
                 f"{len(collective_ids)} for this Join. "
                 "Ensure ReserveOpIDs is run with dynamic_planning enabled."
             )
-        broadcast_threshold = (
-            executor.target_partition_size * executor.broadcast_join_limit
-        )
         actors[ir] = [
             join_actor(
                 rec.state["context"],
@@ -1220,9 +948,7 @@ def _(
                 channels[ir].reserve_input_slot(),
                 channels[left].reserve_output_slot(),
                 channels[right].reserve_output_slot(),
-                executor.dynamic_planning.sample_chunk_count,
-                broadcast_threshold,
-                executor.target_partition_size,
+                executor,
                 collective_ids,
             )
         ]
