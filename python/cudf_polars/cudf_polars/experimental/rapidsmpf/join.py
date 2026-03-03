@@ -310,7 +310,7 @@ async def _broadcast_join(
         large_initial_chunks = strategy.left_sample.chunks
         local_count = left_metadata.local_count
         partitioning: Partitioning | None = maybe_remap_partitioning(
-            ir, left_metadata.partitioning, child_index=0
+            ir, left_metadata.partitioning, child_ir=ir.children[0]
         )
     else:
         small_ch, large_ch = ch_left, ch_right
@@ -320,7 +320,9 @@ async def _broadcast_join(
         large_initial_chunks = strategy.right_sample.chunks
         local_count = right_metadata.local_count
         partitioning = (
-            maybe_remap_partitioning(ir, right_metadata.partitioning, child_index=1)
+            maybe_remap_partitioning(
+                ir, right_metadata.partitioning, child_ir=ir.children[1]
+            )
             if ir.options[0] == "Right"
             else None
         )
