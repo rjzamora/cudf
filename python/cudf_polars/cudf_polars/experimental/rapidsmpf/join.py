@@ -39,9 +39,9 @@ from cudf_polars.experimental.rapidsmpf.utils import (
     allgather_reduce,
     chunk_to_frame,
     empty_table_chunk,
+    maybe_remap_partitioning,
     process_children,
     recv_metadata,
-    remap_partitioning,
     send_metadata,
     shutdown_on_error,
 )
@@ -1019,12 +1019,62 @@ async def join_actor(
             recv_metadata(ch_right, context),
         )
 
-        nranks = context.comm().nranks
-        left_partitioning = NormalizedPartitioning.resolve_from_exprs(
-            left_metadata, nranks, exprs=ir.left_on, schema=ir.children[0].schema
-        )
-        right_partitioning = NormalizedPartitioning.resolve_from_exprs(
-            right_metadata, nranks, exprs=ir.right_on, schema=ir.children[1].schema
+        partitioning: Partitioning | None = None
+        if broadcast_side == "right":
+            # Broadcast right, stream left
+            small_ch = ch_right
+            large_ch = ch_left
+            small_child = ir.children[1]
+            large_child = ir.children[0]
+            # Preserve left-side partitioning metadata
+            local_count = left_metadata.local_count
+            # Remap partitioning from child schema to output schema
+            partitioning = maybe_remap_partitioning(
+                ir,
+                left_metadata.partitioning,
+                child_index=0,
+            )
+            # Check if the right-side is already broadcasted
+            small_duplicated = right_metadata.duplicated
+        else:
+            # Broadcast left, stream right
+            small_ch = ch_left
+            large_ch = ch_right
+            small_child = ir.children[0]
+            large_child = ir.children[1]
+            # Preserve right-side partitioning metadata
+            local_count = right_metadata.local_count
+            if ir.options[0] == "Right":
+                # Remap partitioning from child schema to output schema
+                partitioning = maybe_remap_partitioning(
+                    ir,
+                    right_metadata.partitioning,
+                    child_index=1,
+                )
+            # Check if the right-side is already broadcasted
+            small_duplicated = left_metadata.duplicated
+
+        if tracer is not None:
+            tracer.decision = f"broadcast_{broadcast_side}"
+
+        # Determine which metadata belongs to the large side
+        large_metadata = left_metadata if broadcast_side == "right" else right_metadata
+
+        # Allgather is a collective - all ranks must participate even with no local data
+        need_allgather = context.comm().nranks > 1 and not small_duplicated
+
+        # The result is duplicated if:
+        # - The small side is/will be duplicated (already duplicated OR will be AllGathered)
+        # - AND the large side is already duplicated
+        output_duplicated = (
+            small_duplicated or need_allgather
+        ) and large_metadata.duplicated
+
+        # Send metadata.
+        output_metadata = ChannelMetadata(
+            local_count=local_count,
+            partitioning=partitioning,
+            duplicated=output_duplicated,
         )
 
         # Skip sampling when both sides have aligned partitioning
