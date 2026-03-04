@@ -64,6 +64,7 @@ def test_join_maintain_order(left, right, maintain_order):
 @pytest.mark.parametrize(
     "join_expr",
     [
+        pl.col("a") + pl.col("c"),
         pl.col("a"),
         pl.col("a") * 2,
         [pl.col("a"), pl.col("c") + 1],

@@ -8,7 +8,8 @@ import operator
 from functools import partial, reduce
 from typing import TYPE_CHECKING, Any
 
-from cudf_polars.dsl.ir import ConditionalJoin, Join, Slice
+from cudf_polars.dsl.expr import Col, NamedExpr
+from cudf_polars.dsl.ir import ConditionalJoin, Join, Select, Slice
 from cudf_polars.experimental.base import PartitionInfo, get_key_name
 from cudf_polars.experimental.dispatch import generate_ir_tasks, lower_ir_node
 from cudf_polars.experimental.repartition import Repartition
@@ -241,6 +242,28 @@ def _(
     return new_node, partition_info
 
 
+def _maybe_insert_select(
+    ir: IR,
+    keys: tuple[NamedExpr, ...],
+    partition_info: MutableMapping[IR, PartitionInfo],
+) -> tuple[IR, tuple[NamedExpr, ...]]:
+    if all(isinstance(key.value, Col) for key in keys):
+        return ir, keys
+
+    select_exprs = {
+        name: NamedExpr(name, Col(dtype, name)) for name, dtype in ir.schema.items()
+    }
+    new_keys = []
+    for key in keys:
+        name = key.name
+        select_exprs[name] = key
+        new_keys.append(NamedExpr(name, Col(select_exprs[name].value.dtype, name)))
+    left_schema = {name: select_exprs[name].value.dtype for name in select_exprs}
+    new_ir = Select(left_schema, list(select_exprs.values()), False, ir)
+    partition_info[new_ir] = partition_info[ir]
+    return new_ir, new_keys
+
+
 @lower_ir_node.register(Join)
 def _(
     ir: Join, rec: LowerIRTransformer
@@ -271,7 +294,12 @@ def _(
     config_options = rec.state["config_options"]
     dynamic_planning = _dynamic_planning_on(config_options)
 
+    # Make sure we are joining on simple keys
     left, right = children
+    left, left_on = _maybe_insert_select(left, ir.left_on, partition_info)
+    right, right_on = _maybe_insert_select(right, ir.right_on, partition_info)
+    ir = Join(ir.schema, left_on, right_on, ir.options, left, right)
+
     output_count = max(partition_info[left].count, partition_info[right].count)
     if output_count == 1 and not dynamic_planning:
         new_node = ir.reconstruct(children)
