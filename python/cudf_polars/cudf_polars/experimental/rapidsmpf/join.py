@@ -739,7 +739,7 @@ async def _choose_strategy_from_samples(
     max_estimated_rows = max(left_total_rows, right_total_rows)
     min_partitions_for_row_limit = 1
     if max_estimated_rows > 0:
-        max_rows_per_partition = max(1, CUDF_ROW_LIMIT // 4)  # 4x headroom for skew
+        max_rows_per_partition = max(1, CUDF_ROW_LIMIT // 4)
         min_partitions_for_row_limit = (
             max_estimated_rows + max_rows_per_partition - 1
         ) // max_rows_per_partition
@@ -873,42 +873,10 @@ async def _choose_strategy(
     )
 
     if left_partitioning.is_compatible_with(right_partitioning):
-        # Chunkwise join when partitioning aligns - but skip when modulus is 1
-        # so we can sample and enforce the cuDF row-limit floor (single partition
-        # would overflow on large inputs).
-        modulus = left_partitioning.inter_rank_modulus
-        if modulus >= 2:
-            chunkwise = True
-            left_sample = JoinSideStats(total_chunks=left_metadata.local_count)
-            right_sample = JoinSideStats(total_chunks=right_metadata.local_count)
-        else:
-            chunkwise = False
-            assert executor.dynamic_planning is not None
-            sample_chunk_count = executor.dynamic_planning.sample_chunk_count
-            target_partition_size = executor.target_partition_size
-            left_sample, right_sample = await asyncio.gather(
-                _sample_chunks(
-                    context,
-                    ch_left,
-                    sample_chunk_count,
-                    target_partition_size,
-                    left_metadata.local_count,
-                ),
-                _sample_chunks(
-                    context,
-                    ch_right,
-                    sample_chunk_count,
-                    target_partition_size,
-                    right_metadata.local_count,
-                ),
-            )
-            left_sample, right_sample = await _aggregate_estimates(
-                context,
-                comm,
-                left_sample,
-                right_sample,
-                collective_ids,
-            )
+        # We can use a chunkwise join
+        chunkwise = True
+        left_sample = JoinSideStats(total_chunks=left_metadata.local_count)
+        right_sample = JoinSideStats(total_chunks=right_metadata.local_count)
     else:
         # Need to shuffle or broadcast - Use sampled data to choose a strategy
         chunkwise = False
