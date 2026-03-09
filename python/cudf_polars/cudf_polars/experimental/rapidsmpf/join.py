@@ -787,10 +787,10 @@ def _choose_shuffle_modulus(
     small, large = sorted(
         [left_modulus or default_modulus, right_modulus or default_modulus]
     )
-    if large % small == 0:
+    if large % small == 0 and small >= min_shuffle_modulus:
         return small
     else:
-        return large
+        return max(large, min_shuffle_modulus)
 
 
 async def _sample_chunks(
