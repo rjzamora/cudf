@@ -734,11 +734,15 @@ async def _choose_strategy_from_samples(
     max_output_chunks = 10 * max(left_total_chunks, right_total_chunks)
     min_shuffle_modulus = min(ideal_output_count, max_output_chunks)
     # Ensure no shuffle partition can exceed cuDF's row limit when concatenating.
+    # Use a safety factor so average rows per partition stays well under the limit
+    # (hash skew can make some partitions much larger than average).
     max_estimated_rows = max(left_total_rows, right_total_rows)
+    min_partitions_for_row_limit = 1
     if max_estimated_rows > 0:
+        max_rows_per_partition = max(1, CUDF_ROW_LIMIT // 4)  # 4x headroom for skew
         min_partitions_for_row_limit = (
-            max_estimated_rows + CUDF_ROW_LIMIT - 1
-        ) // CUDF_ROW_LIMIT
+            max_estimated_rows + max_rows_per_partition - 1
+        ) // max_rows_per_partition
         min_shuffle_modulus = max(min_shuffle_modulus, min_partitions_for_row_limit)
     shuffle_modulus = _choose_shuffle_modulus(
         comm,
@@ -746,6 +750,9 @@ async def _choose_strategy_from_samples(
         right_partitioning,
         min_shuffle_modulus,
     )  # Global modulus
+    # _choose_shuffle_modulus may return the smaller modulus for divisibility;
+    # enforce row-limit floor so we never exceed cuDF capacity.
+    shuffle_modulus = max(shuffle_modulus, min_partitions_for_row_limit)
 
     strategy = _make_shuffle_strategy(
         ir, shuffle_modulus, left_partitioning, right_partitioning
@@ -866,10 +873,42 @@ async def _choose_strategy(
     )
 
     if left_partitioning.is_compatible_with(right_partitioning):
-        # We can use a chunkwise join
-        chunkwise = True
-        left_sample = JoinSideStats(total_chunks=left_metadata.local_count)
-        right_sample = JoinSideStats(total_chunks=right_metadata.local_count)
+        # Chunkwise join when partitioning aligns - but skip when modulus is 1
+        # so we can sample and enforce the cuDF row-limit floor (single partition
+        # would overflow on large inputs).
+        modulus = left_partitioning.inter_rank_modulus
+        if modulus >= 2:
+            chunkwise = True
+            left_sample = JoinSideStats(total_chunks=left_metadata.local_count)
+            right_sample = JoinSideStats(total_chunks=right_metadata.local_count)
+        else:
+            chunkwise = False
+            assert executor.dynamic_planning is not None
+            sample_chunk_count = executor.dynamic_planning.sample_chunk_count
+            target_partition_size = executor.target_partition_size
+            left_sample, right_sample = await asyncio.gather(
+                _sample_chunks(
+                    context,
+                    ch_left,
+                    sample_chunk_count,
+                    target_partition_size,
+                    left_metadata.local_count,
+                ),
+                _sample_chunks(
+                    context,
+                    ch_right,
+                    sample_chunk_count,
+                    target_partition_size,
+                    right_metadata.local_count,
+                ),
+            )
+            left_sample, right_sample = await _aggregate_estimates(
+                context,
+                comm,
+                left_sample,
+                right_sample,
+                collective_ids,
+            )
     else:
         # Need to shuffle or broadcast - Use sampled data to choose a strategy
         chunkwise = False
