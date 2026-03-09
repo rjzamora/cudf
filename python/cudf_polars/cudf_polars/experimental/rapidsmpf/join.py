@@ -733,26 +733,21 @@ async def _choose_strategy_from_samples(
     # from blowing up the chunk count.
     max_output_chunks = 10 * max(left_total_chunks, right_total_chunks)
     min_shuffle_modulus = min(ideal_output_count, max_output_chunks)
-    # Ensure no shuffle partition can exceed cuDF's row limit when concatenating.
-    # Use a safety factor so average rows per partition stays well under the limit
-    # (hash skew can make some partitions much larger than average).
-    max_estimated_rows = max(left_total_rows, right_total_rows)
-    min_partitions_for_row_limit = 1
-    if max_estimated_rows > 0:
+
+    # Stay away from cuDF's row limit
+    if (estimated_rows_count := max(left_total_rows, right_total_rows)) > 0:
         max_rows_per_partition = max(1, CUDF_ROW_LIMIT // 4)
         min_partitions_for_row_limit = (
-            max_estimated_rows + max_rows_per_partition - 1
+            estimated_rows_count + max_rows_per_partition - 1
         ) // max_rows_per_partition
         min_shuffle_modulus = max(min_shuffle_modulus, min_partitions_for_row_limit)
+
     shuffle_modulus = _choose_shuffle_modulus(
         comm,
         left_partitioning,
         right_partitioning,
         min_shuffle_modulus,
     )  # Global modulus
-    # _choose_shuffle_modulus may return the smaller modulus for divisibility;
-    # enforce row-limit floor so we never exceed cuDF capacity.
-    shuffle_modulus = max(shuffle_modulus, min_partitions_for_row_limit)
 
     strategy = _make_shuffle_strategy(
         ir, shuffle_modulus, left_partitioning, right_partitioning
