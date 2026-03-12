@@ -460,6 +460,19 @@ def _(
 def _(
     ir: HStack, rec: LowerIRTransformer
 ) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    if (
+        not ir.should_broadcast
+        and rec.state["config_options"].executor.runtime == "rapidsmpf"
+    ):
+        # Always use should_broadcast for RapidsMPF (for now).
+        # See https://github.com/rapidsai/cudf/issues/21645
+        ir = HStack(
+            ir.schema,
+            ir.columns,
+            True,  # noqa: FBT003
+            ir.children[0],
+        )
+
     if not all(
         expr.is_pointwise for expr in traversal([e.value for e in ir.columns])
     ):  # pragma: no cover
