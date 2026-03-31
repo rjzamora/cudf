@@ -85,36 +85,35 @@ class ShuffleManager:
         columns_to_hash: tuple[int, ...],
         collective_id: int,
         *,
-        shuffle_mode: ShuffleMode = "flat",
+        shuffle_mode: ShuffleMode,
     ):
         self.context = context
         self.comm = comm
         self.num_partitions = num_partitions
         self.columns_to_hash = columns_to_hash
         self.collective_id = collective_id
+        # Stratified is only beneficial when there are more partitions than ranks;
+        # otherwise stage-2 is a no-op and the behaviour is identical to flat.
+        if shuffle_mode == "stratified" and num_partitions <= comm.nranks:
+            shuffle_mode = "flat"
         self.shuffle_mode = shuffle_mode
         self._local_count = max(1, num_partitions // comm.nranks)
-        self._stage1_partitions = (
+        self._num_partitions_stage1 = (
             comm.nranks if shuffle_mode == "stratified" else num_partitions
         )
         self.shuffler = ShufflerAsync(
             context,
             comm,
             collective_id,
-            self._stage1_partitions,
+            self._num_partitions_stage1,
         )
-        # _local_shuffle is the ShufflerAsync to extract final partitions from.
-        # For flat it stays as self.shuffler; for stratified it is replaced with
-        # the single-rank stage-2 shuffler inside insert_finished.
+        # _local_shuffle is modified in insert_finished
+        # for the stratified shuffle mode.
         self._local_shuffle: ShufflerAsync = self.shuffler
-        self._local_pid_offset: int = 0
 
     def local_partitions(self) -> list[int]:
         """Get the local partition IDs for this rank."""
-        return [
-            pid + self._local_pid_offset
-            for pid in self._local_shuffle.local_partitions()
-        ]
+        return self._local_shuffle.local_partitions()
 
     def insert_chunk(self, chunk: TableChunk) -> None:
         """
@@ -128,7 +127,7 @@ class ShuffleManager:
         partitioned_chunks = py_partition_and_pack(
             table=chunk.table_view(),
             columns_to_hash=self.columns_to_hash,
-            num_partitions=self._stage1_partitions,
+            num_partitions=self._num_partitions_stage1,
             stream=chunk.stream,
             br=self.context.br(),
         )
@@ -149,6 +148,7 @@ class ShuffleManager:
                 self._local_count,
                 self.columns_to_hash,
                 self.collective_id,
+                shuffle_mode="flat",
             )
             for pd in raw_chunks:
                 local_mgr.insert_chunk(
@@ -158,7 +158,6 @@ class ShuffleManager:
                 )
             await local_mgr.insert_finished()
             self._local_shuffle = local_mgr.shuffler
-            self._local_pid_offset = self.comm.rank * self._local_count
 
     def extract_chunk(self, sequence_number: int, stream: Stream) -> plc.Table:
         """
@@ -180,9 +179,8 @@ class ShuffleManager:
         KeyError
             If the requested sequence number has already been extracted.
         """
-        local_pid = sequence_number - self._local_pid_offset
         return py_unpack_and_concat(
-            partitions=self._local_shuffle.extract(local_pid),
+            partitions=self._local_shuffle.extract(sequence_number),
             stream=stream,
             br=self.context.br(),
         )
@@ -231,7 +229,7 @@ async def _global_shuffle(
     num_partitions: int,
     collective_id: int,
     *,
-    shuffle_mode: ShuffleMode = "flat",
+    shuffle_mode: ShuffleMode,
 ) -> None:
     """
     Global shuffle implementation.
@@ -384,6 +382,7 @@ async def shuffle_actor(
             columns_to_hash,
             num_partitions,
             collective_id,
+            shuffle_mode="flat",
         )
 
 

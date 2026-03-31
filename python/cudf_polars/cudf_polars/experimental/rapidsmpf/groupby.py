@@ -461,10 +461,10 @@ async def _shuffle_reduce(
     extract_irs = [decomposed.reduction_ir] + (
         [decomposed.select_ir] if decomposed.select_ir else []
     )
-    for global_pid in shuffle.local_partitions():
+    for partition_id in shuffle.local_partitions():
         stream = ir_context.get_cuda_stream()
         partition_chunk = TableChunk.from_pylibcudf_table(
-            shuffle.extract_chunk(global_pid, stream),
+            shuffle.extract_chunk(partition_id, stream),
             stream,
             exclusive_view=True,
         )
@@ -476,7 +476,7 @@ async def _shuffle_reduce(
         )
         if tracer is not None:
             tracer.add_chunk(table=partition_chunk.table_view())
-        await ch_out.send(context, Message(global_pid, partition_chunk))
+        await ch_out.send(context, Message(partition_id, partition_chunk))
 
     await ch_out.drain(context)
 
