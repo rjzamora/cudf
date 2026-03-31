@@ -9,10 +9,6 @@ from typing import TYPE_CHECKING, Any
 
 from rapidsmpf.communicator.single import new_communicator as single_comm
 from rapidsmpf.config import Options, get_environment_variables
-from rapidsmpf.integrations.cudf.partition import (
-    partition_and_pack as py_partition_and_pack,
-    unpack_and_concat as py_unpack_and_concat,
-)
 from rapidsmpf.memory.buffer import MemoryType
 from rapidsmpf.streaming.core.actor import define_actor
 from rapidsmpf.streaming.core.context import Context
@@ -403,7 +399,6 @@ async def _shuffle_reduce(
         shuffle_comm = single_comm(options, comm.progress_thread)
         shuffle_context = Context(shuffle_comm.logger, context.br(), options)
     shuf_nranks = shuffle_comm.nranks
-    shuf_rank = shuffle_comm.rank
     modulus = max(shuf_nranks, modulus)
     local_count = max(1, modulus // shuf_nranks)
 
@@ -431,13 +426,13 @@ async def _shuffle_reduce(
     )
     await send_metadata(ch_out, context, metadata_out)
 
-    # Stage 1: shuffle data to owning rank (num_partitions=shuf_nranks)
     shuffle = ShuffleManager(
         shuffle_context,
         shuffle_comm,
-        shuf_nranks,
+        modulus,
         decomposed.shuffle_indices,
         collective_id,
+        shuffle_mode="stratified",
     )
 
     shuffle.insert_chunk(
@@ -463,40 +458,25 @@ async def _shuffle_reduce(
 
     await shuffle.insert_finished()
 
-    # Stage 2: local repartition into local_count partitions without network
     extract_irs = [decomposed.reduction_ir] + (
         [decomposed.select_ir] if decomposed.select_ir else []
     )
-    rank_pid = shuffle.shuffler.local_partitions()[0]
-    raw_chunks = shuffle.shuffler.extract(rank_pid)
-    if raw_chunks:
+    for global_pid in shuffle.local_partitions():
         stream = ir_context.get_cuda_stream()
-        combined = py_unpack_and_concat(raw_chunks, stream, shuffle_context.br())
-        local_parts = py_partition_and_pack(
-            combined,
-            decomposed.shuffle_indices,
-            local_count,
+        partition_chunk = TableChunk.from_pylibcudf_table(
+            shuffle.extract_chunk(global_pid, stream),
             stream,
-            shuffle_context.br(),
+            exclusive_view=True,
         )
-        del combined
-        for local_pid, pd in local_parts.items():
-            global_pid = shuf_rank * local_count + local_pid
-            stream = ir_context.get_cuda_stream()
-            partition_chunk = TableChunk.from_pylibcudf_table(
-                py_unpack_and_concat([pd], stream, shuffle_context.br()),
-                stream,
-                exclusive_view=True,
-            )
-            partition_chunk = await evaluate_chunk(
-                context,
-                partition_chunk,
-                *extract_irs,
-                ir_context=ir_context,
-            )
-            if tracer is not None:
-                tracer.add_chunk(table=partition_chunk.table_view())
-            await ch_out.send(context, Message(global_pid, partition_chunk))
+        partition_chunk = await evaluate_chunk(
+            context,
+            partition_chunk,
+            *extract_irs,
+            ir_context=ir_context,
+        )
+        if tracer is not None:
+            tracer.add_chunk(table=partition_chunk.table_view())
+        await ch_out.send(context, Message(global_pid, partition_chunk))
 
     await ch_out.drain(context)
 

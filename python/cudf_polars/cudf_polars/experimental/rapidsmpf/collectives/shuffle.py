@@ -6,12 +6,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Literal
 
+from rapidsmpf.communicator.single import new_communicator as single_comm
+from rapidsmpf.config import Options, get_environment_variables
 from rapidsmpf.integrations.cudf.partition import (
     partition_and_pack as py_partition_and_pack,
     unpack_and_concat as py_unpack_and_concat,
 )
 from rapidsmpf.streaming.coll.shuffler import ShufflerAsync
 from rapidsmpf.streaming.core.actor import define_actor
+from rapidsmpf.streaming.core.context import Context
 from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.cudf.channel_metadata import (
     ChannelMetadata,
@@ -44,7 +47,6 @@ stratified: stage-1 hash % num_ranks, stage-2 local hash % (num_partitions // nu
 if TYPE_CHECKING:
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.streaming.core.channel import Channel
-    from rapidsmpf.streaming.core.context import Context
 
     import pylibcudf as plc
     from rmm.pylibrmm.stream import Stream
@@ -69,6 +71,10 @@ class ShuffleManager:
         The columns to hash.
     collective_id: int
         The collective ID.
+    shuffle_mode: ShuffleMode
+        Routing strategy: ``"flat"`` (single-phase, hash % num_partitions) or
+        ``"stratified"`` (two-stage: hash % num_ranks in stage 1, local hash %
+        local_count in stage 2).
     """
 
     def __init__(
@@ -78,20 +84,37 @@ class ShuffleManager:
         num_partitions: int,
         columns_to_hash: tuple[int, ...],
         collective_id: int,
+        *,
+        shuffle_mode: ShuffleMode = "flat",
     ):
         self.context = context
+        self.comm = comm
         self.num_partitions = num_partitions
         self.columns_to_hash = columns_to_hash
+        self.collective_id = collective_id
+        self.shuffle_mode = shuffle_mode
+        self._local_count = max(1, num_partitions // comm.nranks)
+        self._stage1_partitions = (
+            comm.nranks if shuffle_mode == "stratified" else num_partitions
+        )
         self.shuffler = ShufflerAsync(
             context,
             comm,
             collective_id,
-            num_partitions,
+            self._stage1_partitions,
         )
+        # _local_shuffle is the ShufflerAsync to extract final partitions from.
+        # For flat it stays as self.shuffler; for stratified it is replaced with
+        # the single-rank stage-2 shuffler inside insert_finished.
+        self._local_shuffle: ShufflerAsync = self.shuffler
+        self._local_pid_offset: int = 0
 
     def local_partitions(self) -> list[int]:
         """Get the local partition IDs for this rank."""
-        return self.shuffler.local_partitions()
+        return [
+            pid + self._local_pid_offset
+            for pid in self._local_shuffle.local_partitions()
+        ]
 
     def insert_chunk(self, chunk: TableChunk) -> None:
         """
@@ -102,21 +125,40 @@ class ShuffleManager:
         chunk: TableChunk
             The table chunk to insert.
         """
-        # Partition and pack using the Python function
         partitioned_chunks = py_partition_and_pack(
             table=chunk.table_view(),
             columns_to_hash=self.columns_to_hash,
-            num_partitions=self.num_partitions,
+            num_partitions=self._stage1_partitions,
             stream=chunk.stream,
             br=self.context.br(),
         )
-
-        # Insert into shuffler
         self.shuffler.insert(partitioned_chunks)
 
     async def insert_finished(self) -> None:
         """Insert finished into the ShuffleManager."""
         await self.shuffler.insert_finished(self.context)
+        if self.shuffle_mode == "stratified":
+            rank_pid = self.shuffler.local_partitions()[0]
+            raw_chunks = self.shuffler.extract(rank_pid)
+            options = Options(get_environment_variables())
+            local_comm = single_comm(options, self.comm.progress_thread)
+            local_ctx = Context(local_comm.logger, self.context.br(), options)
+            local_mgr = ShuffleManager(
+                local_ctx,
+                local_comm,
+                self._local_count,
+                self.columns_to_hash,
+                self.collective_id,
+            )
+            for pd in raw_chunks:
+                local_mgr.insert_chunk(
+                    TableChunk.from_packed_data(pd).make_available_and_spill(
+                        self.context.br(), allow_overbooking=True
+                    )
+                )
+            await local_mgr.insert_finished()
+            self._local_shuffle = local_mgr.shuffler
+            self._local_pid_offset = self.comm.rank * self._local_count
 
     def extract_chunk(self, sequence_number: int, stream: Stream) -> plc.Table:
         """
@@ -138,9 +180,9 @@ class ShuffleManager:
         KeyError
             If the requested sequence number has already been extracted.
         """
-        partition_chunks = self.shuffler.extract(sequence_number)
+        local_pid = sequence_number - self._local_pid_offset
         return py_unpack_and_concat(
-            partitions=partition_chunks,
+            partitions=self._local_shuffle.extract(local_pid),
             stream=stream,
             br=self.context.br(),
         )
@@ -257,69 +299,35 @@ async def _global_shuffle(
     # Other ranks still participate in the shuffle protocol.
     skip_insert = metadata_in.duplicated and comm.rank != 0
 
-    if shuffle_mode == "flat":
-        shuffle = ShuffleManager(
-            context, comm, num_partitions, columns_to_hash, collective_id
-        )
-        while (msg := await ch_in.recv(context)) is not None:
-            if not skip_insert:
-                shuffle.insert_chunk(
-                    TableChunk.from_message(msg).make_available_and_spill(
-                        context.br(), allow_overbooking=True
-                    )
+    shuffle = ShuffleManager(
+        context,
+        comm,
+        num_partitions,
+        columns_to_hash,
+        collective_id,
+        shuffle_mode=shuffle_mode,
+    )
+    while (msg := await ch_in.recv(context)) is not None:
+        if not skip_insert:
+            shuffle.insert_chunk(
+                TableChunk.from_message(msg).make_available_and_spill(
+                    context.br(), allow_overbooking=True
                 )
-        await shuffle.insert_finished()
-        for partition_id in shuffle.shuffler.local_partitions():
-            stream = ir_context.get_cuda_stream()
-            await ch_out.send(
-                context,
-                Message(
-                    partition_id,
-                    TableChunk.from_pylibcudf_table(
-                        table=shuffle.extract_chunk(partition_id, stream),
-                        stream=stream,
-                        exclusive_view=True,
-                    ),
+            )
+    await shuffle.insert_finished()
+    for partition_id in shuffle.local_partitions():
+        stream = ir_context.get_cuda_stream()
+        await ch_out.send(
+            context,
+            Message(
+                partition_id,
+                TableChunk.from_pylibcudf_table(
+                    table=shuffle.extract_chunk(partition_id, stream),
+                    stream=stream,
+                    exclusive_view=True,
                 ),
-            )
-    else:  # stratified
-        # Stage 1: shuffle data to the owning rank (num_partitions=num_ranks)
-        stage1 = ShuffleManager(
-            context, comm, comm.nranks, columns_to_hash, collective_id
+            ),
         )
-        while (msg := await ch_in.recv(context)) is not None:
-            if not skip_insert:
-                stage1.insert_chunk(
-                    TableChunk.from_message(msg).make_available_and_spill(
-                        context.br(), allow_overbooking=True
-                    )
-                )
-        await stage1.insert_finished()
-
-        # Stage 2: local repartition into local_count partitions without network
-        rank_pid = stage1.shuffler.local_partitions()[0]
-        raw_chunks = stage1.shuffler.extract(rank_pid)
-        if raw_chunks:
-            stream = ir_context.get_cuda_stream()
-            combined = py_unpack_and_concat(raw_chunks, stream, context.br())
-            local_parts = py_partition_and_pack(
-                combined, columns_to_hash, local_count, stream, context.br()
-            )
-            del combined
-            for local_pid, pd in local_parts.items():
-                global_pid = comm.rank * local_count + local_pid
-                stream = ir_context.get_cuda_stream()
-                await ch_out.send(
-                    context,
-                    Message(
-                        global_pid,
-                        TableChunk.from_pylibcudf_table(
-                            py_unpack_and_concat([pd], stream, context.br()),
-                            stream,
-                            exclusive_view=True,
-                        ),
-                    ),
-                )
 
     await ch_out.drain(context)
 
