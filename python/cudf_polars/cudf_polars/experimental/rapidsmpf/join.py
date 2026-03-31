@@ -489,18 +489,20 @@ def _log_shuffle_strategy_decision(
     strategy: JoinStrategy,
     partitioning_left: NormalizedPartitioning,
     partitioning_right: NormalizedPartitioning,
+    nranks: int,
 ) -> None:
+    local_count = max(1, strategy.shuffle_modulus // nranks)
     left_partitioning_desired = NormalizedPartitioning(
-        inter_rank_modulus=strategy.shuffle_modulus,
+        inter_rank_modulus=nranks,
         inter_rank_indices=strategy.left_indices,
-        local_modulus=None,
-        local_indices=(),
+        local_modulus=local_count,
+        local_indices=strategy.left_indices,
     )
     right_partitioning_desired = NormalizedPartitioning(
-        inter_rank_modulus=strategy.shuffle_modulus,
+        inter_rank_modulus=nranks,
         inter_rank_indices=strategy.right_indices,
-        local_modulus=None,
-        local_indices=(),
+        local_modulus=local_count,
+        local_indices=strategy.right_indices,
     )
     left_partitioned = partitioning_left == left_partitioning_desired
     right_partitioned = partitioning_right == right_partitioning_desired
@@ -532,11 +534,12 @@ async def _shuffle_join(
     shuffle_modulus = strategy.shuffle_modulus
     output_indices = strategy.output_indices
     nranks = comm.nranks
+    local_count = max(1, shuffle_modulus // nranks)
     metadata_out = ChannelMetadata(
-        local_count=max(1, shuffle_modulus // nranks),
+        local_count=local_count,
         partitioning=Partitioning(
-            HashScheme(column_indices=output_indices, modulus=shuffle_modulus),
-            local="inherit",
+            inter_rank=HashScheme(column_indices=output_indices, modulus=nranks),
+            local=HashScheme(column_indices=output_indices, modulus=local_count),
         )
         if output_indices
         else None,
@@ -563,6 +566,7 @@ async def _shuffle_join(
                 strategy.left_indices,
                 strategy.shuffle_modulus,
                 collective_ids.pop(0),
+                shuffle_mode="stratified",
             ),
             _global_shuffle(
                 context,
@@ -573,6 +577,7 @@ async def _shuffle_join(
                 strategy.right_indices,
                 strategy.shuffle_modulus,
                 collective_ids.pop(0),
+                shuffle_mode="stratified",
             ),
             _join_chunks(
                 context,
@@ -768,6 +773,7 @@ async def _choose_strategy_from_samples(
             strategy,
             left_partitioning,
             right_partitioning,
+            comm.nranks,
         )
     return strategy
 

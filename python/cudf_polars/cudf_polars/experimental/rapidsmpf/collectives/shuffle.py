@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from rapidsmpf.integrations.cudf.partition import (
     partition_and_pack as py_partition_and_pack,
@@ -32,6 +32,14 @@ from cudf_polars.experimental.rapidsmpf.utils import (
     send_metadata,
 )
 from cudf_polars.experimental.shuffle import Shuffle
+
+ShuffleMode = Literal["flat", "stratified"]
+"""
+Shuffle routing strategy.
+
+flat:       hash % num_partitions → route by partition owner (current behaviour)
+stratified: stage-1 hash % num_ranks, stage-2 local hash % (num_partitions // num_ranks)
+"""
 
 if TYPE_CHECKING:
     from rapidsmpf.communicator.communicator import Communicator
@@ -143,19 +151,30 @@ def _is_already_partitioned(
     columns_to_hash: tuple[int, ...],
     num_partitions: int,
     nranks: int,
+    *,
+    shuffle_mode: ShuffleMode = "flat",
 ) -> bool:
     """Check if data is already partitioned on the required keys."""
+    local_count = max(1, num_partitions // nranks)
+    if shuffle_mode == "flat":
+        partitioning_desired = NormalizedPartitioning(
+            inter_rank_modulus=num_partitions,
+            inter_rank_indices=columns_to_hash,
+            local_modulus=None,
+            local_indices=(),
+        )
+    else:  # stratified
+        partitioning_desired = NormalizedPartitioning(
+            inter_rank_modulus=nranks,
+            inter_rank_indices=columns_to_hash,
+            local_modulus=local_count,
+            local_indices=columns_to_hash,
+        )
     partitioning = NormalizedPartitioning.from_indices(
         metadata.partitioning,
         nranks,
         indices=columns_to_hash,
         allow_subset=False,
-    )
-    partitioning_desired = NormalizedPartitioning(
-        inter_rank_modulus=num_partitions,
-        inter_rank_indices=columns_to_hash,
-        local_modulus=None,
-        local_indices=(),
     )
     return bool(partitioning and partitioning == partitioning_desired)
 
@@ -169,6 +188,8 @@ async def _global_shuffle(
     columns_to_hash: tuple[int, ...],
     num_partitions: int,
     collective_id: int,
+    *,
+    shuffle_mode: ShuffleMode = "flat",
 ) -> None:
     """
     Global shuffle implementation.
@@ -191,12 +212,21 @@ async def _global_shuffle(
         Number of partitions to shuffle into.
     collective_id
         The collective ID.
+    shuffle_mode
+        Routing strategy: ``"flat"`` (current single-phase) or ``"stratified"``
+        (two-stage: hash % num_ranks in stage 1, hash % local_count locally in
+        stage 2).  Both sides of a join must use the same mode.
     """
     metadata_in = await recv_metadata(ch_in, context)
+    local_count = max(1, num_partitions // comm.nranks)
 
     # Check if we can skip the shuffle (already partitioned correctly)
     if _is_already_partitioned(
-        metadata_in, columns_to_hash, num_partitions, comm.nranks
+        metadata_in,
+        columns_to_hash,
+        num_partitions,
+        comm.nranks,
+        shuffle_mode=shuffle_mode,
     ):
         # Forward metadata and data unchanged
         await send_metadata(ch_out, context, metadata_in)
@@ -205,47 +235,91 @@ async def _global_shuffle(
         await ch_out.drain(context)
         return
 
-    # Normal shuffle path
-    output_metadata = ChannelMetadata(
-        local_count=max(1, num_partitions // comm.nranks),
-        partitioning=Partitioning(
-            inter_rank=HashScheme(columns_to_hash, num_partitions),
-            local="inherit",
-        ),
-    )
+    if shuffle_mode == "flat":
+        output_metadata = ChannelMetadata(
+            local_count=local_count,
+            partitioning=Partitioning(
+                inter_rank=HashScheme(columns_to_hash, num_partitions),
+                local="inherit",
+            ),
+        )
+    else:  # stratified
+        output_metadata = ChannelMetadata(
+            local_count=local_count,
+            partitioning=Partitioning(
+                inter_rank=HashScheme(columns_to_hash, comm.nranks),
+                local=HashScheme(columns_to_hash, local_count),
+            ),
+        )
     await send_metadata(ch_out, context, output_metadata)
 
-    # Create ShuffleManager instance
-    shuffle = ShuffleManager(
-        context, comm, num_partitions, columns_to_hash, collective_id
-    )
     # When input is duplicated, only rank 0 should contribute data.
     # Other ranks still participate in the shuffle protocol.
     skip_insert = metadata_in.duplicated and comm.rank != 0
 
-    while (msg := await ch_in.recv(context)) is not None:
-        if not skip_insert:
-            shuffle.insert_chunk(
-                TableChunk.from_message(msg).make_available_and_spill(
-                    context.br(), allow_overbooking=True
-                )
-            )
-
-    await shuffle.insert_finished()
-
-    for partition_id in shuffle.shuffler.local_partitions():
-        stream = ir_context.get_cuda_stream()
-        await ch_out.send(
-            context,
-            Message(
-                partition_id,
-                TableChunk.from_pylibcudf_table(
-                    table=shuffle.extract_chunk(partition_id, stream),
-                    stream=stream,
-                    exclusive_view=True,
-                ),
-            ),
+    if shuffle_mode == "flat":
+        shuffle = ShuffleManager(
+            context, comm, num_partitions, columns_to_hash, collective_id
         )
+        while (msg := await ch_in.recv(context)) is not None:
+            if not skip_insert:
+                shuffle.insert_chunk(
+                    TableChunk.from_message(msg).make_available_and_spill(
+                        context.br(), allow_overbooking=True
+                    )
+                )
+        await shuffle.insert_finished()
+        for partition_id in shuffle.shuffler.local_partitions():
+            stream = ir_context.get_cuda_stream()
+            await ch_out.send(
+                context,
+                Message(
+                    partition_id,
+                    TableChunk.from_pylibcudf_table(
+                        table=shuffle.extract_chunk(partition_id, stream),
+                        stream=stream,
+                        exclusive_view=True,
+                    ),
+                ),
+            )
+    else:  # stratified
+        # Stage 1: shuffle data to the owning rank (num_partitions=num_ranks)
+        stage1 = ShuffleManager(
+            context, comm, comm.nranks, columns_to_hash, collective_id
+        )
+        while (msg := await ch_in.recv(context)) is not None:
+            if not skip_insert:
+                stage1.insert_chunk(
+                    TableChunk.from_message(msg).make_available_and_spill(
+                        context.br(), allow_overbooking=True
+                    )
+                )
+        await stage1.insert_finished()
+
+        # Stage 2: local repartition into local_count partitions without network
+        rank_pid = stage1.shuffler.local_partitions()[0]
+        raw_chunks = stage1.shuffler.extract(rank_pid)
+        if raw_chunks:
+            stream = ir_context.get_cuda_stream()
+            combined = py_unpack_and_concat(raw_chunks, stream, context.br())
+            local_parts = py_partition_and_pack(
+                combined, columns_to_hash, local_count, stream, context.br()
+            )
+            del combined
+            for local_pid, pd in local_parts.items():
+                global_pid = comm.rank * local_count + local_pid
+                stream = ir_context.get_cuda_stream()
+                await ch_out.send(
+                    context,
+                    Message(
+                        global_pid,
+                        TableChunk.from_pylibcudf_table(
+                            py_unpack_and_concat([pd], stream, context.br()),
+                            stream,
+                            exclusive_view=True,
+                        ),
+                    ),
+                )
 
     await ch_out.drain(context)
 
