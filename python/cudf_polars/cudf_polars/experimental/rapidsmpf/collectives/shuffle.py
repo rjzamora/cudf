@@ -150,9 +150,22 @@ class ShuffleManager:
                 self.collective_id,
                 shuffle_mode="flat",
             )
-            for pd in raw_chunks:
+            # Register all chunks with SpillableMessages so they
+            # can be spilled under heavy memory pressure.
+            # Register in reverse order so that we avoid spilling
+            # chunks that we are about to pull back into device memory.
+            sm = self.context.spillable_messages()
+            n = len(raw_chunks)
+            mids: list[Any] = [None] * n
+            for i in range(n - 1, -1, -1):
+                mids[i] = sm.insert(
+                    Message(i, TableChunk.from_packed_data(raw_chunks[i]))
+                )
+            for mid in mids:
                 local_mgr.insert_chunk(
-                    TableChunk.from_packed_data(pd).make_available_and_spill(
+                    TableChunk.from_message(
+                        sm.extract(mid=mid)
+                    ).make_available_and_spill(
                         self.context.br(), allow_overbooking=True
                     )
                 )
