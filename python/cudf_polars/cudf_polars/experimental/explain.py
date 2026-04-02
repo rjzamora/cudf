@@ -275,6 +275,8 @@ def _(ir: Scan) -> dict[str, Serializable]:
     return {
         "typ": ir.typ,
         "prefix": os.path.commonprefix(ir.paths),
+        # cudf_polars_explainer (and other tools) expect ``paths`` for Scan labels.
+        "paths": list(ir.paths),
         "predicate": _serialize_expr(ir.predicate) if ir.predicate else None,
     }
 

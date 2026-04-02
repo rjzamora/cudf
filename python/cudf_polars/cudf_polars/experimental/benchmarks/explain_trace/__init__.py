@@ -1,13 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 """
-Convert benchmark trace JSONL output to explain-like tree output.
+Convert benchmark trace output to explain-like tree output.
 
 .. warning::
     This module is experimental and may be removed or changed without notice.
 
+Supports JSONL (one object per line), a single JSON document with ``records``,
+or a single JSON document with a top-level ``traces`` list (e.g. pretty-printed
+``results.json``).
+
 Usage (command-line):
-    python -m cudf_polars.experimental.benchmarks.explain_trace pdsh_results.jsonl [--query Q]
+    python -m cudf_polars.experimental.benchmarks.explain_trace results.json [--query Q]
 
 Usage (programmatic):
     from cudf_polars.experimental.benchmarks.explain_trace import QueryPlan, load_jsonl

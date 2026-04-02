@@ -33,8 +33,12 @@ class NodeStats:
         self.duplicated = self.duplicated or is_dup
         agg = max if is_dup else lambda a, b: a + b
         self.chunk_count = agg(self.chunk_count, event.get("chunk_count", 0))
-        if (rows := event.get("rows")) is not None:
-            self.rows = agg(self.rows or 0, int(rows))
+        # RapidsMPF structlog events use ``row_count``; older / synthetic traces may use ``rows``.
+        nrows = event.get("rows")
+        if nrows is None:
+            nrows = event.get("row_count")
+        if nrows is not None:
+            self.rows = agg(self.rows or 0, int(nrows))
         if event.get("decision"):
             self.decision = event["decision"]
         self.worker_count += 1
@@ -183,9 +187,66 @@ def _fmt_duration(ns: int) -> str:
     return f"{ns / 1_000_000_000:.2g}s"
 
 
+def _normalize_top_level_json(data: Any) -> list[dict[str, Any]]:
+    """Turn a single parsed JSON value into the list of records ``explain_trace`` expects."""
+    if isinstance(data, dict):
+        if "records" in data:
+            return [data]
+        if "traces" in data and isinstance(data["traces"], list):
+            # e.g. lseg-nbbo-demo results.json: one object with top-level ``traces``.
+            return [
+                {
+                    "records": {
+                        "0": [{"traces": data["traces"], "duration": 0.0}],
+                    }
+                }
+            ]
+        return [data]
+    if isinstance(data, list):
+        if not data:
+            return []
+        # Line-free export of raw trace events only
+        if isinstance(data[0], dict) and data[0].get("scope") is not None:
+            return [
+                {
+                    "records": {
+                        "0": [{"traces": data, "duration": 0.0}],
+                    }
+                }
+            ]
+        return data
+    msg = f"Unsupported JSON root type: {type(data).__name__}"
+    raise TypeError(msg)
+
+
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
-    with Path(path).open() as f:
-        return [json.loads(line) for line in f if line.strip()]
+    """
+    Load benchmark outputs for :func:`get_traces_for_query`.
+
+    Supports:
+
+    - **JSONL** — one JSON object per line (e.g. multi-worker TPCH runs).
+    - **Single JSON object** with a ``records`` key (nested queries / iterations).
+    - **Single JSON object** with a top-level ``traces`` list (e.g. NBBO-style
+      ``results.json`` from a pretty-printed ``json.dumps``).
+    - **Single JSON array** of trace events (each with a ``scope`` field).
+    """
+    p = Path(path)
+    text = p.read_text()
+    stripped = text.strip()
+    if not stripped:
+        return []
+    if stripped[0] in "[{":
+        try:
+            return _normalize_top_level_json(json.loads(text))
+        except json.JSONDecodeError:
+            pass
+    records: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        sline = line.strip()
+        if sline:
+            records.append(json.loads(sline))
+    return records
 
 
 def _has_query_plan(traces: list[dict[str, Any]]) -> bool:
@@ -233,7 +294,11 @@ def get_traces_for_query(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Convert benchmark traces to explain-like output."
+        description=(
+            "Render benchmark traces as a text tree. Input may be JSONL, a single JSON "
+            "object with nested records, or a single JSON object with a top-level "
+            "'traces' list (e.g. pretty-printed results.json)."
+        )
     )
     parser.add_argument("input", type=Path)
     parser.add_argument("--query", "-q", type=int, default=None)

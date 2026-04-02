@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from cudf_polars.experimental.benchmarks.explain_trace import (
@@ -14,6 +16,7 @@ from cudf_polars.experimental.benchmarks.explain_trace._core import (
     _fmt_count,
     _fmt_duration,
     _has_query_plan,
+    load_jsonl,
 )
 
 _PLAN_NEW = {
@@ -89,6 +92,23 @@ def test_add_streaming_actor_partitioned():
     assert s.rows == 150
     assert s.worker_count == 2
     assert not s.duplicated
+
+
+def test_add_streaming_actor_row_count_alias():
+    """RapidsMPF emits ``row_count`` on Streaming Actor events, not ``rows``."""
+    s = NodeStats()
+    s.add_streaming_actor(
+        {
+            "scope": "actor",
+            "actor_ir_id": "x",
+            "actor_ir_type": "Scan",
+            "chunk_count": 2,
+            "row_count": 42,
+            "duplicated": False,
+        }
+    )
+    assert s.rows == 42
+    assert s.chunk_count == 2
 
 
 def test_add_streaming_actor_duplicated():
@@ -253,6 +273,25 @@ def test_get_traces_first_query():
     records = _make_records({4: [{"traces": [_PLAN_NEW]}]})
     qid, _ = get_traces_for_query(records)
     assert qid == 4
+
+
+def test_load_jsonl_single_file_with_top_level_traces(tmp_path):
+    payload = {"metadata": {"benchmark": "nbbo"}, "traces": [_PLAN_NEW]}
+    p = tmp_path / "results.json"
+    p.write_text(json.dumps(payload, indent=2))
+    records = load_jsonl(p)
+    assert len(records) == 1
+    assert "0" in records[0]["records"]
+    assert records[0]["records"]["0"][0]["traces"] == [_PLAN_NEW]
+
+
+def test_load_jsonl_raw_trace_array(tmp_path):
+    p = tmp_path / "t.json"
+    p.write_text(json.dumps([_PLAN_NEW]))
+    records = load_jsonl(p)
+    qid, traces = get_traces_for_query(records)
+    assert qid == 0
+    assert traces == [_PLAN_NEW]
 
 
 @pytest.mark.parametrize(
