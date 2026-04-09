@@ -18,6 +18,27 @@ __all__: list[str] = ["Node"]
 T = TypeVar("T", bound="Node[Any]")
 
 
+def _materialize_for_stable_id(obj: Any) -> Any:
+    """
+    Expand nested :class:`Node` instances to their ``get_hashable()`` form.
+
+    ``IR.get_hashable()`` embeds child IR objects in tuples. Using
+    ``repr(get_hashable())`` for stable IDs would expand those via
+    ``Node.__repr__()``, which for e.g. :class:`~cudf_polars.dsl.ir.DataFrameScan`
+    includes the dataframe and is not stable across processes. Recursing through
+    ``get_hashable()`` keeps stable IDs aligned with the structural hash only.
+    """
+    if isinstance(obj, Node):
+        return _materialize_for_stable_id(obj.get_hashable())
+    if isinstance(obj, tuple):
+        return tuple(_materialize_for_stable_id(x) for x in obj)
+    if isinstance(obj, list):
+        return tuple(_materialize_for_stable_id(x) for x in obj)
+    if isinstance(obj, dict):
+        return tuple(sorted((k, _materialize_for_stable_id(v)) for k, v in obj.items()))
+    return obj
+
+
 class Node(Generic[T]):
     """
     An abstract node type.
@@ -103,7 +124,8 @@ class Node(Generic[T]):
         try:
             return self._stable_hash_value
         except AttributeError:
-            content = repr(self.get_hashable()).encode("utf-8")
+            material = _materialize_for_stable_id(self.get_hashable())
+            content = repr(material).encode("utf-8")
             self._stable_hash_value = int(hashlib.md5(content).hexdigest()[:8], 16)
             return self._stable_hash_value
 

@@ -14,6 +14,13 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 
+def _nid(ir_id: Any) -> str:
+    """Normalize plan/trace ids to str (JSON ``children`` may be int; actor_ir_id is int)."""
+    if ir_id is None:
+        return ""
+    return str(ir_id)
+
+
 @dataclass
 class NodeStats:
     ir_type: str = ""
@@ -68,33 +75,39 @@ class QueryPlan:
             if scope == "plan":
                 if "plan" in event:
                     ser = event["plan"]
-                    for ir_id, node in ser.get("nodes", {}).items():
-                        plan.nodes[ir_id] = {
-                            "ir_id": ir_id,
+                    for raw_plan_id, node in ser.get("nodes", {}).items():
+                        plan_id = _nid(raw_plan_id)
+                        ch = [_nid(c) for c in node.get("children", [])]
+                        plan.nodes[plan_id] = {
+                            "ir_id": plan_id,
                             "ir_type": node.get("type", ""),
-                            "children_ir_ids": node.get("children", []),
+                            "children_ir_ids": ch,
                             "schema": node.get("schema", {}),
                             "properties": node.get("properties", {}),
                         }
-                        plan.stats[ir_id].ir_type = node.get("type", "")
+                        plan.stats[plan_id].ir_type = node.get("type", "")
                     if roots := ser.get("roots"):
-                        plan.root_id = roots[0]
+                        plan.root_id = _nid(roots[0])
                 else:
                     for node in event.get("nodes", []):
-                        ir_id = node["ir_id"]
-                        plan.nodes[ir_id] = node
+                        ir_id = _nid(node["ir_id"])
+                        row: dict[str, Any] = {**node, "ir_id": ir_id}
+                        ch_raw = row.get("children_ir_ids")
+                        if ch_raw is not None:
+                            row["children_ir_ids"] = [_nid(c) for c in ch_raw]
+                        plan.nodes[ir_id] = row
                         plan.stats[ir_id].ir_type = node.get("ir_type", "")
-                    if nodes := event.get("nodes"):
-                        plan.root_id = nodes[0]["ir_id"]
+                    nodes_list = event.get("nodes")
+                    if nodes_list and len(nodes_list) > 0:
+                        plan.root_id = _nid(nodes_list[0]["ir_id"])
             elif scope == "actor" or etype == "Streaming Actor":
-                if (ir_id := event.get("actor_ir_id")) is not None:
-                    ir_id = str(ir_id) if isinstance(ir_id, int) else ir_id
-                    plan.stats[ir_id].add_streaming_actor(event)
-            elif (scope == "evaluate_ir_node" or etype == "Execute IR") and (
-                ir_id := event.get("actor_ir_id") or event.get("ir_id")
-            ) is not None:
-                ir_id = str(ir_id) if isinstance(ir_id, int) else ir_id
-                plan.stats[ir_id].add_execute_ir(event)
+                actor_ir_raw = event.get("actor_ir_id")
+                if actor_ir_raw is not None:
+                    plan.stats[_nid(actor_ir_raw)].add_streaming_actor(event)
+            elif scope == "evaluate_ir_node" or etype == "Execute IR":
+                exec_ir_raw = event.get("actor_ir_id") or event.get("ir_id")
+                if exec_ir_raw is not None:
+                    plan.stats[_nid(exec_ir_raw)].add_execute_ir(event)
         return plan
 
     def render(self) -> str:
@@ -128,6 +141,7 @@ class QueryPlan:
         return "\n".join(lines)
 
     def _render_node(self, ir_id: str | int, indent: str, lines: list[str]) -> None:
+        ir_id = _nid(ir_id)
         node = self.nodes.get(ir_id, {})
         stats = self.stats.get(ir_id, NodeStats())
         ir_type = stats.ir_type or node.get("ir_type", "Unknown")
@@ -153,8 +167,9 @@ class QueryPlan:
             ann.append(f"on={tuple(left_on)}")
         ann_str = f" [{', '.join(ann)}]" if ann else ""
         lines.append(f"{indent}{ir_type.upper()}{ann_str}")
-        for child_id in node.get("children_ir_ids", []):
-            self._render_node(child_id, indent + "  ", lines)
+        children = node.get("children_ir_ids") or node.get("children") or []
+        for child_id in children:
+            self._render_node(_nid(child_id), indent + "  ", lines)
 
 
 def _fmt_count(n: int) -> str:

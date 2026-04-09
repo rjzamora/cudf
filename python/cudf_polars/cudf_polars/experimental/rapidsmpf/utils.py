@@ -35,7 +35,7 @@ import rmm.mr
 import cudf_polars.dsl.tracing
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.expr import Col, NamedExpr
-from cudf_polars.dsl.ir import Cache, Filter, Join, Projection, Select
+from cudf_polars.dsl.ir import IR, Cache, Filter, Join, Projection, Select
 from cudf_polars.dsl.tracing import Scope
 from cudf_polars.experimental.utils import _concat
 
@@ -49,7 +49,7 @@ if TYPE_CHECKING:
 
     from rmm.pylibrmm.stream import Stream
 
-    from cudf_polars.dsl.ir import IR, IRExecutionContext
+    from cudf_polars.dsl.ir import IRExecutionContext
     from cudf_polars.experimental.rapidsmpf.dispatch import SubNetGenerator
     from cudf_polars.experimental.rapidsmpf.tracing import ActorTracer
     from cudf_polars.typing import DataType, Schema
@@ -99,7 +99,7 @@ async def gather_in_task_group(*coroutines: Coroutine[Any, Any, Any]) -> list[An
 async def shutdown_on_error(
     context: Context,
     *channels: Channel[Any],
-    trace_ir: IR,
+    trace_ir: IR | ActorTracer,
     ir_context: IRExecutionContext | None = None,
 ) -> AsyncIterator[ActorTracer | None]:
     """
@@ -115,10 +115,8 @@ async def shutdown_on_error(
     channels
         The channels to shutdown on error.
     trace_ir
-        Optional IR node to enable tracing for this streaming actor.
-        When provided and LOG_TRACES is enabled, an ActorTracer
-        is yielded for collecting stats, and a structlog event is
-        emitted on exit.
+        IR node to enable tracing for this streaming actor,
+        or the existing ActorTracer instance for the node.
     ir_context
         The IR execution context from cudf-polars. This is used to propagate
         the query_id to the structlog logs emitted in this context.
@@ -133,11 +131,23 @@ async def shutdown_on_error(
     contextvars: dict[str, Any] = {}
     from cudf_polars.experimental.rapidsmpf.tracing import ActorTracer
 
-    ir_id = trace_ir.get_stable_id()
-    ir_type = type(trace_ir).__name__
-    tracer = ActorTracer(ir_id, ir_type)
-    contextvars = {"actor_ir_id": ir_id, "actor_ir_type": ir_type}
+    if isinstance(trace_ir, IR):
+        ir_id = trace_ir.get_stable_id()
+        ir_type = type(trace_ir).__name__
+        tracer = ActorTracer(ir_id, ir_type)
+        need_log = True
+    else:
+        assert isinstance(trace_ir, ActorTracer)
+        tracer = trace_ir
+        ir_id_opt = tracer.ir_id
+        ir_type_opt = tracer.ir_type
+        assert ir_id_opt is not None
+        assert ir_type_opt is not None
+        ir_id = ir_id_opt
+        ir_type = ir_type_opt
+        need_log = False
 
+    contextvars = {"actor_ir_id": ir_id, "actor_ir_type": ir_type}
     if ir_context is not None:
         contextvars["cudf_polars_query_id"] = str(ir_context.query_id)
 
@@ -154,11 +164,11 @@ async def shutdown_on_error(
             )
             raise
         finally:
-            stop = time.monotonic_ns()
-            record: dict[str, Any] = {
-                "scope": Scope.ACTOR.value,
-            }
-            if tracer is not None:
+            if need_log:
+                stop = time.monotonic_ns()
+                record: dict[str, Any] = {
+                    "scope": Scope.ACTOR.value,
+                }
                 record.update(
                     {
                         "chunk_count": tracer.chunk_count,
@@ -169,9 +179,9 @@ async def shutdown_on_error(
                     record["row_count"] = tracer.row_count
                 if tracer.decision is not None:
                     record["decision"] = tracer.decision
-            cudf_polars.dsl.tracing.log(
-                "Streaming Actor", start=start, stop=stop, **record
-            )
+                cudf_polars.dsl.tracing.log(
+                    "Streaming Actor", start=start, stop=stop, **record
+                )
 
 
 def _remap_scheme_select(
@@ -588,7 +598,7 @@ async def replay_buffered_channel(
     buffered_chunks: dict[int, TableChunk],
     metadata: ChannelMetadata,
     *,
-    trace_ir: IR,
+    trace_ir: IR | ActorTracer,
 ) -> None:
     """
     Replay a buffered input channel into an output channel.

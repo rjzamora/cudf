@@ -170,9 +170,9 @@ def test_from_traces_new_format():
 
 def test_from_traces_old_format():
     plan = QueryPlan.from_traces([_PLAN_OLD])
-    assert plan.root_id == 1
-    assert plan.nodes[1]["ir_type"] == "Join"
-    assert plan.nodes[1]["children_ir_ids"] == [2, 3]
+    assert plan.root_id == "1"
+    assert plan.nodes["1"]["ir_type"] == "Join"
+    assert plan.nodes["1"]["children_ir_ids"] == ["2", "3"]
 
 
 def test_from_traces_actor_int_ir_id():

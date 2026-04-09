@@ -413,6 +413,7 @@ async def _join_chunks(
     ch_out: Channel[TableChunk],
     ch_left: Channel[TableChunk],
     ch_right: Channel[TableChunk],
+    *,
     tracer: ActorTracer | None,
 ) -> None:
     # Consume metadata from both shuffle outputs before reading data
@@ -549,41 +550,45 @@ async def _shuffle_join(
     ch_left_shuffle = context.create_channel()
     ch_right_shuffle = context.create_channel()
     # note: this is an actor inside of an actor. How should we log that in our traces?
-    async with shutdown_on_error(
-        context, ch_left_shuffle, ch_right_shuffle, trace_ir=ir, ir_context=ir_context
-    ):
-        actor_tasks = [
-            _global_shuffle(
-                context,
-                comm,
-                ir_context,
-                ch_left_shuffle,
-                ch_left,
-                strategy.left_indices,
-                strategy.shuffle_modulus,
-                collective_ids.pop(0),
-            ),
-            _global_shuffle(
-                context,
-                comm,
-                ir_context,
-                ch_right_shuffle,
-                ch_right,
-                strategy.right_indices,
-                strategy.shuffle_modulus,
-                collective_ids.pop(0),
-            ),
-            _join_chunks(
-                context,
-                ir,
-                ir_context,
-                ch_out,
-                ch_left_shuffle,
-                ch_right_shuffle,
-                tracer=tracer,
-            ),
-        ]
-        await gather_in_task_group(*actor_tasks)
+    # async with shutdown_on_error(
+    #     context,
+    #     ch_left_shuffle,
+    #     ch_right_shuffle,
+    #     trace_ir=tracer,
+    #     ir_context=ir_context,
+    # ):
+    actor_tasks = [
+        _global_shuffle(
+            context,
+            comm,
+            ir_context,
+            ch_left_shuffle,
+            ch_left,
+            strategy.left_indices,
+            strategy.shuffle_modulus,
+            collective_ids.pop(0),
+        ),
+        _global_shuffle(
+            context,
+            comm,
+            ir_context,
+            ch_right_shuffle,
+            ch_right,
+            strategy.right_indices,
+            strategy.shuffle_modulus,
+            collective_ids.pop(0),
+        ),
+        _join_chunks(
+            context,
+            ir,
+            ir_context,
+            ch_out,
+            ch_left_shuffle,
+            ch_right_shuffle,
+            tracer=tracer,
+        ),
+    ]
+    await gather_in_task_group(*actor_tasks)
 
 
 def _make_shuffle_strategy(
@@ -967,11 +972,15 @@ async def join_actor(
     collective_ids
         List of collective IDs for shuffle/broadcast; consumed as needed.
     """
+    ch_left_replay = context.create_channel()
+    ch_right_replay = context.create_channel()
     async with shutdown_on_error(
         context,
         ch_out,
         ch_left,
         ch_right,
+        ch_left_replay,
+        ch_right_replay,
         trace_ir=ir,
         ir_context=ir_context,
     ) as tracer:
@@ -993,68 +1002,60 @@ async def join_actor(
             tracer=tracer,
         )
 
-        ch_left_replay = context.create_channel()
-        ch_right_replay = context.create_channel()
-        async with shutdown_on_error(
-            context,
-            ch_left_replay,
-            ch_right_replay,
-            trace_ir=ir,
-            ir_context=ir_context,
-        ):
-            actor_tasks = [
-                replay_buffered_channel(
-                    context,
-                    ch_left_replay,
-                    ch_left,
-                    left_sample.chunks,
-                    left_metadata,
-                    trace_ir=ir,
-                ),
-                replay_buffered_channel(
-                    context,
-                    ch_right_replay,
-                    ch_right,
-                    right_sample.chunks,
-                    right_metadata,
-                    trace_ir=ir,
-                ),
-            ]
-            ch_left = ch_left_replay
-            ch_right = ch_right_replay
+        trace_ir_replay: IR | ActorTracer = tracer if tracer is not None else ir
+        actor_tasks = [
+            replay_buffered_channel(
+                context,
+                ch_left_replay,
+                ch_left,
+                left_sample.chunks,
+                left_metadata,
+                trace_ir=trace_ir_replay,
+            ),
+            replay_buffered_channel(
+                context,
+                ch_right_replay,
+                ch_right,
+                right_sample.chunks,
+                right_metadata,
+                trace_ir=trace_ir_replay,
+            ),
+        ]
+        ch_left = ch_left_replay
+        ch_right = ch_right_replay
 
-            if strategy.broadcast_side is not None:
-                actor_tasks.append(
-                    _broadcast_join(
-                        context,
-                        comm,
-                        ir,
-                        ir_context,
-                        ch_out,
-                        ch_left,
-                        ch_right,
-                        strategy,
-                        collective_ids,
-                        executor.target_partition_size,
-                        tracer=tracer,
-                    )
+        if strategy.broadcast_side is not None:
+            actor_tasks.append(
+                _broadcast_join(
+                    context,
+                    comm,
+                    ir,
+                    ir_context,
+                    ch_out,
+                    ch_left,
+                    ch_right,
+                    strategy,
+                    collective_ids,
+                    executor.target_partition_size,
+                    tracer=tracer,
                 )
-            else:
-                actor_tasks.append(
-                    _shuffle_join(
-                        context,
-                        comm,
-                        ir,
-                        ir_context,
-                        ch_out,
-                        ch_left,
-                        ch_right,
-                        strategy,
-                        collective_ids,
-                        tracer=tracer,
-                    )
+            )
+        else:
+            actor_tasks.append(
+                _shuffle_join(
+                    context,
+                    comm,
+                    ir,
+                    ir_context,
+                    ch_out,
+                    ch_left,
+                    ch_right,
+                    strategy,
+                    collective_ids,
+                    tracer=tracer,
                 )
-            await gather_in_task_group(*actor_tasks)
+            )
+        await gather_in_task_group(*actor_tasks)
 
 
 def _use_pwise_join(
