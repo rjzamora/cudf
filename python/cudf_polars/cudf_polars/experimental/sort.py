@@ -14,7 +14,7 @@ from rmm.pylibrmm.stream import DEFAULT_STREAM
 
 from cudf_polars.containers import Column, DataFrame, DataType
 from cudf_polars.dsl.expr import Col
-from cudf_polars.dsl.ir import IR, Sort
+from cudf_polars.dsl.ir import IR, MapFunction, Sort
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.dsl.utils.naming import unique_names
 from cudf_polars.experimental.base import PartitionInfo, get_key_name
@@ -443,6 +443,58 @@ def _sort_partition_dataframe(
         )
         for i, split in enumerate(plc.copying.split(df.table, splits, stream=stream))
     }
+
+
+class HintSorted(IR):
+    """
+    Apply sorted-column hints to a multi-partition dataframe.
+
+    Parameters
+    ----------
+    schema
+        Output schema (identical to the data child's schema).
+    options
+        Single-element tuple whose element is a tuple of
+        ``(column_name, descending, nulls_last)`` triples.
+    df
+        Data child — the dataframe whose chunks are forwarded.
+    keys
+        Key-projection child — a view of ``df`` containing only
+        the sort-key columns.  Used by the actor path to compute
+        per-chunk min/max without buffering the full table.
+    """
+
+    __slots__ = ("options",)
+    _non_child = ("schema", "options")
+    _n_non_child_args = 2
+    options: Any
+
+    def __init__(self, schema: Schema, options: Any, df: IR, keys: IR):
+        self.schema = schema
+        self.options = options
+        self._non_child_args = (schema, options)
+        self.children = (df, keys)
+
+    @property
+    def sorted_info(self) -> tuple[tuple[str, bool, bool], ...]:
+        """Sort hint triples: (column_name, descending, nulls_last)."""
+        (info,) = self.options
+        return info
+
+    @classmethod
+    def do_evaluate(
+        cls,
+        schema: Schema,
+        options: Any,
+        df: DataFrame,
+        keys: DataFrame,  # Used by actor path; ignored in tasks path
+        *,
+        context: IRExecutionContext,
+    ) -> DataFrame:
+        """Evaluate and return a dataframe."""
+        return MapFunction.do_evaluate(
+            schema, "hint_sorted", options, df, context=context
+        )
 
 
 class ShuffleSorted(IR):
