@@ -633,35 +633,35 @@ async def _collect_boundaries(
         plc.types.NullOrder.AFTER if nl else plc.types.NullOrder.BEFORE
         for _, _, nl in hint_sorted_info
     ]
-
-    local_parts: list[tuple[int, plc.Table]] = []
+    boundary_rows: list[plc.Table] = []
     while (msg := await sorted_ch_in.recv(context)) is not None:
         chunk = TableChunk.from_message(msg, br=context.br()).make_available_and_spill(
             context.br(), allow_overbooking=True
         )
         tbl = chunk.table_view()
         if (n := tbl.num_rows()) == 0:
-            continue  # drop_empty_chunks will drop this chunk
-        slices = plc.copying.slice(
-            tbl, [0, 1] if n == 1 else [0, 1, n - 1, n], stream=stream
+            # The corresponding chunk will be dropped from sorted_ch_in
+            continue
+        boundary_rows.extend(
+            plc.copying.slice(
+                tbl,
+                [0, 1, 0, 1] if n == 1 else [0, 1, n - 1, n],
+                stream=stream,
+            )
         )
-        two_rows = plc.concatenate.concatenate(
-            [slices[0], slices[0 if n == 1 else 1]], stream=stream
-        )
-        local_parts.append((msg.sequence_number, two_rows))
 
-    local_parts.sort(key=lambda x: x[0])
-    tables = [t for _, t in local_parts]
-    local_table: plc.Table | None = (
-        plc.concatenate.concatenate(tables, stream=stream) if tables else None
+    boundary_table: plc.Table | None = (
+        plc.concatenate.concatenate(boundary_rows, stream=stream)
+        if boundary_rows
+        else None
     )
 
     if comm.nranks > 1:
         local_chunk = (
             TableChunk.from_pylibcudf_table(
-                local_table, stream, exclusive_view=True, br=context.br()
+                boundary_table, stream, exclusive_view=True, br=context.br()
             )
-            if local_table is not None
+            if boundary_table is not None
             else empty_table_chunk(ir.children[1], context, stream)
         )
         allgather = AllGatherManager(context, comm, collective_ids.pop())
@@ -670,16 +670,15 @@ async def _collect_boundaries(
         full_table = await allgather.extract_concatenated(stream, ordered=True)
     else:
         collective_ids.pop()
-        if local_table is None:
+        if boundary_table is None:
             return None, False
-        full_table = local_table
+        full_table = boundary_table
 
     N = full_table.num_rows() // 2
 
     if N == 0:
         return None, False
-
-    if N == 1:
+    elif N == 1:
         empty = plc.copying.slice(full_table, [0, 0], stream=stream)[0]
         return (
             TableChunk.from_pylibcudf_table(
