@@ -362,7 +362,7 @@ def _(
     if ir.name in ("rename", "explode"):
         return _lower_ir_pwise(ir, rec)
 
-    elif ir.name == "hint_sorted":
+    elif ir.name == "hint_sorted" and _dynamic_planning_on(rec.state["config_options"]):
         child, partition_info = rec(ir.children[0])
         key_names = [col_name for col_name, *_ in ir.options[0]]
         original = ir.children[0]

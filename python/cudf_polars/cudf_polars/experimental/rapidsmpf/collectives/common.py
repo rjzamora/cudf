@@ -16,6 +16,7 @@ from cudf_polars.experimental.io import StreamingSink
 from cudf_polars.experimental.join import Join
 from cudf_polars.experimental.repartition import Repartition
 from cudf_polars.experimental.shuffle import Shuffle
+from cudf_polars.experimental.sort import HintSorted
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -91,6 +92,7 @@ class ReserveOpIDs:
             Repartition,
             StreamingSink,
             Sort,
+            HintSorted,
         )
         if self.dynamic_planning_enabled:
             collective_types = (
@@ -99,6 +101,7 @@ class ReserveOpIDs:
                 Repartition,
                 StreamingSink,
                 Sort,
+                HintSorted,
                 GroupBy,
                 Distinct,
             )

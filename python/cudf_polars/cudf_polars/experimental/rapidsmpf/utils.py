@@ -586,6 +586,30 @@ async def chunkwise_evaluate(
     await ch_out.drain(context)
 
 
+async def drop_empty_chunks(
+    context: Context,
+    ch_in: Channel[TableChunk],
+    ch_out: Channel[TableChunk],
+) -> None:
+    """
+    Drop empty chunks from a channel.
+
+    Parameters
+    ----------
+    context
+        The rapidsmpf context.
+    ch_in
+        The channel to drop empty chunks from.
+    ch_out
+        The channel to forward non-empty chunks to.
+    """
+    while (msg := await ch_in.recv(context)) is not None:
+        chunk = TableChunk.from_message(msg, br=context.br())
+        if chunk.shape[0] > 0:
+            await ch_out.send(context, Message(msg.sequence_number, chunk))
+    await ch_out.drain(context)
+
+
 def indices_to_names(indices: tuple[int, ...], schema: Schema) -> tuple[str, ...]:
     """
     Return column names for the given column indices in schema order.

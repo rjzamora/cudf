@@ -21,7 +21,7 @@ import pylibcudf as plc
 from cudf_polars import Translator
 from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.dsl import expr
-from cudf_polars.dsl.ir import GroupBy, HStack, Projection, Select
+from cudf_polars.dsl.ir import GroupBy, HStack, MapFunction, Projection, Select
 from cudf_polars.experimental.rapidsmpf.core import evaluate_logical_plan
 from cudf_polars.experimental.rapidsmpf.frontend.options import StreamingOptions
 from cudf_polars.experimental.rapidsmpf.frontend.spmd import SPMDEngine
@@ -29,6 +29,7 @@ from cudf_polars.experimental.rapidsmpf.utils import (
     NormalizedPartitioning,
     maybe_remap_partitioning,
 )
+from cudf_polars.testing.io import make_lazy_frame
 from cudf_polars.utils.config import ConfigOptions
 
 
@@ -571,3 +572,64 @@ def test_remap_partitioning_order_scheme_drops_key(rapidsmpf_context, engine):
     result = maybe_remap_partitioning(_make_select_ir(engine, ("b",)), part)
     assert result is not None
     assert result.inter_rank is None
+
+
+@pytest.mark.parametrize(
+    "descending,expected_order",
+    [
+        (False, plc.types.Order.ASCENDING),
+        (True, plc.types.Order.DESCENDING),
+    ],
+    ids=["ascending", "descending"],
+)
+def test_hint_sorted_metadata(
+    streaming_engine_factory, tmp_path, descending, expected_order
+) -> None:
+    options = StreamingOptions(max_rows_per_partition=3)
+    streaming_engine = streaming_engine_factory(options)
+    config_options = ConfigOptions.from_polars_engine(streaming_engine)
+
+    values = list(range(8, -1, -1)) if descending else list(range(9))
+    df = pl.DataFrame({"x": values, "y": list(range(9, 0, -1))})
+    q = make_lazy_frame(df, "parquet", path=tmp_path, n_files=3)
+    scan_ir = Translator(q._ldf.visit(), streaming_engine).translate_ir()
+    # Bypass Polars' optimizer which prunes hint_sorted when no downstream op consumes it
+    ir = MapFunction(
+        scan_ir.schema, "hint_sorted", ([("x", descending, False)],), scan_ir
+    )
+
+    metadata_collector = evaluate_logical_plan(
+        ir, config_options, collect_metadata=True
+    )[1]
+    assert metadata_collector is not None
+    assert len(metadata_collector) == 1
+    metadata = metadata_collector[0]
+
+    assert isinstance(metadata.partitioning.inter_rank, OrderScheme)
+    assert metadata.partitioning.local == "inherit"
+    (key,) = metadata.partitioning.inter_rank.keys
+    assert key.column_index == 0  # "x" is first in schema
+    assert key.order == expected_order
+    assert metadata.partitioning.inter_rank.num_boundaries >= 1
+
+
+def test_hint_sorted_metadata_unsorted_fallback(
+    streaming_engine_factory, tmp_path
+) -> None:
+    options = StreamingOptions(max_rows_per_partition=3)
+    streaming_engine = streaming_engine_factory(options)
+    config_options = ConfigOptions.from_polars_engine(streaming_engine)
+
+    df = pl.DataFrame({"x": [3, 1, 4, 1, 5, 9, 2, 6, 8], "y": list(range(9))})
+    q = make_lazy_frame(df, "parquet", path=tmp_path, n_files=3)
+    scan_ir = Translator(q._ldf.visit(), streaming_engine).translate_ir()
+    # Bypass Polars' optimizer which prunes hint_sorted when no downstream op consumes it
+    ir = MapFunction(scan_ir.schema, "hint_sorted", ([("x", False, False)],), scan_ir)
+
+    metadata_collector = evaluate_logical_plan(
+        ir, config_options, collect_metadata=True
+    )[1]
+    assert metadata_collector is not None
+    metadata = metadata_collector[0]
+
+    assert not isinstance(metadata.partitioning.inter_rank, OrderScheme)

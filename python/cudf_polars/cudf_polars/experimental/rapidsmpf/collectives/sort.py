@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 from rapidsmpf.shuffler import PartitionAssignment
 from rapidsmpf.streaming.core.actor import define_actor
 from rapidsmpf.streaming.core.message import Message
-from rapidsmpf.streaming.cudf.channel_metadata import ChannelMetadata, Partitioning
+from rapidsmpf.streaming.cudf.channel_metadata import (
+    ChannelMetadata,
+    OrderKey,
+    OrderScheme,
+    Partitioning,
+)
 from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
 import polars as pl
@@ -19,7 +24,7 @@ import pylibcudf as plc
 
 from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.dsl.expr import Col, NamedExpr
-from cudf_polars.dsl.ir import Empty, Sort
+from cudf_polars.dsl.ir import Empty, MapFunction, Sort
 from cudf_polars.dsl.utils.naming import unique_names
 from cudf_polars.experimental.rapidsmpf.collectives.allgather import AllGatherManager
 from cudf_polars.experimental.rapidsmpf.collectives.shuffle import ShuffleManager
@@ -32,7 +37,9 @@ from cudf_polars.experimental.rapidsmpf.utils import (
     ChannelManager,
     allgather_reduce,
     chunk_to_frame,
+    chunkwise_evaluate,
     concat_batch,
+    drop_empty_chunks,
     empty_table_chunk,
     evaluate_batch,
     evaluate_chunk,
@@ -45,6 +52,7 @@ from cudf_polars.experimental.rapidsmpf.utils import (
 )
 from cudf_polars.experimental.repartition import Repartition
 from cudf_polars.experimental.sort import (
+    HintSorted,
     _get_final_sort_boundaries,
     _has_simple_zlice,
     _select_local_split_candidates,
@@ -600,6 +608,248 @@ def _sort_rapidsmpf_network(ir: Sort, rec: SubNetGenerator) -> tuple[dict, dict]
             by=by,
             num_partitions=partition_info[ir].count,
             executor=executor,
+            collective_ids=collective_ids,
+        )
+    ]
+    return nodes, channels
+
+
+async def _collect_boundaries(
+    context: Context,
+    comm: Communicator,
+    ir_context: IRExecutionContext,
+    sorted_ch_in: Channel[TableChunk],
+    hint_sorted_info: tuple[tuple[str, bool, bool], ...],
+    collective_ids: list[int],
+    ir: HintSorted,
+) -> tuple[TableChunk | None, bool]:
+    """Collect boundaries from a sorted-data channel."""
+    stream = ir_context.get_cuda_stream()
+    column_order = [
+        plc.types.Order.DESCENDING if desc else plc.types.Order.ASCENDING
+        for _, desc, _ in hint_sorted_info
+    ]
+    null_order = [
+        plc.types.NullOrder.AFTER if nl else plc.types.NullOrder.BEFORE
+        for _, _, nl in hint_sorted_info
+    ]
+
+    local_parts: list[tuple[int, plc.Table]] = []
+    while (msg := await sorted_ch_in.recv(context)) is not None:
+        chunk = TableChunk.from_message(msg, br=context.br()).make_available_and_spill(
+            context.br(), allow_overbooking=True
+        )
+        tbl = chunk.table_view()
+        if (n := tbl.num_rows()) == 0:
+            continue  # drop_empty_chunks will drop this chunk
+        slices = plc.copying.slice(
+            tbl, [0, 1] if n == 1 else [0, 1, n - 1, n], stream=stream
+        )
+        two_rows = plc.concatenate.concatenate(
+            [slices[0], slices[0 if n == 1 else 1]], stream=stream
+        )
+        local_parts.append((msg.sequence_number, two_rows))
+
+    local_parts.sort(key=lambda x: x[0])
+    tables = [t for _, t in local_parts]
+    local_table: plc.Table | None = (
+        plc.concatenate.concatenate(tables, stream=stream) if tables else None
+    )
+
+    if comm.nranks > 1:
+        local_chunk = (
+            TableChunk.from_pylibcudf_table(
+                local_table, stream, exclusive_view=True, br=context.br()
+            )
+            if local_table is not None
+            else empty_table_chunk(ir.children[1], context, stream)
+        )
+        allgather = AllGatherManager(context, comm, collective_ids.pop())
+        with allgather.inserting() as inserter:
+            inserter.insert(comm.rank, local_chunk)
+        full_table = await allgather.extract_concatenated(stream, ordered=True)
+    else:
+        collective_ids.pop()
+        if local_table is None:
+            return None, False
+        full_table = local_table
+
+    N = full_table.num_rows() // 2
+
+    if N == 0:
+        return None, False
+
+    if N == 1:
+        empty = plc.copying.slice(full_table, [0, 0], stream=stream)[0]
+        return (
+            TableChunk.from_pylibcudf_table(
+                empty, stream, exclusive_view=True, br=context.br()
+            ),
+            True,
+        )
+
+    if not plc.sorting.is_sorted(full_table, column_order, null_order, stream=stream):
+        return None, False
+
+    def _slice_rows(positions: list[int]) -> plc.Table:
+        bounds = [v for k in positions for v in (k, k + 1)]
+        return plc.concatenate.concatenate(
+            plc.copying.slice(full_table, bounds, stream=stream), stream=stream
+        )
+
+    boundaries_tbl = _slice_rows(list(range(1, 2 * N - 1, 2)))
+    next_first_tbl = _slice_rows(list(range(2, 2 * N, 2)))
+
+    bool_type = plc.DataType(plc.TypeId.BOOL8)
+    row_eq = plc.binaryop.binary_operation(
+        boundaries_tbl.columns()[0],
+        next_first_tbl.columns()[0],
+        plc.binaryop.BinaryOperator.NULL_EQUALS,
+        bool_type,
+        stream=stream,
+    )
+    for j in range(1, boundaries_tbl.num_columns()):
+        row_eq = plc.binaryop.binary_operation(
+            row_eq,
+            plc.binaryop.binary_operation(
+                boundaries_tbl.columns()[j],
+                next_first_tbl.columns()[j],
+                plc.binaryop.BinaryOperator.NULL_EQUALS,
+                bool_type,
+                stream=stream,
+            ),
+            plc.binaryop.BinaryOperator.LOGICAL_AND,
+            bool_type,
+            stream=stream,
+        )
+    strict = (
+        plc.stream_compaction.apply_boolean_mask(
+            plc.Table([row_eq]), row_eq, stream=stream
+        ).num_rows()
+        == 0
+    )
+    return (
+        TableChunk.from_pylibcudf_table(
+            boundaries_tbl, stream, exclusive_view=True, br=context.br()
+        ),
+        strict,
+    )
+
+
+def _construct_ordered_metadata(
+    ir: HintSorted,
+    data_metadata: ChannelMetadata,
+    hint_sorted_info: tuple[tuple[str, bool, bool], ...],
+    boundaries: TableChunk,
+    *,
+    strict_boundaries: bool,
+) -> ChannelMetadata:
+    """Construct ChannelMetadata with an appropriate OrderScheme."""
+    col_names = list(ir.schema.keys())
+    keys = [
+        OrderKey(
+            col_names.index(name),
+            plc.types.Order.DESCENDING if desc else plc.types.Order.ASCENDING,
+            plc.types.NullOrder.AFTER if nl else plc.types.NullOrder.BEFORE,
+        )
+        for name, desc, nl in hint_sorted_info
+    ]
+    return ChannelMetadata(
+        local_count=data_metadata.local_count,
+        partitioning=Partitioning(
+            OrderScheme(keys, boundaries, strict_boundaries=strict_boundaries),
+            "inherit",
+        ),
+        duplicated=data_metadata.duplicated,
+    )
+
+
+@define_actor()
+async def hint_sorted(
+    context: Context,
+    comm: Communicator,
+    ir: HintSorted,
+    ir_context: IRExecutionContext,
+    ch_out: Channel[TableChunk],
+    data_ch_in: Channel[TableChunk],
+    sorted_ch_in: Channel[TableChunk],
+    hint_sorted_info: tuple[tuple[str, bool, bool], ...],
+    collective_ids: list[int],
+) -> None:
+    """Hint-sorted actor."""
+    nonempty_data_ch = context.create_channel()
+    async with shutdown_on_error(
+        context,
+        data_ch_in,
+        sorted_ch_in,
+        nonempty_data_ch,
+        ch_out,
+        trace_ir=ir,
+        ir_context=ir_context,
+    ) as tracer:
+        data_metadata, _ = await gather_in_task_group(
+            recv_metadata(data_ch_in, context),
+            recv_metadata(sorted_ch_in, context),
+        )
+
+        boundaries, strict_boundaries = await _collect_boundaries(
+            context,
+            comm,
+            ir_context,
+            sorted_ch_in,
+            hint_sorted_info,
+            collective_ids,
+            ir,
+        )
+
+        output_metadata = (
+            _construct_ordered_metadata(
+                ir,
+                data_metadata,
+                hint_sorted_info,
+                boundaries,
+                strict_boundaries=strict_boundaries,
+            )
+            if boundaries is not None
+            else data_metadata
+        )
+
+        data_ir = ir.children[0]
+        await gather_in_task_group(
+            drop_empty_chunks(context, data_ch_in, nonempty_data_ch),
+            chunkwise_evaluate(
+                context,
+                MapFunction(
+                    data_ir.schema, "hint_sorted", (hint_sorted_info,), data_ir
+                ),
+                ir_context,
+                ch_out,
+                nonempty_data_ch,
+                output_metadata,
+                tracer=tracer,
+            ),
+        )
+
+
+@generate_ir_sub_network.register(HintSorted)
+def _hint_sorted_rapidsmpf_network(
+    ir: HintSorted, rec: SubNetGenerator
+) -> tuple[dict, dict]:
+    df, keys = ir.children
+    nodes, channels = process_children(ir, rec)
+    collective_ids = list(rec.state["collective_id_map"][ir])
+    assert len(collective_ids) == 1
+    channels[ir] = ChannelManager(rec.state["context"])
+    nodes[ir] = [
+        hint_sorted(
+            rec.state["context"],
+            rec.state["comm"],
+            ir,
+            rec.state["ir_context"],
+            ch_out=channels[ir].reserve_input_slot(),
+            data_ch_in=channels[df].reserve_output_slot(),
+            sorted_ch_in=channels[keys].reserve_output_slot(),
+            hint_sorted_info=ir.sorted_info,
             collective_ids=collective_ids,
         )
     ]

@@ -14,7 +14,7 @@ from rmm.pylibrmm.stream import DEFAULT_STREAM
 
 from cudf_polars.containers import Column, DataFrame, DataType
 from cudf_polars.dsl.expr import Col
-from cudf_polars.dsl.ir import IR, MapFunction, Slice, Sort
+from cudf_polars.dsl.ir import IR, Slice, Sort
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.dsl.utils.naming import unique_names
 from cudf_polars.experimental.base import PartitionInfo, get_key_name
@@ -482,21 +482,6 @@ class HintSorted(IR):
         """Sort hint triples: (column_name, descending, nulls_last)."""
         (info,) = self.options
         return info
-
-    @classmethod
-    def do_evaluate(
-        cls,
-        schema: Schema,
-        options: Any,
-        df: DataFrame,
-        keys: DataFrame,  # Used by actor path; ignored in tasks path
-        *,
-        context: IRExecutionContext,
-    ) -> DataFrame:
-        """Evaluate and return a dataframe."""
-        return MapFunction.do_evaluate(
-            schema, "hint_sorted", options, df, context=context
-        )
 
 
 class ShuffleSorted(IR):
