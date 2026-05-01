@@ -575,22 +575,28 @@ def test_remap_partitioning_order_scheme_drops_key(rapidsmpf_context, engine):
 
 
 @pytest.mark.parametrize(
-    "descending,expected_order",
+    "descending,with_nulls,expected_order",
     [
-        (False, plc.types.Order.ASCENDING),
-        (True, plc.types.Order.DESCENDING),
+        (False, False, plc.types.Order.ASCENDING),
+        (True, False, plc.types.Order.DESCENDING),
+        (False, True, plc.types.Order.ASCENDING),
     ],
-    ids=["ascending", "descending"],
+    ids=["ascending", "descending", "ascending-nulls"],
 )
 def test_hint_sorted_metadata(
-    streaming_engine_factory, tmp_path, descending, expected_order
+    streaming_engine_factory, tmp_path, descending, with_nulls, expected_order
 ) -> None:
     options = StreamingOptions(max_rows_per_partition=3)
     streaming_engine = streaming_engine_factory(options)
     config_options = ConfigOptions.from_polars_engine(streaming_engine)
 
-    values = list(range(8, -1, -1)) if descending else list(range(9))
-    df = pl.DataFrame({"x": values, "y": list(range(9, 0, -1))})
+    # with_nulls: [None, None, None, 3, 4, 5, 6, 7, 8] — sorted ascending, nulls-first
+    x = (
+        [None, None, None, 3, 4, 5, 6, 7, 8]
+        if with_nulls
+        else (list(range(8, -1, -1)) if descending else list(range(9)))
+    )
+    df = pl.DataFrame({"x": pl.Series(x, dtype=pl.Int64), "y": list(range(9, 0, -1))})
     q = make_lazy_frame(df, "parquet", path=tmp_path, n_files=3)
     scan_ir = Translator(q._ldf.visit(), streaming_engine).translate_ir()
     # Bypass Polars' optimizer which prunes hint_sorted when no downstream op consumes it

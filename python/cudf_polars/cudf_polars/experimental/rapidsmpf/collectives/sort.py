@@ -624,7 +624,6 @@ async def _collect_boundaries(
     ir: HintSorted,
 ) -> tuple[TableChunk | None, bool]:
     """Collect boundaries from a sorted-data channel."""
-    stream = ir_context.get_cuda_stream()
     column_order = [
         plc.types.Order.DESCENDING if desc else plc.types.Order.ASCENDING
         for _, desc, _ in hint_sorted_info
@@ -633,7 +632,9 @@ async def _collect_boundaries(
         plc.types.NullOrder.AFTER if nl else plc.types.NullOrder.BEFORE
         for _, _, nl in hint_sorted_info
     ]
+
     boundary_rows: list[plc.Table] = []
+    stream = ir_context.get_cuda_stream()
     while (msg := await sorted_ch_in.recv(context)) is not None:
         chunk = TableChunk.from_message(msg, br=context.br()).make_available_and_spill(
             context.br(), allow_overbooking=True
@@ -667,19 +668,15 @@ async def _collect_boundaries(
         allgather = AllGatherManager(context, comm, collective_ids.pop())
         with allgather.inserting() as inserter:
             inserter.insert(comm.rank, local_chunk)
-        full_table = await allgather.extract_concatenated(stream, ordered=True)
-    else:
-        collective_ids.pop()
-        if boundary_table is None:
-            return None, False
-        full_table = boundary_table
-
-    N = full_table.num_rows() // 2
-
-    if N == 0:
+        boundary_table = await allgather.extract_concatenated(stream, ordered=True)
+    elif boundary_table is None:
         return None, False
-    elif N == 1:
-        empty = plc.copying.slice(full_table, [0, 0], stream=stream)[0]
+
+    num_partitions = boundary_table.num_rows() // 2
+    if num_partitions == 0:
+        return None, False  # No boundaries
+    elif num_partitions == 1:
+        empty = plc.copying.slice(boundary_table, [0, 0], stream=stream)[0]
         return (
             TableChunk.from_pylibcudf_table(
                 empty, stream, exclusive_view=True, br=context.br()
@@ -687,32 +684,34 @@ async def _collect_boundaries(
             True,
         )
 
-    if not plc.sorting.is_sorted(full_table, column_order, null_order, stream=stream):
-        return None, False
+    if not plc.sorting.is_sorted(
+        boundary_table, column_order, null_order, stream=stream
+    ):
+        return None, False  # Not sorted
 
     def _slice_rows(positions: list[int]) -> plc.Table:
         bounds = [v for k in positions for v in (k, k + 1)]
         return plc.concatenate.concatenate(
-            plc.copying.slice(full_table, bounds, stream=stream), stream=stream
+            plc.copying.slice(boundary_table, bounds, stream=stream), stream=stream
         )
 
-    boundaries_tbl = _slice_rows(list(range(1, 2 * N - 1, 2)))
-    next_first_tbl = _slice_rows(list(range(2, 2 * N, 2)))
+    partition_ends = _slice_rows(list(range(1, 2 * num_partitions - 1, 2)))
+    partition_starts = _slice_rows(list(range(2, 2 * num_partitions, 2)))
 
     bool_type = plc.DataType(plc.TypeId.BOOL8)
     row_eq = plc.binaryop.binary_operation(
-        boundaries_tbl.columns()[0],
-        next_first_tbl.columns()[0],
+        partition_ends.columns()[0],
+        partition_starts.columns()[0],
         plc.binaryop.BinaryOperator.NULL_EQUALS,
         bool_type,
         stream=stream,
     )
-    for j in range(1, boundaries_tbl.num_columns()):
+    for j in range(1, partition_ends.num_columns()):
         row_eq = plc.binaryop.binary_operation(
             row_eq,
             plc.binaryop.binary_operation(
-                boundaries_tbl.columns()[j],
-                next_first_tbl.columns()[j],
+                partition_ends.columns()[j],
+                partition_starts.columns()[j],
                 plc.binaryop.BinaryOperator.NULL_EQUALS,
                 bool_type,
                 stream=stream,
@@ -729,7 +728,7 @@ async def _collect_boundaries(
     )
     return (
         TableChunk.from_pylibcudf_table(
-            boundaries_tbl, stream, exclusive_view=True, br=context.br()
+            partition_starts, stream, exclusive_view=True, br=context.br()
         ),
         strict,
     )
