@@ -698,6 +698,9 @@ async def _collect_boundaries(
     partition_ends = _slice_rows(list(range(1, 2 * num_partitions - 1, 2)))
     partition_starts = _slice_rows(list(range(2, 2 * num_partitions, 2)))
 
+    # Check if any rows of partition_ends and partition_starts
+    # are equal. If so, the boundaries are not strict
+    # (i.e. a distinct value my exist in multiple partitions).
     bool_type = plc.DataType(plc.TypeId.BOOL8)
     row_eq = plc.binaryop.binary_operation(
         partition_ends.columns()[0],
