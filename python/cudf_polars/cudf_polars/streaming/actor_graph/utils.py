@@ -52,7 +52,7 @@ from cudf_polars.dsl.ir import (
 )
 from cudf_polars.dsl.tracing import Scope
 from cudf_polars.dsl.utils.column_domain import column_domain_bindings
-from cudf_polars.dsl.utils.naming import names_to_indices
+from cudf_polars.dsl.utils.naming import indices_to_names, names_to_indices
 from cudf_polars.streaming.actor_graph.collectives.allgather import AllGatherManager
 from cudf_polars.streaming.actor_graph.tracing import (
     ActorTracer,
@@ -1162,25 +1162,6 @@ async def chunkwise_evaluate(
         await send_chunk(context, ch_out, result, 0, tracer=tracer)
 
     await ch_out.drain(context)
-
-
-def indices_to_names(indices: Iterable[int], schema: Schema) -> tuple[str, ...]:
-    """
-    Return column names for the given column indices in schema order.
-
-    Parameters
-    ----------
-    indices
-        The indices to get names for.
-    schema
-        The schema to get names from.
-
-    Returns
-    -------
-    The column names for each index in schema order.
-    """
-    keys = list(schema.keys())
-    return tuple(keys[i] for i in indices)
 
 
 @dataclass(frozen=True)
