@@ -109,7 +109,7 @@ def test_hint_sorted_join_uses_ordered_adjustment(spmd_engine_factory, monkeypat
     )
 
     assert_gpu_result_equal(q, engine=engine)
-    assert calls == 2
+    assert calls == 1
 
 
 def test_one_sided_hint_sorted_join_uses_dynamic_join(spmd_engine_factory, monkeypatch):

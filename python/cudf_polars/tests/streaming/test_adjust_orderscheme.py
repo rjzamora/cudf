@@ -22,6 +22,9 @@ import pylibcudf as plc
 
 from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.dsl.ir import Empty, IRExecutionContext
+from cudf_polars.streaming.actor_graph.collectives import (
+    orderscheme as orderscheme_module,
+)
 from cudf_polars.streaming.actor_graph.collectives.common import reserve_op_id
 from cudf_polars.streaming.actor_graph.collectives.orderscheme import (
     adjust_orderscheme,
@@ -344,12 +347,17 @@ def test_adjust_orderscheme_emits_empty_owned_partitions(spmd_engine) -> None:
     ],
 )
 def test_adjust_orderscheme_single_rank_no_collective(
-    spmd_engine, target_boundary, expected
+    spmd_engine, monkeypatch, target_boundary, expected
 ) -> None:
     context = spmd_engine.context
     comm = spmd_engine.comm
     if comm.nranks != 1:
         pytest.skip("This test covers the single-rank path.")
+
+    def _fail_pack(*args, **kwargs):
+        pytest.fail("single-rank OrderScheme adjustment should not pack")
+
+    monkeypatch.setattr(orderscheme_module, "_pack_table", _fail_pack)
 
     stream = context.get_stream_from_pool()
     input_scheme = _make_scheme(context, 4, stream=stream)

@@ -490,7 +490,11 @@ def _ordered_join_adjustment(
     ):
         return None
 
-    target = make_strict_orderscheme(left_scheme, context)
+    target_source = max(
+        (left_scheme, right_scheme),
+        key=lambda scheme: (scheme.num_boundaries, scheme.strict_boundaries),
+    )
+    target = make_strict_orderscheme(target_source, context)
     left_output = _retarget_orderscheme(left_scheme, target, context)
     right_output = _retarget_orderscheme(right_scheme, target, context)
     output_scheme = _output_orderscheme(ir, target, context)
@@ -538,6 +542,12 @@ async def _adjust_ordered_join_side(
     output_scheme: OrderScheme,
     collective_id: int,
 ) -> None:
+    if input_scheme.strict_boundaries and input_scheme.boundaries_aligned_with(
+        output_scheme, context.br()
+    ):
+        await _send_metadata_and_forward_channel(context, ch_out, ch_in, metadata)
+        return
+
     ch_adjusted = context.create_channel()
     await gather_in_task_group(
         adjust_orderscheme(

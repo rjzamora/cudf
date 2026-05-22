@@ -238,25 +238,26 @@ async def adjust_orderscheme(
     if comm.nranks == 1:
         boundary_chunk = output_scheme.get_boundaries(context.br())
         boundary_table = boundary_chunk.table_view()
-        pieces: list[PackedData] = []
+        chunks: list[TableChunk] = []
         next_pid = 0
 
         async def flush_until(pid: int) -> None:
-            nonlocal next_pid, pieces
+            nonlocal next_pid, chunks
             while next_pid < pid:
-                chunk = (
-                    _materialize_packed_pieces(
-                        pieces, context, context.get_stream_from_pool()
+                if len(chunks) > 1:
+                    chunk = await concat_batch(
+                        chunks, context, ref_ir.schema, ir_context
                     )
-                    if pieces
-                    else None
-                )
+                elif chunks:
+                    chunk = chunks[0]
+                else:
+                    chunk = None
                 if chunk is None:
                     chunk = empty_table_chunk(
                         ref_ir, context, ir_context.get_cuda_stream()
                     )
                 await ch_out.send(context, Message(next_pid, chunk))
-                pieces = []
+                chunks = []
                 next_pid += 1
 
         while (msg := await ch_in.recv(context)) is not None:
@@ -277,7 +278,14 @@ async def adjust_orderscheme(
                     if piece.num_rows() == 0:
                         continue
                     await flush_until(pid)
-                    pieces.append(_pack_table(piece, stream, context.br()))
+                    chunks.append(
+                        TableChunk.from_pylibcudf_table(
+                            piece,
+                            stream,
+                            exclusive_view=True,
+                            br=context.br(),
+                        )
+                    )
 
         await flush_until(npartitions)
         await ch_out.drain(context)
