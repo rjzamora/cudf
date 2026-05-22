@@ -23,7 +23,7 @@ import pylibcudf as plc
 
 from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.dsl.expr import Col, NamedExpr
-from cudf_polars.dsl.ir import Empty, Sort
+from cudf_polars.dsl.ir import Empty, MapFunction, Sort
 from cudf_polars.dsl.utils.naming import names_to_indices, unique_names
 from cudf_polars.streaming.actor_graph.collectives.allgather import AllGatherManager
 from cudf_polars.streaming.actor_graph.collectives.shuffle import ShuffleManager
@@ -51,6 +51,7 @@ from cudf_polars.streaming.actor_graph.utils import (
 )
 from cudf_polars.streaming.repartition import Repartition
 from cudf_polars.streaming.sort import (
+    HintSorted,
     _get_final_sort_boundaries,
     _has_simple_zlice,
     _select_local_split_candidates,
@@ -718,6 +719,95 @@ def _build_order_scheme(
     )
 
 
+def _hint_sorted_order_keys(
+    schema: Schema, sorted_info: tuple[tuple[str, bool, bool], ...]
+) -> list[OrderKey]:
+    names = list(schema)
+    return [
+        OrderKey(
+            names.index(name),
+            plc.types.Order.DESCENDING if descending else plc.types.Order.ASCENDING,
+            (
+                plc.types.NullOrder.AFTER
+                if nulls_last != descending
+                else plc.types.NullOrder.BEFORE
+            ),
+        )
+        for name, descending, nulls_last in sorted_info
+    ]
+
+
+async def _drop_empty_chunks(
+    context: Context,
+    ch_out: Channel[TableChunk],
+    ch_in: Channel[TableChunk],
+) -> None:
+    while (msg := await ch_in.recv(context)) is not None:
+        chunk = TableChunk.from_message(msg, br=context.br())
+        if chunk.table_view().num_rows() > 0:
+            await ch_out.send(context, Message(msg.sequence_number, chunk))
+    await ch_out.drain(context)
+
+
+@define_actor()
+async def hint_sorted_actor(
+    context: Context,
+    comm: Communicator,
+    ir: HintSorted,
+    ir_context: IRExecutionContext,
+    ch_out: Channel[TableChunk],
+    ch_data: Channel[TableChunk],
+    ch_keys: Channel[TableChunk],
+    collective_ids: list[int],
+) -> None:
+    """Attach OrderScheme metadata to data marked by MapFunction(hint_sorted)."""
+    ch_nonempty = context.create_channel()
+    async with shutdown_on_error(
+        context,
+        ch_out,
+        ch_data,
+        ch_keys,
+        ch_nonempty,
+        trace_ir=ir,
+        ir_context=ir_context,
+    ) as tracer:
+        data_metadata, _ = await gather_in_task_group(
+            recv_metadata(ch_data, context),
+            recv_metadata(ch_keys, context),
+        )
+        partitioning = await extract_orderscheme_partitioning(
+            context,
+            comm,
+            ir.children[1],
+            ir_context,
+            ch_keys,
+            _hint_sorted_order_keys(ir.schema, ir.sorted_info),
+            collective_ids.pop(),
+        )
+        metadata_out = ChannelMetadata(
+            local_count=data_metadata.local_count,
+            partitioning=partitioning or data_metadata.partitioning,
+            duplicated=data_metadata.duplicated,
+        )
+        await gather_in_task_group(
+            _drop_empty_chunks(context, ch_nonempty, ch_data),
+            chunkwise_evaluate(
+                context,
+                MapFunction(
+                    ir.children[0].schema,
+                    "hint_sorted",
+                    ir.options,
+                    ir.children[0],
+                ),
+                ir_context,
+                ch_out,
+                ch_nonempty,
+                metadata_out,
+                tracer=tracer,
+            ),
+        )
+
+
 async def _global_sort(
     context: Context,
     comm: Communicator,
@@ -929,6 +1019,30 @@ def _sort_rapidsmpf_network(ir: Sort, rec: SubNetGenerator) -> tuple[dict, dict]
             by=by,
             num_partitions=partition_info[ir].count,
             executor=executor,
+            collective_ids=collective_ids,
+        )
+    ]
+    return nodes, channels
+
+
+@generate_ir_sub_network.register(HintSorted)
+def _hint_sorted_rapidsmpf_network(
+    ir: HintSorted, rec: SubNetGenerator
+) -> tuple[dict, dict]:
+    data, keys = ir.children
+    nodes, channels = process_children(ir, rec)
+    collective_ids = list(rec.state["collective_id_map"][ir])
+    assert len(collective_ids) == 1
+    channels[ir] = ChannelManager(rec.state["context"])
+    nodes[ir] = [
+        hint_sorted_actor(
+            rec.state["context"],
+            rec.state["comm"],
+            ir,
+            rec.state["ir_context"],
+            ch_out=channels[ir].reserve_input_slot(),
+            ch_data=channels[data].reserve_output_slot(),
+            ch_keys=channels[keys].reserve_output_slot(),
             collective_ids=collective_ids,
         )
     ]

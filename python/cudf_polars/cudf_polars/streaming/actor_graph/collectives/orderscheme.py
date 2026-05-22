@@ -11,6 +11,7 @@ from rapidsmpf.integrations.cudf.partition import unpack_and_concat
 from rapidsmpf.memory.packed_data import PackedData
 from rapidsmpf.streaming.coll.sparse_alltoall import SparseAlltoall
 from rapidsmpf.streaming.core.message import Message
+from rapidsmpf.streaming.cudf.channel_metadata import OrderScheme
 from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
 import polars as pl
@@ -19,7 +20,7 @@ import pylibcudf as plc
 from pylibcudf.contiguous_split import pack
 
 from cudf_polars.containers import DataFrame, DataType
-from cudf_polars.streaming.actor_graph.utils import concat_batch
+from cudf_polars.streaming.actor_graph.utils import concat_batch, empty_table_chunk
 from cudf_polars.utils.cuda_stream import stream_ordered_after
 
 if TYPE_CHECKING:
@@ -29,7 +30,6 @@ if TYPE_CHECKING:
     from rapidsmpf.memory.buffer_resource import BufferResource
     from rapidsmpf.streaming.core.channel import Channel
     from rapidsmpf.streaming.core.context import Context
-    from rapidsmpf.streaming.cudf.channel_metadata import OrderScheme
 
     from rmm.pylibrmm.stream import Stream
 
@@ -52,6 +52,27 @@ def _local_partitions(rank: int, nranks: int, npartitions: int) -> list[int]:
         for pid in range(npartitions)
         if _contiguous_owner(pid, nranks, npartitions) == rank
     ]
+
+
+def orderscheme_local_partitions(
+    rank: int, nranks: int, scheme: OrderScheme
+) -> list[int]:
+    """Return local partition IDs for a flat OrderScheme."""
+    return _local_partitions(rank, nranks, scheme.num_boundaries + 1)
+
+
+def orderscheme_local_count(rank: int, nranks: int, scheme: OrderScheme) -> int:
+    """Return local partition count for a flat OrderScheme."""
+    return len(orderscheme_local_partitions(rank, nranks, scheme))
+
+
+def make_strict_orderscheme(scheme: OrderScheme, context: Context) -> OrderScheme:
+    """Return an equivalent OrderScheme with strict boundary metadata."""
+    return OrderScheme(
+        scheme.keys,
+        scheme.get_boundaries(context.br()),
+        strict_boundaries=True,
+    )
 
 
 def _validate_schemes(input_scheme: OrderScheme, output_scheme: OrderScheme) -> None:
@@ -283,8 +304,7 @@ async def adjust_orderscheme(
         chunk = (
             await concat_batch(chunks, context, ref_ir.schema, ir_context)
             if chunks
-            else None
+            else empty_table_chunk(ref_ir, context, ir_context.get_cuda_stream())
         )
-        if chunk is not None and chunk.table_view().num_rows() > 0:
-            await ch_out.send(context, Message(pid, chunk))
+        await ch_out.send(context, Message(pid, chunk))
     await ch_out.drain(context)

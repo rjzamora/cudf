@@ -283,7 +283,7 @@ def test_adjust_orderscheme_sparse_boundary_shift(
     "target_boundary,expected",
     [
         (3, {0: [0, 1, 2], 1: [3, 4, 5, 6, 7]}),
-        (0, {1: list(range(8))}),
+        (0, {0: [], 1: list(range(8))}),
     ],
 )
 def test_adjust_orderscheme_single_rank_no_collective(

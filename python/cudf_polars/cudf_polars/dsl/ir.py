@@ -3095,7 +3095,8 @@ class MapFunction(IR):
         elif (
             self.name == "hint_sorted"
         ):  # pragma: no cover; polars prunes hints in some cases
-            raise NotImplementedError("Hint sorted unsupported")
+            (sorted_info,) = options
+            self.options = (tuple(tuple(s) for s in sorted_info),)
         self._non_child_args = (schema, name, self.options)
 
     def get_hashable(self) -> Hashable:
@@ -3205,6 +3206,25 @@ class MapFunction(IR):
                 dtype=dtype,
             )
             return DataFrame([index_col, *df.columns], stream=df.stream)
+        elif (
+            name == "hint_sorted"
+        ):  # pragma: no cover; polars prunes hints in some cases
+            (sorted_info,) = options
+            for col_name, descending, nulls_last in sorted_info:
+                df.column_map[col_name].set_sorted(
+                    is_sorted=plc.types.Sorted.YES,
+                    order=(
+                        plc.types.Order.DESCENDING
+                        if descending
+                        else plc.types.Order.ASCENDING
+                    ),
+                    null_order=(
+                        plc.types.NullOrder.AFTER
+                        if nulls_last != descending
+                        else plc.types.NullOrder.BEFORE
+                    ),
+                )
+            return df
         else:
             raise AssertionError("Should never be reached")  # pragma: no cover
 

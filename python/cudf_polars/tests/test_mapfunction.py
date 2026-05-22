@@ -110,7 +110,6 @@ def test_unique_hash():
     assert hash(ir_a) != hash(ir_b)
 
 
-@pytest.mark.xfail(reason="HintIR not supported")
 def test_set_sorted_then_inner_join(engine: pl.GPUEngine):
     df = pl.LazyFrame({"a": [1, 2, 3, 4, 5]})
 

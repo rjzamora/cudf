@@ -17,6 +17,8 @@ from rapidsmpf.streaming.cudf.bloom_filter import BloomFilter
 from rapidsmpf.streaming.cudf.channel_metadata import (
     ChannelMetadata,
     HashScheme,
+    OrderKey,
+    OrderScheme,
     Partitioning,
 )
 from rapidsmpf.streaming.cudf.table_chunk import (
@@ -31,6 +33,11 @@ from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IR, Join
 from cudf_polars.dsl.utils.naming import names_to_indices
 from cudf_polars.streaming.actor_graph.collectives.allgather import AllGatherManager
+from cudf_polars.streaming.actor_graph.collectives.orderscheme import (
+    adjust_orderscheme,
+    make_strict_orderscheme,
+    orderscheme_local_count,
+)
 from cudf_polars.streaming.actor_graph.collectives.shuffle import _global_shuffle
 from cudf_polars.streaming.actor_graph.dispatch import (
     generate_ir_sub_network,
@@ -95,6 +102,19 @@ class JoinStrategy:
     """The shuffle indices for the left side. Only used for shuffle joins."""
     right_indices: tuple[int, ...] = ()
     """The shuffle indices for the right side. Only used for shuffle joins."""
+
+
+@dataclass(frozen=True)
+class OrderedJoinAdjustment:
+    """OrderScheme adjustment plan for a chunkwise join."""
+
+    left_input_scheme: OrderScheme
+    left_output_scheme: OrderScheme
+    right_input_scheme: OrderScheme
+    right_output_scheme: OrderScheme
+    left_metadata: ChannelMetadata
+    right_metadata: ChannelMetadata
+    output_metadata: ChannelMetadata
 
 
 @define_actor()
@@ -413,6 +433,130 @@ def _get_key_indices(
         left_key_indices[:n_keys],
         right_key_indices[:n_keys],
         output_key_indices[:n_keys],
+    )
+
+
+def _compatible_order_keys(left: OrderScheme, right: OrderScheme) -> bool:
+    return len(left.keys) == len(right.keys) and all(
+        left_key.order == right_key.order
+        and left_key.null_order == right_key.null_order
+        for left_key, right_key in zip(left.keys, right.keys, strict=True)
+    )
+
+
+def _retarget_orderscheme(
+    source: OrderScheme, target: OrderScheme, context: Context
+) -> OrderScheme:
+    return OrderScheme(
+        source.keys,
+        target.get_boundaries(context.br()),
+        strict_boundaries=True,
+    )
+
+
+def _output_orderscheme(ir: Join, target: OrderScheme, context: Context) -> OrderScheme:
+    _, _, output_key_indices = _get_key_indices(ir, len(target.keys))
+    return OrderScheme(
+        [
+            OrderKey(idx, key.order, key.null_order)
+            for idx, key in zip(output_key_indices, target.keys, strict=True)
+        ],
+        target.get_boundaries(context.br()),
+        strict_boundaries=True,
+    )
+
+
+def _ordered_join_adjustment(
+    context: Context,
+    comm: Communicator,
+    ir: Join,
+    left_metadata: ChannelMetadata,
+    right_metadata: ChannelMetadata,
+    left_partitioning: NormalizedPartitioning,
+    right_partitioning: NormalizedPartitioning,
+) -> OrderedJoinAdjustment | None:
+    if left_metadata.duplicated or right_metadata.duplicated:
+        return None
+    if left_partitioning.is_aligned_with(right_partitioning, context.br()):
+        return None
+    left_scheme = left_partitioning.inter_rank_scheme
+    right_scheme = right_partitioning.inter_rank_scheme
+    if not (
+        isinstance(left_scheme, OrderScheme)
+        and isinstance(right_scheme, OrderScheme)
+        and left_partitioning.local_scheme == "inherit"
+        and right_partitioning.local_scheme == "inherit"
+        and _compatible_order_keys(left_scheme, right_scheme)
+    ):
+        return None
+
+    target = make_strict_orderscheme(left_scheme, context)
+    left_output = _retarget_orderscheme(left_scheme, target, context)
+    right_output = _retarget_orderscheme(right_scheme, target, context)
+    output_scheme = _output_orderscheme(ir, target, context)
+    return OrderedJoinAdjustment(
+        left_input_scheme=left_scheme,
+        left_output_scheme=left_output,
+        right_input_scheme=right_scheme,
+        right_output_scheme=right_output,
+        left_metadata=ChannelMetadata(
+            local_count=orderscheme_local_count(comm.rank, comm.nranks, left_output),
+            partitioning=Partitioning(left_output, "inherit"),
+        ),
+        right_metadata=ChannelMetadata(
+            local_count=orderscheme_local_count(comm.rank, comm.nranks, right_output),
+            partitioning=Partitioning(right_output, "inherit"),
+        ),
+        output_metadata=ChannelMetadata(
+            local_count=orderscheme_local_count(comm.rank, comm.nranks, output_scheme),
+            partitioning=Partitioning(output_scheme, "inherit"),
+        ),
+    )
+
+
+async def _send_metadata_and_forward_channel(
+    context: Context,
+    ch_out: Channel[TableChunk],
+    ch_in: Channel[TableChunk],
+    metadata: ChannelMetadata,
+) -> None:
+    await send_metadata(ch_out, context, metadata)
+    while (msg := await ch_in.recv(context)) is not None:
+        await ch_out.send(context, msg)
+    await ch_out.drain(context)
+
+
+async def _adjust_ordered_join_side(
+    context: Context,
+    comm: Communicator,
+    ir_context: IRExecutionContext,
+    ch_out: Channel[TableChunk],
+    ch_in: Channel[TableChunk],
+    metadata: ChannelMetadata,
+    schema_ir: IR,
+    input_scheme: OrderScheme,
+    output_scheme: OrderScheme,
+    collective_id: int,
+) -> None:
+    ch_adjusted = context.create_channel()
+    await gather_in_task_group(
+        adjust_orderscheme(
+            context,
+            comm,
+            schema_ir,
+            ir_context,
+            ch_adjusted,
+            ch_in,
+            input_scheme,
+            output_scheme,
+            collective_id=collective_id,
+        ),
+        _send_metadata_and_forward_channel(
+            context,
+            ch_out,
+            ch_adjusted,
+            metadata,
+        ),
     )
 
 
@@ -1160,6 +1304,72 @@ async def join_actor(
             recv_metadata(ch_left, context),
             recv_metadata(ch_right, context),
         )
+
+        left_partitioning = NormalizedPartitioning.from_keys(
+            left_metadata.partitioning,
+            comm.nranks,
+            keys=names_to_indices(
+                ir.left_on, ir.children[0].schema, concrete_prefix=True
+            ),
+        )
+        right_partitioning = NormalizedPartitioning.from_keys(
+            right_metadata.partitioning,
+            comm.nranks,
+            keys=names_to_indices(
+                ir.right_on, ir.children[1].schema, concrete_prefix=True
+            ),
+        )
+        ordered_adjustment = _ordered_join_adjustment(
+            context,
+            comm,
+            ir,
+            left_metadata,
+            right_metadata,
+            left_partitioning,
+            right_partitioning,
+        )
+        if ordered_adjustment is not None:
+            if tracer is not None:
+                tracer.decision = "adjust_orderscheme"
+            ch_left_ordered = context.create_channel()
+            ch_right_ordered = context.create_channel()
+            await send_metadata(ch_out, context, ordered_adjustment.output_metadata)
+            await gather_in_task_group(
+                _adjust_ordered_join_side(
+                    context,
+                    comm,
+                    ir_context,
+                    ch_left_ordered,
+                    ch_left,
+                    ordered_adjustment.left_metadata,
+                    ir.children[0],
+                    ordered_adjustment.left_input_scheme,
+                    ordered_adjustment.left_output_scheme,
+                    collective_ids.pop(0),
+                ),
+                _adjust_ordered_join_side(
+                    context,
+                    comm,
+                    ir_context,
+                    ch_right_ordered,
+                    ch_right,
+                    ordered_adjustment.right_metadata,
+                    ir.children[1],
+                    ordered_adjustment.right_input_scheme,
+                    ordered_adjustment.right_output_scheme,
+                    collective_ids.pop(0),
+                ),
+                _join_chunks(
+                    context,
+                    ir,
+                    ir_context,
+                    ch_out,
+                    ch_left_ordered,
+                    ch_right_ordered,
+                    tracer=tracer,
+                ),
+            )
+            return
 
         left_sample, right_sample, strategy = await _choose_strategy(
             context,

@@ -30,6 +30,7 @@ from cudf_polars.dsl.ir import (
     HStack,
     MapFunction,
     Projection,
+    Scan,
     Select,
     Slice,
     Union,
@@ -40,6 +41,7 @@ from cudf_polars.streaming.base import PartitionInfo
 from cudf_polars.streaming.dispatch import lower_ir_node
 from cudf_polars.streaming.io import _clear_source_info_cache
 from cudf_polars.streaming.repartition import Repartition
+from cudf_polars.streaming.sort import HintSorted
 from cudf_polars.streaming.utils import (
     _contains_over,
     _dynamic_planning_on,
@@ -165,6 +167,51 @@ def _(
     # Allow pointwise operations
     if ir.name in ("rename", "explode"):
         return _lower_ir_pwise(ir, rec)
+    if ir.name == "hint_sorted" and _dynamic_planning_on(rec.state["config_options"]):
+        child, partition_info = rec(ir.children[0])
+        key_names = [col_name for col_name, *_ in ir.options[0]]
+        original = ir.children[0]
+        full_cols = (
+            original.with_columns
+            if isinstance(original, Scan) and original.with_columns is not None
+            else list(original.schema)
+        )
+        if (
+            isinstance(original, Scan)
+            and original.typ == "parquet"
+            and len(key_names) < len(full_cols)
+        ):
+            key_schema = {name: original.schema[name] for name in key_names}
+            key_ir: IR = Scan(
+                key_schema,
+                original.typ,
+                original.reader_options,
+                original.cloud_options,
+                original.paths,
+                key_names,
+                original.skip_rows,
+                original.n_rows,
+                original.row_index,
+                original.include_file_paths,
+                original.predicate,
+                original.parquet_options,
+            )
+        else:
+            key_schema = {name: child.schema[name] for name in key_names}
+            key_ir = Select(
+                key_schema,
+                tuple(
+                    NamedExpr(name, Col(child.schema[name], name)) for name in key_names
+                ),
+                False,  # noqa: FBT003
+                child,
+            )
+
+        key_child, key_partition_info = rec(key_ir)
+        partition_info = reduce(operator.or_, (partition_info, key_partition_info))
+        hint_node = HintSorted(ir.schema, ir.options, child, key_child)
+        partition_info[hint_node] = partition_info[child]
+        return hint_node, partition_info
 
     # Fallback for everything else
     return _lower_ir_fallback(

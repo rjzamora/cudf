@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import polars as pl
 
@@ -12,7 +12,7 @@ import pylibcudf as plc
 
 from cudf_polars.containers import Column, DataFrame, DataType
 from cudf_polars.dsl.expr import Col
-from cudf_polars.dsl.ir import Slice, Sort
+from cudf_polars.dsl.ir import IR, Slice, Sort
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.dsl.utils.naming import unique_names
 from cudf_polars.streaming.dispatch import lower_ir_node
@@ -25,9 +25,9 @@ if TYPE_CHECKING:
 
     from rmm.pylibrmm.stream import Stream
 
-    from cudf_polars.dsl.ir import IR
     from cudf_polars.streaming.base import PartitionInfo
     from cudf_polars.streaming.dispatch import LowerIRTransformer
+    from cudf_polars.typing import Schema
 
 
 def find_sort_splits(
@@ -242,6 +242,27 @@ def _has_simple_zlice(zlice: tuple[int, int | None] | None) -> bool:
         zlice[0] < 0 and zlice[1] is not None and zlice[0] + zlice[1] < 0
     )
     return not has_offset
+
+
+class HintSorted(IR):
+    """Apply sorted-column hints to a multi-partition dataframe."""
+
+    __slots__ = ("options",)
+    _non_child = ("schema", "options")
+    _n_non_child_args = 2
+    options: Any
+
+    def __init__(self, schema: Schema, options: Any, df: IR, keys: IR):
+        self.schema = schema
+        self.options = options
+        self._non_child_args = (schema, options)
+        self.children = (df, keys)
+
+    @property
+    def sorted_info(self) -> tuple[tuple[str, bool, bool], ...]:
+        """Return sorted-column hint metadata."""
+        (info,) = self.options
+        return info
 
 
 @lower_ir_node.register(Sort)

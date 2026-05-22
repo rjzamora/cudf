@@ -17,6 +17,7 @@ from cudf_polars.streaming.join import Join
 from cudf_polars.streaming.over import Over
 from cudf_polars.streaming.repartition import Repartition
 from cudf_polars.streaming.shuffle import Shuffle
+from cudf_polars.streaming.sort import HintSorted
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -107,6 +108,7 @@ class ReserveOpIDs:
                 GroupBy,
                 Distinct,
                 Over,
+                HintSorted,
             )
 
         self.collective_nodes: list[IR] = [
