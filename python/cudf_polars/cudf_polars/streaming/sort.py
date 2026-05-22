@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import polars as pl
@@ -244,19 +245,35 @@ def _has_simple_zlice(zlice: tuple[int, int | None] | None) -> bool:
     return not has_offset
 
 
+@dataclass(frozen=True)
+class ParquetFooterHint:
+    paths: tuple[str, ...]
+    key_name: str
+    plan_flavor: int
+    plan_factor: int
+
+
 class HintSorted(IR):
     """Apply sorted-column hints to a multi-partition dataframe."""
 
-    __slots__ = ("options",)
-    _non_child = ("schema", "options")
-    _n_non_child_args = 2
+    __slots__ = ("footer_hint", "options")
+    _non_child = ("schema", "options", "footer_hint")
+    _n_non_child_args = 3
+    footer_hint: ParquetFooterHint | None
     options: Any
 
-    def __init__(self, schema: Schema, options: Any, df: IR, keys: IR):
+    def __init__(
+        self,
+        schema: Schema,
+        options: Any,
+        footer_hint: ParquetFooterHint | None,
+        df: IR,
+    ):
         self.schema = schema
         self.options = options
-        self._non_child_args = (schema, options)
-        self.children = (df, keys)
+        self.footer_hint = footer_hint
+        self._non_child_args = (schema, options, footer_hint)
+        self.children = (df,)
 
     @property
     def sorted_info(self) -> tuple[tuple[str, bool, bool], ...]:

@@ -29,7 +29,7 @@ from cudf_polars.streaming.actor_graph.utils import (
     empty_table_chunk,
     gather_in_task_group,
     make_spill_function,
-    maybe_remap_partitioning,
+    maybe_remap_partitioning_runtime,
     process_children,
     recv_metadata,
     send_metadata,
@@ -80,7 +80,9 @@ async def default_node_single(
         metadata_in = await recv_metadata(ch_in, context)
         metadata_out = ChannelMetadata(
             local_count=metadata_in.local_count,
-            partitioning=maybe_remap_partitioning(ir, metadata_in.partitioning),
+            partitioning=maybe_remap_partitioning_runtime(
+                context, ir, ir_context, metadata_in.partitioning
+            ),
             duplicated=metadata_in.duplicated,
         )
 
@@ -143,8 +145,12 @@ async def default_node_multi(
             duplicated = duplicated and md_child.duplicated
             if idx == partitioning_index:
                 # Remap partitioning from child schema to output schema
-                partitioning = maybe_remap_partitioning(
-                    ir, md_child.partitioning, child_ir=ir.children[idx]
+                partitioning = maybe_remap_partitioning_runtime(
+                    context,
+                    ir,
+                    ir_context,
+                    md_child.partitioning,
+                    child_ir=ir.children[idx],
                 )
         metadata = ChannelMetadata(
             local_count=local_count,

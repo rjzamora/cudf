@@ -22,7 +22,14 @@ import pylibcudf as plc
 from cudf_polars import Translator
 from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.dsl import expr
-from cudf_polars.dsl.ir import GroupBy, HStack, Projection, Select, Sort
+from cudf_polars.dsl.ir import (
+    GroupBy,
+    HStack,
+    IRExecutionContext,
+    Projection,
+    Select,
+    Sort,
+)
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.streaming.actor_graph.collectives.sort import (
     _is_already_sorted,
@@ -32,6 +39,7 @@ from cudf_polars.streaming.actor_graph.core import evaluate_logical_plan
 from cudf_polars.streaming.actor_graph.utils import (
     NormalizedPartitioning,
     maybe_remap_partitioning,
+    maybe_remap_partitioning_runtime,
 )
 from cudf_polars.utils.config import ConfigOptions
 
@@ -608,6 +616,59 @@ def test_remap_partitioning_order_scheme_drops_key(spmd_engine):
     result = maybe_remap_partitioning(_make_select_ir(engine, ("b",)), part)
     assert result is not None
     assert result.inter_rank is None
+
+
+def test_remap_partitioning_order_scheme_bucket_transform(spmd_engine):
+    context = spmd_engine.context
+    engine = pl.GPUEngine(executor="in-memory", raise_on_fail=True)
+    child = Translator(
+        pl.LazyFrame({"DateTime": [0], "value": [1]})._ldf.visit(), engine
+    ).translate_ir()
+    dtype = DataType(pl.Int64())
+    divisor = expr.Literal(dtype, 10)
+    ts_bucket = expr.BinOp(
+        dtype,
+        plc.binaryop.BinaryOperator.MUL,
+        expr.BinOp(
+            dtype,
+            plc.binaryop.BinaryOperator.FLOOR_DIV,
+            expr.Cast(dtype, strict=True, value=expr.Col(dtype, "DateTime")),
+            divisor,
+        ),
+        divisor,
+    )
+    hstack = HStack(
+        {**child.schema, "ts_bucket": dtype},
+        (expr.NamedExpr("ts_bucket", ts_bucket),),
+        should_broadcast=True,
+        df=child,
+    )
+    part = Partitioning(
+        inter_rank=_make_order_scheme(
+            context, key_indices=(0,), values=(2, 10, 12), strict=True
+        ),
+        local="inherit",
+    )
+
+    result = maybe_remap_partitioning_runtime(
+        context,
+        hstack,
+        IRExecutionContext(get_cuda_stream=context.get_stream_from_pool),
+        part,
+    )
+
+    assert result is not None
+    scheme = result.inter_rank
+    assert isinstance(scheme, OrderScheme)
+    assert scheme.keys[0].column_index == tuple(hstack.schema).index("ts_bucket")
+    assert not scheme.strict_boundaries
+    chunk = scheme.get_boundaries(context.br())
+    actual = (
+        DataFrame.from_table(chunk.table_view(), ["ts_bucket"], [dtype], chunk.stream)
+        .to_polars()["ts_bucket"]
+        .to_list()
+    )
+    assert actual == [0, 10, 10]
 
 
 @pytest.mark.parametrize(

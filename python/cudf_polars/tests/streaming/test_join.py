@@ -71,6 +71,88 @@ def test_dynamic_join_right_full_reverse(left, right, streaming_engine_factory, 
     assert_gpu_result_equal(q, engine=streaming_engine, check_row_order=False)
 
 
+def test_hint_sorted_join_uses_ordered_adjustment(spmd_engine_factory, monkeypatch):
+    import cudf_polars.streaming.actor_graph.join as join_module
+
+    engine = spmd_engine_factory(
+        StreamingOptions(
+            max_rows_per_partition=2,
+            target_partition_size=1,
+            broadcast_limit=1,
+        )
+    )
+    calls = 0
+    original = join_module.adjust_orderscheme
+
+    async def wrapped_adjust_orderscheme(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(join_module, "adjust_orderscheme", wrapped_adjust_orderscheme)
+    left = pl.LazyFrame(
+        {
+            "key": [0, 0, 1, 1, 2, 2, 3, 3],
+            "lv": range(8),
+        }
+    )
+    right = pl.LazyFrame(
+        {
+            "key": [0, 1, 1, 2, 2, 3, 4, 4],
+            "rv": range(8),
+        }
+    )
+    q = (
+        left.set_sorted("key")
+        .join(right.set_sorted("key"), on="key", how="inner")
+        .sort("key", "lv", "rv")
+    )
+
+    assert_gpu_result_equal(q, engine=engine)
+    assert calls == 2
+
+
+def test_one_sided_hint_sorted_join_uses_dynamic_join(spmd_engine_factory, monkeypatch):
+    import cudf_polars.streaming.actor_graph.join as join_module
+
+    engine = spmd_engine_factory(
+        StreamingOptions(
+            max_rows_per_partition=2,
+            target_partition_size=1,
+            broadcast_limit=1,
+        )
+    )
+    calls = 0
+    original = join_module.adjust_orderscheme
+
+    async def wrapped_adjust_orderscheme(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(join_module, "adjust_orderscheme", wrapped_adjust_orderscheme)
+    left = pl.LazyFrame(
+        {
+            "key": [0, 0, 1, 1, 2, 2, 3, 3],
+            "lv": range(8),
+        }
+    )
+    right = pl.LazyFrame(
+        {
+            "key": [2, 0, 4, 1, 3, 1, 2, 4],
+            "rv": range(8),
+        }
+    )
+    q = (
+        left.set_sorted("key")
+        .join(right, on="key", how="inner")
+        .sort("key", "lv", "rv")
+    )
+
+    assert_gpu_result_equal(q, engine=engine)
+    assert calls == 0
+
+
 # ---------------------------------------------------------------------------
 # Tests migrated from tests/streaming/test_join.py
 # ---------------------------------------------------------------------------

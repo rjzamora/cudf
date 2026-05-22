@@ -68,6 +68,80 @@ def test_dynamic_groupby_single_group(streaming_engine):
     assert_gpu_result_equal(q, engine=streaming_engine, check_row_order=False)
 
 
+def test_hint_sorted_groupby_uses_ordered_adjustment(spmd_engine_factory, monkeypatch):
+    import cudf_polars.streaming.actor_graph.groupby as groupby_module
+
+    engine = spmd_engine_factory(
+        StreamingOptions(
+            max_rows_per_partition=2,
+            target_partition_size=1,
+            broadcast_limit=1,
+        )
+    )
+    calls = 0
+    original = groupby_module.adjust_orderscheme
+
+    async def wrapped_adjust_orderscheme(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        groupby_module, "adjust_orderscheme", wrapped_adjust_orderscheme
+    )
+    df = pl.LazyFrame(
+        {
+            "key": [0, 0, 0, 1, 1, 2, 2, 3],
+            "value": range(8),
+        }
+    )
+    q = df.set_sorted("key").group_by("key").agg(pl.col("value").sum())
+
+    assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+    assert calls == 1
+
+
+def test_datetime_hint_bucket_groupby_uses_ordered_adjustment(
+    spmd_engine_factory, monkeypatch
+):
+    import cudf_polars.streaming.actor_graph.groupby as groupby_module
+
+    engine = spmd_engine_factory(
+        StreamingOptions(
+            max_rows_per_partition=2,
+            target_partition_size=1,
+            broadcast_limit=1,
+        )
+    )
+    calls = 0
+    original = groupby_module.adjust_orderscheme
+
+    async def wrapped_adjust_orderscheme(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        groupby_module, "adjust_orderscheme", wrapped_adjust_orderscheme
+    )
+    df = pl.LazyFrame(
+        {
+            "DateTime": [0, 1, 2, 10, 11, 12, 20, 21],
+            "value": range(8),
+        }
+    )
+    ts_bucket = ((pl.col("DateTime").cast(pl.Int64) // 10) * 10).alias("ts_bucket")
+    q = (
+        df.set_sorted("DateTime")
+        .with_columns(ts_bucket)
+        .group_by("ts_bucket")
+        .agg(pl.col("value").sum())
+    )
+
+    assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+    assert calls == 1
+
+
 def test_dynamic_groupby_multiple_aggs(df, streaming_engine):
     """Test dynamic groupby with multiple aggregations."""
     q = df.group_by("key").agg(

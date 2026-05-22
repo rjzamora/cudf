@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 
 import polars as pl
 
+import pylibcudf as plc
+
 # Side-effect imports: each module registers ``@lower_ir_node.register(...)``
 # handlers at import time so the dispatch table is populated before any query
 # is lowered.
@@ -33,15 +35,16 @@ from cudf_polars.dsl.ir import (
     Scan,
     Select,
     Slice,
+    Sort,
     Union,
 )
 from cudf_polars.dsl.traversal import CachingVisitor, traversal
 from cudf_polars.dsl.utils.naming import unique_names
-from cudf_polars.streaming.base import PartitionInfo
+from cudf_polars.streaming.base import IOPartitionFlavor, PartitionInfo
 from cudf_polars.streaming.dispatch import lower_ir_node
 from cudf_polars.streaming.io import _clear_source_info_cache
 from cudf_polars.streaming.repartition import Repartition
-from cudf_polars.streaming.sort import HintSorted
+from cudf_polars.streaming.sort import HintSorted, ParquetFooterHint
 from cudf_polars.streaming.utils import (
     _contains_over,
     _dynamic_planning_on,
@@ -54,6 +57,52 @@ if TYPE_CHECKING:
     from cudf_polars.streaming.base import StatsCollector
     from cudf_polars.streaming.dispatch import LowerIRTransformer, State
     from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
+
+
+def _hint_matches_sort_prefix(ir: Sort, sorted_info: tuple) -> bool:
+    if len(sorted_info) > len(ir.by):
+        return False
+    for (name, descending, nulls_last), by, order, null_order in zip(
+        sorted_info, ir.by, ir.order, ir.null_order, strict=False
+    ):
+        by_name = by.name if isinstance(by, NamedExpr) else by
+        if name != by_name:
+            return False
+        if descending != (order == plc.types.Order.DESCENDING):
+            return False
+        expected_null_order = (
+            plc.types.NullOrder.AFTER
+            if nulls_last != descending
+            else plc.types.NullOrder.BEFORE
+        )
+        if null_order != expected_null_order:
+            return False
+    return True
+
+
+def _can_use_parquet_footer_hint(
+    scan: Scan,
+    key_names: list[str],
+    info: PartitionInfo,
+    config_options: ConfigOptions[StreamingExecutor],
+) -> bool:
+    return (
+        len(key_names) == 1
+        and scan.typ == "parquet"
+        and scan.skip_rows == 0
+        and scan.n_rows == -1
+        and scan.row_index is None
+        and scan.include_file_paths is None
+        and info.io_plan is not None
+        and not config_options.parquet_options.use_rapidsmpf_native
+        and info.io_plan.flavor
+        in {
+            IOPartitionFlavor.SINGLE_FILE,
+            IOPartitionFlavor.SPLIT_FILES,
+            IOPartitionFlavor.FUSED_FILES,
+            IOPartitionFlavor.SINGLE_READ,
+        }
+    )
 
 
 @lower_ir_node.register(IR)
@@ -168,6 +217,10 @@ def _(
     if ir.name in ("rename", "explode"):
         return _lower_ir_pwise(ir, rec)
     if ir.name == "hint_sorted" and _dynamic_planning_on(rec.state["config_options"]):
+        if isinstance(ir.children[0], Sort) and _hint_matches_sort_prefix(
+            ir.children[0], ir.options[0]
+        ):
+            return rec(ir.children[0])
         child, partition_info = rec(ir.children[0])
         key_names = [col_name for col_name, *_ in ir.options[0]]
         original = ir.children[0]
@@ -181,35 +234,25 @@ def _(
             and original.typ == "parquet"
             and len(key_names) < len(full_cols)
         ):
-            key_schema = {name: original.schema[name] for name in key_names}
-            key_ir: IR = Scan(
-                key_schema,
-                original.typ,
-                original.reader_options,
-                original.cloud_options,
-                original.paths,
-                key_names,
-                original.skip_rows,
-                original.n_rows,
-                original.row_index,
-                original.include_file_paths,
-                original.predicate,
-                original.parquet_options,
-            )
-        else:
-            key_schema = {name: child.schema[name] for name in key_names}
-            key_ir = Select(
-                key_schema,
-                tuple(
-                    NamedExpr(name, Col(child.schema[name], name)) for name in key_names
-                ),
-                False,  # noqa: FBT003
-                child,
-            )
-
-        key_child, key_partition_info = rec(key_ir)
-        partition_info = reduce(operator.or_, (partition_info, key_partition_info))
-        hint_node = HintSorted(ir.schema, ir.options, child, key_child)
+            data_info = partition_info[child]
+            if _can_use_parquet_footer_hint(
+                original, key_names, data_info, rec.state["config_options"]
+            ):
+                assert data_info.io_plan is not None
+                hint_node = HintSorted(
+                    ir.schema,
+                    ir.options,
+                    ParquetFooterHint(
+                        tuple(original.paths),
+                        key_names[0],
+                        int(data_info.io_plan.flavor),
+                        data_info.io_plan.factor,
+                    ),
+                    child,
+                )
+                partition_info[hint_node] = data_info
+                return hint_node, partition_info
+        hint_node = HintSorted(ir.schema, ir.options, None, child)
         partition_info[hint_node] = partition_info[child]
         return hint_node, partition_info
 

@@ -37,13 +37,21 @@ import rmm.mr
 
 import cudf_polars.dsl.tracing
 from cudf_polars.containers import DataFrame
-from cudf_polars.dsl.expr import Col, NamedExpr
+from cudf_polars.dsl.expr import (
+    BinOp,
+    Cast,
+    Col,
+    Literal as LiteralExpr,
+    NamedExpr,
+    TemporalFunction,
+)
 from cudf_polars.dsl.ir import Cache, Filter, GroupBy, HStack, Join, Projection, Select
 from cudf_polars.dsl.tracing import Scope
 from cudf_polars.dsl.utils.naming import names_to_indices
 from cudf_polars.streaming.actor_graph.collectives.allgather import AllGatherManager
 from cudf_polars.streaming.actor_graph.tracing import ActorTracer
 from cudf_polars.streaming.utils import _concat
+from cudf_polars.utils.cuda_stream import stream_ordered_after
 from cudf_polars.utils.dtypes import make_empty_column
 
 if TYPE_CHECKING:
@@ -227,6 +235,98 @@ def _update_scheme_indices(
     )
 
 
+def _positive_int_literal(value: object) -> int | None:
+    if (
+        isinstance(value, LiteralExpr)
+        and isinstance(value.value, int)
+        and value.value > 0
+    ):
+        return value.value
+    return None
+
+
+def _order_transform_source_name(value: object) -> str | None:
+    if isinstance(value, Col):
+        return value.name
+    if isinstance(value, Cast):
+        return _order_transform_source_name(value.children[0])
+    if (
+        isinstance(value, TemporalFunction)
+        and value.name is TemporalFunction.Name.CastTimeUnit
+    ):
+        return _order_transform_source_name(value.children[0])
+    return None
+
+
+def _bucket_transform_source_name(value: object) -> str | None:
+    if not isinstance(value, BinOp) or value.op != plc.binaryop.BinaryOperator.MUL:
+        return None
+    left, right = value.children
+    divisor = _positive_int_literal(right)
+    floor_div = left
+    if divisor is None:
+        divisor = _positive_int_literal(left)
+        floor_div = right
+    if (
+        divisor is None
+        or not isinstance(floor_div, BinOp)
+        or floor_div.op != plc.binaryop.BinaryOperator.FLOOR_DIV
+    ):
+        return None
+    numerator, denominator = floor_div.children
+    if _positive_int_literal(denominator) != divisor:
+        return None
+    return _order_transform_source_name(numerator)
+
+
+def _transform_order_scheme_select(
+    context: Context,
+    select: Select,
+    scheme: OrderScheme,
+    ir_context: IRExecutionContext,
+) -> OrderScheme | None:
+    if not scheme.keys:
+        return None
+    child_schema = select.children[0].schema
+    source_key = scheme.keys[0]
+    source_name = tuple(child_schema)[source_key.column_index]
+
+    expr_out = next(
+        (
+            ne
+            for ne in select.exprs
+            if _bucket_transform_source_name(ne.value) == source_name
+        ),
+        None,
+    )
+    if expr_out is None:
+        return None
+
+    boundary_chunk = scheme.get_boundaries(context.br()).make_available_and_spill(
+        context.br(), allow_overbooking=True
+    )
+    with stream_ordered_after(
+        ir_context.get_cuda_stream, upstreams=(boundary_chunk.stream,)
+    ) as stream:
+        source_boundaries = DataFrame.from_table(
+            plc.Table([boundary_chunk.table_view().columns()[0]]),
+            [source_name],
+            [child_schema[source_name]],
+            stream,
+        )
+        result = expr_out.evaluate(source_boundaries)
+        boundaries = TableChunk.from_pylibcudf_table(
+            plc.Table([result.obj]), stream, exclusive_view=True, br=context.br()
+        )
+
+    output_key = OrderKey(
+        tuple(select.schema).index(expr_out.name),
+        source_key.order,
+        source_key.null_order,
+    )
+    return OrderScheme([output_key], boundaries, strict_boundaries=False)
+
+
 def _remap_scheme_select(
     select: Select, scheme: PartitioningScheme
 ) -> PartitioningScheme:
@@ -246,6 +346,21 @@ def _remap_scheme_select(
     if scheme not in (None, "inherit"):  # pragma: no cover
         return None  # Guard against future/unsupported scheme types
     return scheme
+
+
+def _remap_scheme_select_runtime(
+    context: Context,
+    select: Select,
+    scheme: PartitioningScheme,
+    ir_context: IRExecutionContext,
+) -> PartitioningScheme:
+    if isinstance(scheme, OrderScheme):
+        transformed = _transform_order_scheme_select(
+            context, select, scheme, ir_context
+        )
+        if transformed is not None:
+            return transformed
+    return _remap_scheme_select(select, scheme)
 
 
 def _remap_scheme_simple(
@@ -269,6 +384,30 @@ def _hstack_to_select(hstack: HStack) -> Select:
         for name, dtype in hstack.schema.items()
     )
     return Select(hstack.schema, exprs, hstack.should_broadcast, hstack.children[0])
+
+
+def maybe_remap_partitioning_runtime(
+    context: Context,
+    ir: IR,
+    ir_context: IRExecutionContext,
+    partitioning: Partitioning | None,
+    *,
+    child_ir: IR | None = None,
+) -> Partitioning | None:
+    if partitioning is None:
+        return None
+    if isinstance(ir, (Select, HStack)):
+        if isinstance(ir, HStack):
+            ir = _hstack_to_select(ir)
+        return Partitioning(
+            inter_rank=_remap_scheme_select_runtime(
+                context, ir, partitioning.inter_rank, ir_context
+            ),
+            local=_remap_scheme_select_runtime(
+                context, ir, partitioning.local, ir_context
+            ),
+        )
+    return maybe_remap_partitioning(ir, partitioning, child_ir=child_ir)
 
 
 def maybe_remap_partitioning(

@@ -235,6 +235,54 @@ async def adjust_orderscheme(
     if comm.nranks > 1 and collective_id is None:
         raise ValueError("collective_id is required when comm.nranks > 1.")
 
+    if comm.nranks == 1:
+        boundary_chunk = output_scheme.get_boundaries(context.br())
+        boundary_table = boundary_chunk.table_view()
+        pieces: list[PackedData] = []
+        next_pid = 0
+
+        async def flush_until(pid: int) -> None:
+            nonlocal next_pid, pieces
+            while next_pid < pid:
+                chunk = (
+                    _materialize_packed_pieces(
+                        pieces, context, context.get_stream_from_pool()
+                    )
+                    if pieces
+                    else None
+                )
+                if chunk is None:
+                    chunk = empty_table_chunk(
+                        ref_ir, context, ir_context.get_cuda_stream()
+                    )
+                await ch_out.send(context, Message(next_pid, chunk))
+                pieces = []
+                next_pid += 1
+
+        while (msg := await ch_in.recv(context)) is not None:
+            chunk = TableChunk.from_message(
+                msg, br=context.br()
+            ).make_available_and_spill(context.br(), allow_overbooking=True)
+            if chunk.table_view().num_rows() == 0:
+                continue
+            with stream_ordered_after(
+                context.get_stream_from_pool,
+                upstreams=(chunk.stream, boundary_chunk.stream),
+            ) as stream:
+                table = chunk.table_view()
+                splits = _split_points(table, boundary_table, output_scheme, stream)
+                for pid, piece in enumerate(
+                    plc.copying.split(table, splits, stream=stream)
+                ):
+                    if piece.num_rows() == 0:
+                        continue
+                    await flush_until(pid)
+                    pieces.append(_pack_table(piece, stream, context.br()))
+
+        await flush_until(npartitions)
+        await ch_out.drain(context)
+        return
+
     # TODO: Narrow the peer list (avoid all-to-all control messages)
     peers = [rank for rank in range(comm.nranks) if rank != comm.rank]
     exchange = (

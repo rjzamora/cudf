@@ -49,9 +49,11 @@ from cudf_polars.streaming.actor_graph.utils import (
     replay_buffered_channel,
     send_metadata,
 )
+from cudf_polars.streaming.base import IOPartitionFlavor
 from cudf_polars.streaming.repartition import Repartition
 from cudf_polars.streaming.sort import (
     HintSorted,
+    ParquetFooterHint,
     _get_final_sort_boundaries,
     _has_simple_zlice,
     _select_local_split_candidates,
@@ -243,6 +245,125 @@ async def extract_orderscheme_partitioning(
     # Extract boundaries and construct the Partitioning
     boundaries, strict = _extract_boundaries(min_max_table, num_partitions, stream)
     del min_max_table
+    return Partitioning(
+        inter_rank=OrderScheme(
+            order_keys,
+            TableChunk.from_pylibcudf_table(
+                boundaries, stream, exclusive_view=True, br=context.br()
+            ),
+            strict_boundaries=strict,
+        ),
+        local="inherit",
+    )
+
+
+def _footer_min_max_rows(hint: ParquetFooterHint) -> list[int] | None:
+    import pyarrow.parquet as pq
+
+    def row_group_ranges(path: str) -> list[tuple[int, int]] | None:
+        parquet_file = pq.ParquetFile(path)
+        try:
+            column_index = parquet_file.schema.names.index(hint.key_name)
+        except ValueError:
+            return None
+
+        ranges: list[tuple[int, int]] = []
+        for row_group_index in range(parquet_file.metadata.num_row_groups):
+            row_group = parquet_file.metadata.row_group(row_group_index)
+            if row_group.num_rows == 0:
+                continue
+            stats = row_group.column(column_index).statistics
+            if (
+                stats is None
+                or not stats.has_min_max
+                or stats.null_count not in (None, 0)
+                or not isinstance(stats.min, int)
+                or not isinstance(stats.max, int)
+            ):
+                return None
+            ranges.append((stats.min, stats.max))
+
+        if any(
+            a_max > b_min
+            for (_, a_max), (b_min, _) in zip(ranges, ranges[1:], strict=False)
+        ):
+            return None
+        return ranges
+
+    def append_partition(values: list[int], ranges: list[tuple[int, int]]) -> bool:
+        if not ranges:
+            return False
+        values.extend((ranges[0][0], ranges[-1][1]))
+        return True
+
+    file_ranges = [row_group_ranges(path) for path in hint.paths]
+    if any(ranges is None for ranges in file_ranges):
+        return None
+    ranges_by_file = [ranges for ranges in file_ranges if ranges is not None]
+
+    values: list[int] = []
+    flavor = IOPartitionFlavor(hint.plan_flavor)
+    if flavor == IOPartitionFlavor.SINGLE_FILE:
+        for ranges in ranges_by_file:
+            append_partition(values, ranges)
+    elif flavor == IOPartitionFlavor.SPLIT_FILES:
+        total_splits = hint.plan_factor
+        for ranges in ranges_by_file:
+            if total_splits > len(ranges):
+                return None
+            row_group_stride = len(ranges) // total_splits
+            for split_index in range(total_splits):
+                start = row_group_stride * split_index
+                stop = (
+                    len(ranges)
+                    if split_index == total_splits - 1
+                    else (start + row_group_stride)
+                )
+                append_partition(values, ranges[start:stop])
+    elif flavor == IOPartitionFlavor.FUSED_FILES:
+        files_per_partition = hint.plan_factor
+        for start in range(0, len(ranges_by_file), files_per_partition):
+            fused = [
+                item
+                for ranges in ranges_by_file[start : start + files_per_partition]
+                for item in ranges
+            ]
+            append_partition(values, fused)
+    elif flavor == IOPartitionFlavor.SINGLE_READ:
+        append_partition(values, [item for ranges in ranges_by_file for item in ranges])
+    else:  # pragma: no cover
+        return None
+
+    return values if len(values) >= 4 else None
+
+
+async def extract_orderscheme_partitioning_from_footer(
+    context: Context,
+    ir_context: IRExecutionContext,
+    hint: ParquetFooterHint,
+    order_keys: Sequence[OrderKey],
+) -> Partitioning | None:
+    if len(order_keys) != 1 or order_keys[0].order != plc.types.Order.ASCENDING:
+        return None
+
+    values = await ir_context.to_thread(_footer_min_max_rows, hint)
+    if values is None:
+        return None
+
+    stream = ir_context.get_cuda_stream()
+    min_max_table = DataFrame.from_polars(
+        pl.DataFrame({hint.key_name: values}), stream
+    ).table
+    num_partitions = min_max_table.num_rows() // 2
+    if not plc.sorting.is_sorted(
+        min_max_table,
+        [key.order for key in order_keys],
+        [key.null_order for key in order_keys],
+        stream=stream,
+    ):
+        return None
+
+    boundaries, strict = _extract_boundaries(min_max_table, num_partitions, stream)
     return Partitioning(
         inter_rank=OrderScheme(
             order_keys,
@@ -743,10 +864,49 @@ async def _drop_empty_chunks(
     ch_in: Channel[TableChunk],
 ) -> None:
     while (msg := await ch_in.recv(context)) is not None:
-        chunk = TableChunk.from_message(msg, br=context.br())
+        chunk = TableChunk.from_message(msg, br=context.br()).make_available_and_spill(
+            context.br(), allow_overbooking=True
+        )
         if chunk.table_view().num_rows() > 0:
             await ch_out.send(context, Message(msg.sequence_number, chunk))
     await ch_out.drain(context)
+
+
+async def _buffer_data_and_send_keys(
+    context: Context,
+    ch_data: Channel[TableChunk],
+    ch_keys: Channel[TableChunk],
+    chunk_store: ChunkStore,
+    order_keys: Sequence[OrderKey],
+) -> None:
+    while (msg := await ch_data.recv(context)) is not None:
+        chunk = TableChunk.from_message(msg, br=context.br()).make_available_and_spill(
+            context.br(), allow_overbooking=True
+        )
+        table = chunk.table_view()
+        if table.num_rows() == 0:
+            continue
+        columns = table.columns()
+        key_table = plc.Table(
+            [
+                columns[key.column_index].copy(chunk.stream, mr=context.br().device_mr)
+                for key in order_keys
+            ]
+        )
+        await ch_keys.send(
+            context,
+            Message(
+                msg.sequence_number,
+                TableChunk.from_pylibcudf_table(
+                    key_table,
+                    chunk.stream,
+                    exclusive_view=True,
+                    br=context.br(),
+                ),
+            ),
+        )
+        chunk_store.insert(Message(msg.sequence_number, chunk))
+    await ch_keys.drain(context)
 
 
 @define_actor()
@@ -757,48 +917,81 @@ async def hint_sorted_actor(
     ir_context: IRExecutionContext,
     ch_out: Channel[TableChunk],
     ch_data: Channel[TableChunk],
-    ch_keys: Channel[TableChunk],
     collective_ids: list[int],
 ) -> None:
     """Attach OrderScheme metadata to data marked by MapFunction(hint_sorted)."""
     ch_nonempty = context.create_channel()
+    ch_keys = context.create_channel()
+    ch_replay = context.create_channel()
     async with shutdown_on_error(
         context,
         ch_out,
         ch_data,
-        ch_keys,
         ch_nonempty,
+        ch_keys,
+        ch_replay,
         trace_ir=ir,
         ir_context=ir_context,
     ) as tracer:
-        data_metadata, _ = await gather_in_task_group(
-            recv_metadata(ch_data, context),
-            recv_metadata(ch_keys, context),
-        )
-        partitioning = await extract_orderscheme_partitioning(
-            context,
-            comm,
-            ir.children[1],
-            ir_context,
-            ch_keys,
-            _hint_sorted_order_keys(ir.schema, ir.sorted_info),
-            collective_ids.pop(),
-        )
+        order_keys = _hint_sorted_order_keys(ir.schema, ir.sorted_info)
+        data_metadata = await recv_metadata(ch_data, context)
+        if ir.footer_hint is not None:
+            partitioning = await extract_orderscheme_partitioning_from_footer(
+                context,
+                ir_context,
+                ir.footer_hint,
+                order_keys,
+            )
+        else:
+            key_schema = {name: ir.schema[name] for name, *_ in ir.sorted_info}
+            chunk_store = ChunkStore(context)
+            _, partitioning = await gather_in_task_group(
+                _buffer_data_and_send_keys(
+                    context, ch_data, ch_keys, chunk_store, order_keys
+                ),
+                extract_orderscheme_partitioning(
+                    context,
+                    comm,
+                    Empty(key_schema),
+                    ir_context,
+                    ch_keys,
+                    order_keys,
+                    collective_ids.pop(),
+                ),
+            )
+        if tracer is not None:
+            tracer.decision = "orderscheme" if partitioning is not None else "fallback"
         metadata_out = ChannelMetadata(
             local_count=data_metadata.local_count,
             partitioning=partitioning or data_metadata.partitioning,
             duplicated=data_metadata.duplicated,
         )
+        hint_ir = MapFunction(
+            ir.children[0].schema,
+            "hint_sorted",
+            ir.options,
+            ir.children[0],
+        )
+        if ir.footer_hint is None:
+            await gather_in_task_group(
+                _forward_from_chunk_store(context, ch_replay, chunk_store),
+                chunkwise_evaluate(
+                    context,
+                    hint_ir,
+                    ir_context,
+                    ch_out,
+                    ch_replay,
+                    metadata_out,
+                    tracer=tracer,
+                ),
+            )
+            return
+
         await gather_in_task_group(
             _drop_empty_chunks(context, ch_nonempty, ch_data),
             chunkwise_evaluate(
                 context,
-                MapFunction(
-                    ir.children[0].schema,
-                    "hint_sorted",
-                    ir.options,
-                    ir.children[0],
-                ),
+                hint_ir,
                 ir_context,
                 ch_out,
                 ch_nonempty,
@@ -881,7 +1074,6 @@ async def sort_actor(
         trace_ir=ir,
         ir_context=ir_context,
     ) as tracer:
-        # TODO: Skip sort if OrderScheme metadata is present and compatible.
         metadata_in = await recv_metadata(ch_in, context)
 
         if ir.zlice is not None:
@@ -904,15 +1096,13 @@ async def sort_actor(
         if _is_already_sorted(metadata_in, _sort_to_order_keys(ir), comm.nranks):
             if tracer is not None:
                 tracer.decision = "already_sorted"
-            await chunkwise_evaluate(
-                context,
-                ir,
-                ir_context,
-                ch_out,
-                ch_in,
-                metadata_in,
-                tracer=tracer,
-            )
+            await send_metadata(ch_out, context, metadata_in)
+            while (msg := await ch_in.recv(context)) is not None:
+                chunk = TableChunk.from_message(msg, br=context.br())
+                if tracer is not None:
+                    tracer.add_chunk(table=chunk.table_view())
+                await ch_out.send(context, Message(msg.sequence_number, chunk))
+            await ch_out.drain(context)
             return
 
         sampled_chunks, num_partitions = await _sample_chunks_for_size_estimate(
@@ -1029,8 +1219,8 @@ def _sort_rapidsmpf_network(ir: Sort, rec: SubNetGenerator) -> tuple[dict, dict]
 def _hint_sorted_rapidsmpf_network(
     ir: HintSorted, rec: SubNetGenerator
 ) -> tuple[dict, dict]:
-    data, keys = ir.children
-    nodes, channels = process_children(ir, rec)
+    data = ir.children[0]
+    nodes, channels = rec(data)
     collective_ids = list(rec.state["collective_id_map"][ir])
     assert len(collective_ids) == 1
     channels[ir] = ChannelManager(rec.state["context"])
@@ -1042,7 +1232,6 @@ def _hint_sorted_rapidsmpf_network(
             rec.state["ir_context"],
             ch_out=channels[ir].reserve_input_slot(),
             ch_data=channels[data].reserve_output_slot(),
-            ch_keys=channels[keys].reserve_output_slot(),
             collective_ids=collective_ids,
         )
     ]

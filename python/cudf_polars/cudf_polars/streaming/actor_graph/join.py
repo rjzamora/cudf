@@ -1371,6 +1371,51 @@ async def join_actor(
             )
             return
 
+        left_scheme = left_partitioning.inter_rank_scheme
+        right_scheme = right_partitioning.inter_rank_scheme
+        if (
+            not left_metadata.duplicated
+            and not right_metadata.duplicated
+            and left_partitioning.is_aligned_with(right_partitioning, context.br())
+            and isinstance(left_scheme, OrderScheme)
+            and isinstance(right_scheme, OrderScheme)
+            and left_partitioning.local_scheme == "inherit"
+            and right_partitioning.local_scheme == "inherit"
+            and _compatible_order_keys(left_scheme, right_scheme)
+        ):
+            if tracer is not None:
+                tracer.decision = "chunkwise"
+            await send_metadata(
+                ch_out,
+                context,
+                ChannelMetadata(
+                    local_count=left_metadata.local_count,
+                    partitioning=Partitioning(
+                        _output_orderscheme(ir, left_scheme, context), "inherit"
+                    ),
+                ),
+            )
+            ch_left_ordered = context.create_channel()
+            ch_right_ordered = context.create_channel()
+            await gather_in_task_group(
+                _send_metadata_and_forward_channel(
+                    context, ch_left_ordered, ch_left, left_metadata
+                ),
+                _send_metadata_and_forward_channel(
+                    context, ch_right_ordered, ch_right, right_metadata
+                ),
+                _join_chunks(
+                    context,
+                    ir,
+                    ir_context,
+                    ch_out,
+                    ch_left_ordered,
+                    ch_right_ordered,
+                    tracer=tracer,
+                ),
+            )
+            return
+
         left_sample, right_sample, strategy = await _choose_strategy(
             context,
             comm,
