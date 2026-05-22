@@ -41,6 +41,7 @@ from cudf_polars.streaming.actor_graph.utils import (
     chunk_to_frame,
     chunkwise_evaluate,
     concat_batch,
+    derive_order_hint_partitioning_runtime,
     empty_table_chunk,
     evaluate_batch,
     evaluate_chunk,
@@ -947,7 +948,17 @@ async def hint_sorted_actor(
     ) as tracer:
         order_keys = _hint_sorted_order_keys(ir.schema, ir.sorted_info)
         data_metadata = await recv_metadata(ch_data, context)
-        if ir.footer_hint is not None:
+        derived_partitioning = derive_order_hint_partitioning_runtime(
+            context,
+            ir.children[0],
+            ir_context,
+            data_metadata.partitioning,
+            order_keys,
+            comm.nranks,
+        )
+        if derived_partitioning is not None:
+            partitioning = derived_partitioning
+        elif ir.footer_hint is not None:
             partitioning = await extract_orderscheme_partitioning_from_footer(
                 context,
                 ir_context,
@@ -972,7 +983,13 @@ async def hint_sorted_actor(
                 ),
             )
         if tracer is not None:
-            tracer.decision = "orderscheme" if partitioning is not None else "fallback"
+            tracer.decision = (
+                "derived_orderscheme"
+                if derived_partitioning is not None
+                else "orderscheme"
+                if partitioning is not None
+                else "fallback"
+            )
         metadata_out = ChannelMetadata(
             local_count=data_metadata.local_count,
             partitioning=partitioning or data_metadata.partitioning,
@@ -984,6 +1001,17 @@ async def hint_sorted_actor(
             ir.options,
             ir.children[0],
         )
+        if derived_partitioning is not None:
+            await chunkwise_evaluate(
+                context,
+                hint_ir,
+                ir_context,
+                ch_out,
+                ch_data,
+                metadata_out,
+                tracer=tracer,
+            )
+            return
         if ir.footer_hint is None:
             await gather_in_task_group(
                 _forward_from_chunk_store(context, ch_replay, chunk_store),

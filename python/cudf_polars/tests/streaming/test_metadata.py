@@ -39,6 +39,7 @@ from cudf_polars.streaming.actor_graph.collectives.sort import (
 from cudf_polars.streaming.actor_graph.core import evaluate_logical_plan
 from cudf_polars.streaming.actor_graph.utils import (
     NormalizedPartitioning,
+    derive_order_hint_partitioning_runtime,
     maybe_remap_partitioning,
     maybe_remap_partitioning_runtime,
 )
@@ -619,7 +620,7 @@ def test_remap_partitioning_order_scheme_drops_key(spmd_engine):
     assert result.inter_rank is None
 
 
-def test_remap_partitioning_order_scheme_bucket_transform(spmd_engine):
+def test_remap_partitioning_order_scheme_hstack_preserves_source_key(spmd_engine):
     context = spmd_engine.context
     engine = pl.GPUEngine(executor="in-memory", raise_on_fail=True)
     child = Translator(
@@ -656,6 +657,60 @@ def test_remap_partitioning_order_scheme_bucket_transform(spmd_engine):
         hstack,
         IRExecutionContext(get_cuda_stream=context.get_stream_from_pool),
         part,
+    )
+
+    assert result is not None
+    scheme = result.inter_rank
+    assert isinstance(scheme, OrderScheme)
+    assert scheme.keys[0].column_index == tuple(hstack.schema).index("DateTime")
+    assert scheme.strict_boundaries
+
+
+def test_order_hint_derives_bucket_transform(spmd_engine):
+    context = spmd_engine.context
+    engine = pl.GPUEngine(executor="in-memory", raise_on_fail=True)
+    child = Translator(
+        pl.LazyFrame({"DateTime": [0], "value": [1]})._ldf.visit(), engine
+    ).translate_ir()
+    dtype = DataType(pl.Int64())
+    divisor = expr.Literal(dtype, 10)
+    ts_bucket = expr.BinOp(
+        dtype,
+        plc.binaryop.BinaryOperator.MUL,
+        expr.BinOp(
+            dtype,
+            plc.binaryop.BinaryOperator.FLOOR_DIV,
+            expr.Cast(dtype, strict=True, value=expr.Col(dtype, "DateTime")),
+            divisor,
+        ),
+        divisor,
+    )
+    hstack = HStack(
+        {**child.schema, "ts_bucket": dtype},
+        (expr.NamedExpr("ts_bucket", ts_bucket),),
+        should_broadcast=True,
+        df=child,
+    )
+    part = Partitioning(
+        inter_rank=_make_order_scheme(
+            context, key_indices=(0,), values=(2, 10, 12), strict=True
+        ),
+        local="inherit",
+    )
+
+    result = derive_order_hint_partitioning_runtime(
+        context,
+        hstack,
+        IRExecutionContext(get_cuda_stream=context.get_stream_from_pool),
+        part,
+        [
+            OrderKey(
+                tuple(hstack.schema).index("ts_bucket"),
+                plc.types.Order.ASCENDING,
+                plc.types.NullOrder.BEFORE,
+            )
+        ],
+        nranks=1,
     )
 
     assert result is not None

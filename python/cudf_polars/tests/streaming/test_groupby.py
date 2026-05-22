@@ -104,6 +104,7 @@ def test_hint_sorted_groupby_uses_ordered_adjustment(spmd_engine_factory, monkey
 def test_datetime_hint_bucket_groupby_uses_ordered_adjustment(
     spmd_engine_factory, monkeypatch
 ):
+    import cudf_polars.streaming.actor_graph.collectives.sort as sort_module
     import cudf_polars.streaming.actor_graph.groupby as groupby_module
 
     engine = spmd_engine_factory(
@@ -114,15 +115,27 @@ def test_datetime_hint_bucket_groupby_uses_ordered_adjustment(
         )
     )
     calls = 0
+    boundary_calls = 0
     original = groupby_module.adjust_orderscheme
+    original_extract = sort_module.extract_orderscheme_partitioning
 
     async def wrapped_adjust_orderscheme(*args, **kwargs):
         nonlocal calls
         calls += 1
         return await original(*args, **kwargs)
 
+    async def wrapped_extract_orderscheme_partitioning(*args, **kwargs):
+        nonlocal boundary_calls
+        boundary_calls += 1
+        return await original_extract(*args, **kwargs)
+
     monkeypatch.setattr(
         groupby_module, "adjust_orderscheme", wrapped_adjust_orderscheme
+    )
+    monkeypatch.setattr(
+        sort_module,
+        "extract_orderscheme_partitioning",
+        wrapped_extract_orderscheme_partitioning,
     )
     df = pl.LazyFrame(
         {
@@ -134,12 +147,14 @@ def test_datetime_hint_bucket_groupby_uses_ordered_adjustment(
     q = (
         df.set_sorted("DateTime")
         .with_columns(ts_bucket)
+        .set_sorted("ts_bucket")
         .group_by("ts_bucket")
         .agg(pl.col("value").sum())
     )
 
     assert_gpu_result_equal(q, engine=engine, check_row_order=False)
     assert calls == 1
+    assert boundary_calls == 1
 
 
 def test_dynamic_groupby_multiple_aggs(df, streaming_engine):

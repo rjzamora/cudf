@@ -279,54 +279,6 @@ def _bucket_transform_source_name(value: object) -> str | None:
     return _order_transform_source_name(numerator)
 
 
-def _transform_order_scheme_select(
-    context: Context,
-    select: Select,
-    scheme: OrderScheme,
-    ir_context: IRExecutionContext,
-) -> OrderScheme | None:
-    if not scheme.keys:
-        return None
-    child_schema = select.children[0].schema
-    source_key = scheme.keys[0]
-    source_name = tuple(child_schema)[source_key.column_index]
-
-    expr_out = next(
-        (
-            ne
-            for ne in select.exprs
-            if _bucket_transform_source_name(ne.value) == source_name
-        ),
-        None,
-    )
-    if expr_out is None:
-        return None
-
-    boundary_chunk = scheme.get_boundaries(context.br()).make_available_and_spill(
-        context.br(), allow_overbooking=True
-    )
-    with stream_ordered_after(
-        ir_context.get_cuda_stream, upstreams=(boundary_chunk.stream,)
-    ) as stream:
-        source_boundaries = DataFrame.from_table(
-            plc.Table([boundary_chunk.table_view().columns()[0]]),
-            [source_name],
-            [child_schema[source_name]],
-            stream,
-        )
-        result = expr_out.evaluate(source_boundaries)
-        boundaries = TableChunk.from_pylibcudf_table(
-            plc.Table([result.obj]), stream, exclusive_view=True, br=context.br()
-        )
-
-    output_key = OrderKey(
-        tuple(select.schema).index(expr_out.name),
-        source_key.order,
-        source_key.null_order,
-    )
-    return OrderScheme([output_key], boundaries, strict_boundaries=False)
-
-
 def _remap_scheme_select(
     select: Select, scheme: PartitioningScheme
 ) -> PartitioningScheme:
@@ -348,19 +300,87 @@ def _remap_scheme_select(
     return scheme
 
 
-def _remap_scheme_select_runtime(
+def _derive_order_hint_scheme_runtime(
     context: Context,
-    select: Select,
-    scheme: PartitioningScheme,
+    ir: IR,
     ir_context: IRExecutionContext,
-) -> PartitioningScheme:
-    if isinstance(scheme, OrderScheme):
-        transformed = _transform_order_scheme_select(
-            context, select, scheme, ir_context
+    scheme: PartitioningScheme,
+    order_keys: Sequence[OrderKey],
+) -> OrderScheme | None:
+    if not isinstance(scheme, OrderScheme) or len(scheme.keys) != 1:
+        return None
+    if len(order_keys) != 1:
+        return None
+    target_key = order_keys[0]
+    source_key = scheme.keys[0]
+    if (
+        source_key.order != target_key.order
+        or source_key.null_order != target_key.null_order
+    ):
+        return None
+
+    select = _hstack_to_select(ir) if isinstance(ir, HStack) else ir
+    if not isinstance(select, Select):
+        return None
+
+    output_names = tuple(ir.schema)
+    target_name = output_names[target_key.column_index]
+    source_name = output_names[source_key.column_index]
+    expr_out = next((ne for ne in select.exprs if ne.name == target_name), None)
+    if expr_out is None or _bucket_transform_source_name(expr_out.value) != source_name:
+        return None
+
+    boundary_chunk = scheme.get_boundaries(context.br()).make_available_and_spill(
+        context.br(), allow_overbooking=True
+    )
+    with stream_ordered_after(
+        ir_context.get_cuda_stream, upstreams=(boundary_chunk.stream,)
+    ) as stream:
+        source_boundaries = DataFrame.from_table(
+            plc.Table([boundary_chunk.table_view().columns()[0]]),
+            [source_name],
+            [ir.schema[source_name]],
+            stream,
         )
-        if transformed is not None:
-            return transformed
-    return _remap_scheme_select(select, scheme)
+        result = expr_out.evaluate(source_boundaries)
+        boundaries = TableChunk.from_pylibcudf_table(
+            plc.Table([result.obj]), stream, exclusive_view=True, br=context.br()
+        )
+
+    return OrderScheme([target_key], boundaries, strict_boundaries=False)
+
+
+def derive_order_hint_partitioning_runtime(
+    context: Context,
+    ir: IR,
+    ir_context: IRExecutionContext,
+    partitioning: Partitioning | None,
+    order_keys: Sequence[OrderKey],
+    nranks: int,
+) -> Partitioning | None:
+    """Derive OrderScheme metadata for an explicit ``set_sorted`` hint."""
+    if partitioning is None:
+        return None
+
+    existing = NormalizedPartitioning.from_keys(
+        partitioning, nranks, keys=order_keys, allow_subset=False
+    )
+    if existing and isinstance(existing.inter_rank_scheme, OrderScheme):
+        return Partitioning(existing.inter_rank_scheme, existing.local_scheme)
+
+    inter_rank = _derive_order_hint_scheme_runtime(
+        context, ir, ir_context, partitioning.inter_rank, order_keys
+    )
+    if inter_rank is None:
+        return None
+
+    if partitioning.local == "inherit":
+        local: PartitioningScheme = "inherit"
+    else:
+        local = _derive_order_hint_scheme_runtime(
+            context, ir, ir_context, partitioning.local, order_keys
+        )
+    return Partitioning(inter_rank, local)
 
 
 def _remap_scheme_simple(
@@ -394,18 +414,16 @@ def maybe_remap_partitioning_runtime(
     *,
     child_ir: IR | None = None,
 ) -> Partitioning | None:
+    """Remap partitioning from runtime channel metadata."""
+    del context, ir_context
     if partitioning is None:
         return None
     if isinstance(ir, (Select, HStack)):
         if isinstance(ir, HStack):
             ir = _hstack_to_select(ir)
         return Partitioning(
-            inter_rank=_remap_scheme_select_runtime(
-                context, ir, partitioning.inter_rank, ir_context
-            ),
-            local=_remap_scheme_select_runtime(
-                context, ir, partitioning.local, ir_context
-            ),
+            inter_rank=_remap_scheme_select(ir, partitioning.inter_rank),
+            local=_remap_scheme_select(ir, partitioning.local),
         )
     return maybe_remap_partitioning(ir, partitioning, child_ir=child_ir)
 
