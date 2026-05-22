@@ -32,6 +32,7 @@ from cudf_polars.dsl.ir import (
 )
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.streaming.actor_graph.collectives.sort import (
+    _has_strict_order_prefix,
     _is_already_sorted,
     _sort_to_order_keys,
 )
@@ -714,7 +715,7 @@ def test_sort_output_metadata(spmd_engine_factory, by, descending, nulls_last) -
 @pytest.mark.parametrize(
     "scheme_key_count,strict,expected",
     [
-        (1, True, True),  # prefix match + strict → skip
+        (1, True, False),  # prefix match does not order suffix keys
         (1, False, False),  # prefix match + non-strict → no skip
         (2, True, True),  # exact match + strict → skip
         (2, False, True),  # exact match + non-strict → skip (strict irrelevant)
@@ -757,3 +758,53 @@ def test_is_already_sorted(spmd_engine, scheme_key_count, strict, expected) -> N
 
     order_keys = _sort_to_order_keys(sort_xy)
     assert _is_already_sorted(meta, order_keys, nranks=1) is expected
+
+
+@pytest.mark.parametrize(
+    "scheme_key_count,strict,expected",
+    [
+        (1, True, True),
+        (1, False, False),
+        (2, True, False),
+        (2, False, False),
+    ],
+)
+def test_has_strict_order_prefix(
+    spmd_engine, scheme_key_count, strict, expected
+) -> None:
+    df_lf = pl.LazyFrame({"x": list(range(5)), "y": list(range(5))})
+    base_ir = Translator(df_lf._ldf.visit(), spmd_engine).translate_ir()
+    asc, before = plc.types.Order.ASCENDING, plc.types.NullOrder.BEFORE
+
+    sort_xy = Sort(
+        base_ir.schema,
+        (
+            expr.NamedExpr("x", expr.Col(base_ir.schema["x"], "x")),
+            expr.NamedExpr("y", expr.Col(base_ir.schema["y"], "y")),
+        ),
+        (asc, asc),
+        (before, before),
+        stable=False,
+        zlice=None,
+        df=base_ir,
+    )
+
+    ctx = spmd_engine.context
+    stream = ctx.get_stream_from_pool()
+    keys = [OrderKey(i, asc, before) for i in range(scheme_key_count)]
+    boundary_chunk = TableChunk.from_pylibcudf_table(
+        DataFrame.from_polars(
+            pl.DataFrame({f"k{i}": [100, 200] for i in range(scheme_key_count)}),
+            stream,
+        ).table,
+        stream,
+        exclusive_view=False,
+        br=ctx.br(),
+    )
+    scheme = OrderScheme(keys, boundary_chunk, strict_boundaries=strict)
+    meta = ChannelMetadata(
+        3, partitioning=Partitioning(inter_rank=scheme, local="inherit")
+    )
+
+    order_keys = _sort_to_order_keys(sort_xy)
+    assert _has_strict_order_prefix(meta, order_keys, nranks=1) is expected

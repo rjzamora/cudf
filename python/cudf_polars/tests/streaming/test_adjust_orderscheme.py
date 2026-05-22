@@ -72,6 +72,29 @@ def _make_scheme(
     )
 
 
+def _make_single_key_scheme(
+    context,
+    boundaries: list[int],
+    *,
+    strict: bool = True,
+    stream,
+) -> OrderScheme:
+    boundary_df = DataFrame.from_polars(
+        pl.DataFrame({"key": pl.Series(boundaries, dtype=pl.Int32())}),
+        stream,
+    )
+    return OrderScheme(
+        [OrderKey(0, plc.types.Order.ASCENDING, plc.types.NullOrder.BEFORE)],
+        TableChunk.from_pylibcudf_table(
+            boundary_df.table,
+            stream,
+            exclusive_view=False,
+            br=context.br(),
+        ),
+        strict_boundaries=strict,
+    )
+
+
 def _ref_ir() -> Empty:
     return Empty(_SCHEMA)
 
@@ -276,6 +299,40 @@ def test_adjust_orderscheme_sparse_boundary_shift(
     result = pl.concat(output.values())
     assert result["key"].to_list() == expected[comm.rank]
     assert result["val"].to_list() == expected[comm.rank]
+
+
+@pytest.mark.spmd
+def test_adjust_orderscheme_emits_empty_owned_partitions(spmd_engine) -> None:
+    context = spmd_engine.context
+    comm = spmd_engine.comm
+    if comm.nranks != 2:
+        pytest.skip("This test expects exactly two ranks.")
+
+    keys = [0, 1, 2] if comm.rank == 0 else [5, 8]
+    stream = context.get_stream_from_pool()
+    input_scheme = _make_scheme(context, 5, stream=stream)
+    output_scheme = _make_single_key_scheme(context, [3, 5, 7], stream=stream)
+
+    with reserve_op_id() as op_id:
+        output = asyncio.run(
+            _adjust_and_collect(
+                context,
+                comm,
+                _frame(keys),
+                input_scheme,
+                output_scheme,
+                collective_id=op_id,
+            )
+        )
+
+    expected = {
+        0: {0: [0, 1, 2], 1: []},
+        1: {2: [5], 3: [8]},
+    }[comm.rank]
+    assert set(output) == set(expected)
+    for pid, keys in expected.items():
+        assert output[pid]["key"].to_list() == keys
+        assert output[pid]["val"].to_list() == keys
 
 
 @pytest.mark.spmd

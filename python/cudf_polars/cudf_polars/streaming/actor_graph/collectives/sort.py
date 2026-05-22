@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from itertools import pairwise
 from typing import TYPE_CHECKING
 
 from rapidsmpf.shuffler import PartitionAssignment
@@ -53,7 +54,6 @@ from cudf_polars.streaming.base import IOPartitionFlavor
 from cudf_polars.streaming.repartition import Repartition
 from cudf_polars.streaming.sort import (
     HintSorted,
-    ParquetFooterHint,
     _get_final_sort_boundaries,
     _has_simple_zlice,
     _select_local_split_candidates,
@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     from cudf_polars.dsl.ir import IR, IRExecutionContext
     from cudf_polars.streaming.actor_graph.dispatch import SubNetGenerator
     from cudf_polars.streaming.actor_graph.tracing import ActorTracer
+    from cudf_polars.streaming.sort import ParquetFooterHint
     from cudf_polars.typing import Schema
     from cudf_polars.utils.config import StreamingExecutor
 
@@ -283,10 +284,7 @@ def _footer_min_max_rows(hint: ParquetFooterHint) -> list[int] | None:
                 return None
             ranges.append((stats.min, stats.max))
 
-        if any(
-            a_max > b_min
-            for (_, a_max), (b_min, _) in zip(ranges, ranges[1:], strict=False)
-        ):
+        if any(a_max > b_min for (_, a_max), (b_min, _) in pairwise(ranges)):
             return None
         return ranges
 
@@ -343,6 +341,7 @@ async def extract_orderscheme_partitioning_from_footer(
     hint: ParquetFooterHint,
     order_keys: Sequence[OrderKey],
 ) -> Partitioning | None:
+    """Build OrderScheme partitioning from Parquet row-group statistics."""
     if len(order_keys) != 1 or order_keys[0].order != plc.types.Order.ASCENDING:
         return None
 
@@ -797,13 +796,26 @@ def _is_already_sorted(
         # and null_order attributes must also match.
         return False
     scheme = np.inter_rank_scheme
-    if not isinstance(scheme, OrderScheme):
+    return isinstance(scheme, OrderScheme) and len(scheme.keys) >= len(order_keys)
+
+
+def _has_strict_order_prefix(
+    metadata_in: ChannelMetadata,
+    order_keys: list[OrderKey],
+    nranks: int,
+) -> bool:
+    """Check if input is strictly partitioned on a prefix of the sort keys."""
+    np = NormalizedPartitioning.from_keys(
+        metadata_in.partitioning, nranks, keys=order_keys
+    )
+    if not np:
         return False
-    elif len(scheme.keys) < len(order_keys):
-        # If we are only sorted on a subset of the keys,
-        # we need to check if the boundaries are strict.
-        return scheme.strict_boundaries
-    return True
+    scheme = np.inter_rank_scheme
+    return (
+        isinstance(scheme, OrderScheme)
+        and 0 < len(scheme.keys) < len(order_keys)
+        and np.is_strictly_partitioned()
+    )
 
 
 def _build_order_scheme(
@@ -1049,6 +1061,30 @@ async def _global_sort(
     )
 
 
+async def _sort_within_existing_partitions(
+    context: Context,
+    ir: Sort,
+    ir_context: IRExecutionContext,
+    ch_out: Channel[TableChunk],
+    ch_in: Channel[TableChunk],
+    metadata_in: ChannelMetadata,
+    *,
+    tracer: ActorTracer | None,
+) -> None:
+    await send_metadata(ch_out, context, metadata_in)
+    while (msg := await ch_in.recv(context)) is not None:
+        chunk = await evaluate_chunk(
+            context,
+            TableChunk.from_message(msg, br=context.br()),
+            ir,
+            ir_context=ir_context,
+        )
+        if tracer is not None:
+            tracer.add_chunk(table=chunk.table_view())
+        await ch_out.send(context, Message(msg.sequence_number, chunk))
+    await ch_out.drain(context)
+
+
 @define_actor()
 async def sort_actor(
     context: Context,
@@ -1100,9 +1136,23 @@ async def sort_actor(
             while (msg := await ch_in.recv(context)) is not None:
                 chunk = TableChunk.from_message(msg, br=context.br())
                 if tracer is not None:
-                    tracer.add_chunk(table=chunk.table_view())
+                    tracer.add_chunk()
                 await ch_out.send(context, Message(msg.sequence_number, chunk))
             await ch_out.drain(context)
+            return
+
+        if _has_strict_order_prefix(metadata_in, _sort_to_order_keys(ir), comm.nranks):
+            if tracer is not None:
+                tracer.decision = "strict_prefix_local_sort"
+            await _sort_within_existing_partitions(
+                context,
+                ir,
+                ir_context,
+                ch_out,
+                ch_in,
+                metadata_in,
+                tracer=tracer,
+            )
             return
 
         sampled_chunks, num_partitions = await _sample_chunks_for_size_estimate(
