@@ -33,6 +33,7 @@ from cudf_polars.streaming.actor_graph.nodes import (
     default_node_single,
     shutdown_on_error,
 )
+from cudf_polars.streaming.actor_graph.tracing import send_chunk
 from cudf_polars.streaming.actor_graph.utils import (
     ChannelManager,
     ChunkStore,
@@ -435,9 +436,7 @@ async def _simple_top_or_bottom_k(
             ir_context=ir_context,
         )
 
-    if tracer is not None:
-        tracer.add_chunk(table=chunk.table_view())
-    await ch_out.send(context, Message(comm.rank, chunk))
+    await send_chunk(context, ch_out, chunk, comm.rank, tracer=tracer)
 
     await ch_out.drain(context)
 
@@ -753,17 +752,10 @@ async def _extract_partitions_and_send(
             ).table
             if table.num_columns() > ncols_out:
                 table = plc.Table(table.columns()[:ncols_out])
-            if tracer is not None:
-                tracer.add_chunk(table=table)
-            await ch_out.send(
-                context,
-                Message(
-                    partition_id,
-                    TableChunk.from_pylibcudf_table(
-                        table, stream, exclusive_view=True, br=context.br()
-                    ),
-                ),
+            chunk = TableChunk.from_pylibcudf_table(
+                table, stream, exclusive_view=True, br=context.br()
             )
+            await send_chunk(context, ch_out, chunk, partition_id, tracer=tracer)
 
     await ch_out.drain(context)
 
@@ -1107,9 +1099,7 @@ async def _sort_within_existing_partitions(
             ir,
             ir_context=ir_context,
         )
-        if tracer is not None:
-            tracer.add_chunk(table=chunk.table_view())
-        await ch_out.send(context, Message(msg.sequence_number, chunk))
+        await send_chunk(context, ch_out, chunk, msg.sequence_number, tracer=tracer)
     await ch_out.drain(context)
 
 
@@ -1163,9 +1153,9 @@ async def sort_actor(
             await send_metadata(ch_out, context, metadata_in)
             while (msg := await ch_in.recv(context)) is not None:
                 chunk = TableChunk.from_message(msg, br=context.br())
-                if tracer is not None:
-                    tracer.add_chunk()
-                await ch_out.send(context, Message(msg.sequence_number, chunk))
+                await send_chunk(
+                    context, ch_out, chunk, msg.sequence_number, tracer=tracer
+                )
             await ch_out.drain(context)
             return
 
