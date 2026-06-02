@@ -24,6 +24,7 @@ from cudf_polars.dsl.ir import Empty, IRExecutionContext
 from cudf_polars.streaming.actor_graph.collectives.common import reserve_op_id
 from cudf_polars.streaming.actor_graph.collectives.orderscheme import (
     adjust_orderscheme,
+    interpolate_orderscheme,
 )
 from cudf_polars.streaming.actor_graph.utils import gather_in_task_group
 
@@ -179,6 +180,20 @@ def _assert_partition_output(
         assert output[pid]["val"].to_list() == [_payload_value(key) for key in keys]
 
 
+def _scheme_boundaries(context: Context, scheme: OrderScheme) -> list[int]:
+    chunk = scheme.get_boundaries(context.br())
+    return (
+        DataFrame.from_table(
+            chunk.table_view(),
+            ["key"],
+            [DataType(pl.Int32())],
+            chunk.stream,
+        )
+        .to_polars()["key"]
+        .to_list()
+    )
+
+
 async def _adjust_direct(
     context: Context,
     comm: Communicator,
@@ -254,6 +269,21 @@ def test_adjust_orderscheme_requires_collective_id(
 
     with pytest.raises(ValueError, match="collective_id"):
         asyncio.run(_adjust_direct(context, comm, input_scheme, output_scheme))
+
+
+@pytest.mark.spmd
+def test_interpolate_orderscheme_refines_boundaries(
+    spmd_engine: SPMDEngine,
+) -> None:
+    context = spmd_engine.context
+    stream = context.get_stream_from_pool()
+    scheme = _make_scheme(context, [10, 20, 30], stream=stream)
+
+    refined = interpolate_orderscheme(context, scheme, target_npartitions=8)
+
+    assert refined is not None
+    assert refined.strict_boundaries
+    assert _scheme_boundaries(context, refined) == [5, 10, 15, 20, 25, 30, 35]
 
 
 @pytest.mark.spmd

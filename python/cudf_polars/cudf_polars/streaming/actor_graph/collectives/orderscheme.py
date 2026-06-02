@@ -5,7 +5,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import TYPE_CHECKING
+from itertools import pairwise
+from math import ceil, floor
+from statistics import fmean, median
+from typing import TYPE_CHECKING, Literal
 
 from rapidsmpf.integrations.cudf.partition import unpack_and_concat
 from rapidsmpf.memory.packed_data import PackedData
@@ -40,6 +43,32 @@ if TYPE_CHECKING:
 
 _PID_DTYPE = DataType(pl.Int32())
 _PID_PLC_DTYPE = plc.DataType(plc.TypeId.INT32)
+_BOUNDARY_DTYPES = {
+    plc.TypeId.INT8: pl.Int8(),
+    plc.TypeId.INT16: pl.Int16(),
+    plc.TypeId.INT32: pl.Int32(),
+    plc.TypeId.INT64: pl.Int64(),
+    plc.TypeId.UINT8: pl.UInt8(),
+    plc.TypeId.UINT16: pl.UInt16(),
+    plc.TypeId.UINT32: pl.UInt32(),
+    plc.TypeId.UINT64: pl.UInt64(),
+    plc.TypeId.FLOAT32: pl.Float32(),
+    plc.TypeId.FLOAT64: pl.Float64(),
+    plc.TypeId.TIMESTAMP_DAYS: pl.Date(),
+    plc.TypeId.TIMESTAMP_MILLISECONDS: pl.Datetime("ms"),
+    plc.TypeId.TIMESTAMP_MICROSECONDS: pl.Datetime("us"),
+    plc.TypeId.TIMESTAMP_NANOSECONDS: pl.Datetime("ns"),
+    plc.TypeId.DURATION_MILLISECONDS: pl.Duration("ms"),
+    plc.TypeId.DURATION_MICROSECONDS: pl.Duration("us"),
+    plc.TypeId.DURATION_NANOSECONDS: pl.Duration("ns"),
+}
+_UNSIGNED_BOUNDARY_IDS = {
+    plc.TypeId.UINT8,
+    plc.TypeId.UINT16,
+    plc.TypeId.UINT32,
+    plc.TypeId.UINT64,
+}
+_FLOAT_BOUNDARY_IDS = {plc.TypeId.FLOAT32, plc.TypeId.FLOAT64}
 
 
 def _contiguous_owner(pid: int, nranks: int, npartitions: int) -> int:
@@ -99,6 +128,129 @@ def make_strict_orderscheme(scheme: OrderScheme, context: Context) -> OrderSchem
         scheme.get_boundaries(context.br()),
         strict_boundaries=True,
     )
+
+
+def _numeric_boundary_series(
+    boundaries: pl.Series,
+    dtype: pl.DataType,
+) -> pl.Series:
+    if isinstance(dtype, pl.Date):
+        return boundaries.cast(pl.Int32())
+    if isinstance(dtype, pl.Datetime | pl.Duration):
+        return boundaries.cast(pl.Int64())
+    return boundaries
+
+
+def _boundary_series(
+    values: list[float | int],
+    dtype: pl.DataType,
+    dtype_id: plc.TypeId,
+) -> pl.Series:
+    if dtype_id in _FLOAT_BOUNDARY_IDS:
+        return pl.Series("boundary", values, dtype=dtype)
+    int_values = [floor(value) for value in values]
+    if isinstance(dtype, pl.Date):
+        return pl.Series("boundary", int_values, dtype=pl.Int32()).cast(dtype)
+    if isinstance(dtype, pl.Datetime | pl.Duration):
+        return pl.Series("boundary", int_values, dtype=pl.Int64()).cast(dtype)
+    return pl.Series("boundary", int_values, dtype=dtype)
+
+
+def _interpolate_boundary_values(
+    values: list[float | int],
+    dtype_id: plc.TypeId,
+    target_npartitions: int,
+    method: Literal["median", "mean"],
+) -> list[float | int] | None:
+    diffs = [stop - start for start, stop in pairwise(values) if stop > start]
+    if not diffs:
+        return None
+
+    gap = median(diffs) if method == "median" else fmean(diffs)
+    start = values[0] - gap
+    stop = values[-1] + gap
+    if stop <= start:
+        return None
+
+    subdivisions = max(2, ceil(target_npartitions / (len(values) + 1)))
+    edges = [start, *values, stop]
+    raw_boundaries = [
+        start + (stop - start) * index / subdivisions
+        for partition, (start, stop) in enumerate(pairwise(edges))
+        for index in range(1, subdivisions + 1)
+        if partition < len(values) or index < subdivisions
+    ]
+    if dtype_id in _FLOAT_BOUNDARY_IDS:
+        boundaries = raw_boundaries
+    else:
+        boundaries = [floor(value) for value in raw_boundaries]
+        if dtype_id in _UNSIGNED_BOUNDARY_IDS and boundaries[0] < 0:
+            return None
+
+    unique_boundaries: list[float | int] = []
+    for value in boundaries:
+        if not unique_boundaries or value > unique_boundaries[-1]:
+            unique_boundaries.append(value)
+    return unique_boundaries
+
+
+def interpolate_orderscheme(
+    context: Context,
+    scheme: OrderScheme,
+    target_npartitions: int,
+    *,
+    method: Literal["median", "mean"] = "median",
+) -> OrderScheme | None:
+    """Return a refined single-key numeric OrderScheme using interpolated boundaries."""
+    if target_npartitions <= scheme.num_boundaries + 1:
+        return scheme
+    if len(scheme.keys) != 1 or scheme.keys[0].order != plc.types.Order.ASCENDING:
+        return None
+    if method not in {"median", "mean"}:
+        raise ValueError("method must be 'median' or 'mean'.")
+
+    boundary_chunk = scheme.get_boundaries(context.br())
+    boundary_table = boundary_chunk.table_view()
+    if boundary_table.num_rows() < 2:
+        return None
+    dtype_id = boundary_table.columns()[0].type().id()
+    dtype = _BOUNDARY_DTYPES.get(dtype_id)
+    if dtype is None:
+        return None
+
+    with stream_ordered_after(
+        context.get_stream_from_pool, upstreams=(boundary_chunk.stream,)
+    ) as stream:
+        boundary_series = (
+            DataFrame.from_table(
+                boundary_table,
+                ["boundary"],
+                [DataType(dtype)],
+                stream,
+            )
+            .to_polars()["boundary"]
+            .rechunk()
+        )
+        numeric_values = _numeric_boundary_series(boundary_series, dtype).to_list()
+        new_values = _interpolate_boundary_values(
+            numeric_values, dtype_id, target_npartitions, method
+        )
+        if new_values is None or len(new_values) <= scheme.num_boundaries:
+            return None
+        boundaries = DataFrame.from_polars(
+            pl.DataFrame({"boundary": _boundary_series(new_values, dtype, dtype_id)}),
+            stream,
+        )
+        return OrderScheme(
+            scheme.keys,
+            TableChunk.from_pylibcudf_table(
+                boundaries.table,
+                stream,
+                exclusive_view=True,
+                br=context.br(),
+            ),
+            strict_boundaries=True,
+        )
 
 
 def _validate_schemes(input_scheme: OrderScheme, output_scheme: OrderScheme) -> None:

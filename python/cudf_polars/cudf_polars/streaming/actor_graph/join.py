@@ -35,6 +35,7 @@ from cudf_polars.dsl.utils.naming import names_to_indices
 from cudf_polars.streaming.actor_graph.collectives.allgather import AllGatherManager
 from cudf_polars.streaming.actor_graph.collectives.orderscheme import (
     adjust_orderscheme,
+    interpolate_orderscheme,
     make_strict_orderscheme,
     orderscheme_local_count,
 )
@@ -468,6 +469,7 @@ def _ordered_join_adjustment(
     right_metadata: ChannelMetadata,
     left_partitioning: NormalizedPartitioning,
     right_partitioning: NormalizedPartitioning,
+    target_npartitions: int | None = None,
 ) -> OrderedJoinAdjustment | None:
     if left_metadata.duplicated or right_metadata.duplicated:
         return None
@@ -489,6 +491,8 @@ def _ordered_join_adjustment(
         key=lambda scheme: (scheme.num_boundaries, scheme.strict_boundaries),
     )
     target = make_strict_orderscheme(target_source, context)
+    if target_npartitions is not None:
+        target = interpolate_orderscheme(context, target, target_npartitions) or target
     left_output = _retarget_orderscheme(left_scheme, target, context)
     right_output = _retarget_orderscheme(right_scheme, target, context)
     output_scheme = _output_orderscheme(ir, target, context)
@@ -522,6 +526,22 @@ async def _send_metadata_and_forward_channel(
     while (msg := await ch_in.recv(context)) is not None:
         await ch_out.send(context, msg)
     await ch_out.drain(context)
+
+
+async def _replay_data_channel(
+    context: Context,
+    ch_out: Channel[TableChunk],
+    ch_in: Channel[TableChunk],
+    buffered_chunks: dict[int, TableChunk],
+    *,
+    trace_ir: IR,
+) -> None:
+    async with shutdown_on_error(context, ch_out, ch_in, trace_ir=trace_ir):
+        for seq_num, chunk in buffered_chunks.items():
+            await ch_out.send(context, Message(seq_num, chunk))
+        while (msg := await ch_in.recv(context)) is not None:
+            await ch_out.send(context, msg)
+        await ch_out.drain(context)
 
 
 async def _adjust_ordered_join_side(
@@ -1024,6 +1044,67 @@ async def _aggregate_estimates(
     return new_left_sample, new_right_sample
 
 
+async def _sample_join_inputs(
+    context: Context,
+    comm: Communicator,
+    ch_left: Channel[TableChunk],
+    ch_right: Channel[TableChunk],
+    left_metadata: ChannelMetadata,
+    right_metadata: ChannelMetadata,
+    executor: StreamingExecutor,
+    collective_ids: list[int],
+) -> tuple[TableSizeStats, TableSizeStats]:
+    """Sample both join inputs and aggregate estimates across ranks."""
+    assert executor.dynamic_planning is not None
+    sample_chunk_count = executor.dynamic_planning.sample_chunk_count
+    target_partition_size = executor.target_partition_size
+    left_sample, right_sample = await gather_in_task_group(
+        _sample_chunks(
+            context,
+            ch_left,
+            sample_chunk_count,
+            target_partition_size,
+            left_metadata.local_count,
+        ),
+        _sample_chunks(
+            context,
+            ch_right,
+            sample_chunk_count,
+            target_partition_size,
+            right_metadata.local_count,
+        ),
+    )
+    return await _aggregate_estimates(
+        context,
+        comm,
+        left_sample,
+        right_sample,
+        collective_ids,
+    )
+
+
+def _estimated_output_partitions(
+    left_sample: TableSizeStats,
+    right_sample: TableSizeStats,
+    target_partition_size: int,
+) -> int:
+    """Estimate the output partition count needed to stay near target size."""
+    estimated_output_size = max(left_sample.total_size, right_sample.total_size)
+    ideal_output_count = max(1, estimated_output_size // target_partition_size)
+    max_output_chunks = 10 * max(left_sample.total_chunks, right_sample.total_chunks)
+    min_output_partitions = min(ideal_output_count, max_output_chunks)
+
+    if (
+        estimated_rows_count := max(left_sample.total_rows, right_sample.total_rows)
+    ) > 0:
+        max_rows_per_partition = CUDF_ROW_LIMIT // 4
+        min_partitions_for_row_limit = (
+            estimated_rows_count + max_rows_per_partition - 1
+        ) // max_rows_per_partition
+        min_output_partitions = max(min_output_partitions, min_partitions_for_row_limit)
+    return min_output_partitions
+
+
 async def _choose_strategy_from_samples(
     comm: Communicator,
     ir: Join,
@@ -1056,10 +1137,6 @@ async def _choose_strategy_from_samples(
 
     left_total, right_total = left_sample.total_size, right_sample.total_size
     left_total_rows, right_total_rows = left_sample.total_rows, right_sample.total_rows
-    left_total_chunks, right_total_chunks = (
-        left_sample.total_chunks,
-        right_sample.total_chunks,
-    )
 
     # =====================================================================
     # Broadcast-Join Strategy Selection
@@ -1103,21 +1180,11 @@ async def _choose_strategy_from_samples(
         return JoinStrategy(broadcast_side=broadcast_side)
 
     # Couldn't broadcast - Use a shuffle join instead.
-    estimated_output_size = max(left_total, right_total)
-    ideal_output_count = max(1, estimated_output_size // executor.target_partition_size)
-    # Limit the output count to 10x the larger input side.
-    # This is an arbitrary limit to prevent an oversized sample
-    # from blowing up the chunk count.
-    max_output_chunks = 10 * max(left_total_chunks, right_total_chunks)
-    min_shuffle_modulus = min(ideal_output_count, max_output_chunks)
-
-    # Stay away from cuDF's row limit
-    if (estimated_rows_count := max(left_total_rows, right_total_rows)) > 0:
-        max_rows_per_partition = CUDF_ROW_LIMIT // 4
-        min_partitions_for_row_limit = (
-            estimated_rows_count + max_rows_per_partition - 1
-        ) // max_rows_per_partition
-        min_shuffle_modulus = max(min_shuffle_modulus, min_partitions_for_row_limit)
+    min_shuffle_modulus = _estimated_output_partitions(
+        left_sample,
+        right_sample,
+        executor.target_partition_size,
+    )
 
     shuffle_modulus = _choose_shuffle_modulus(
         comm,
@@ -1206,30 +1273,14 @@ async def _choose_strategy(
     else:
         # Need to shuffle or broadcast - Use sampled data to choose a strategy
         chunkwise = False
-        assert executor.dynamic_planning is not None
-        sample_chunk_count = executor.dynamic_planning.sample_chunk_count
-        target_partition_size = executor.target_partition_size
-        left_sample, right_sample = await gather_in_task_group(
-            _sample_chunks(
-                context,
-                ch_left,
-                sample_chunk_count,
-                target_partition_size,
-                left_metadata.local_count,
-            ),
-            _sample_chunks(
-                context,
-                ch_right,
-                sample_chunk_count,
-                target_partition_size,
-                right_metadata.local_count,
-            ),
-        )
-        left_sample, right_sample = await _aggregate_estimates(
+        left_sample, right_sample = await _sample_join_inputs(
             context,
             comm,
-            left_sample,
-            right_sample,
+            ch_left,
+            ch_right,
+            left_metadata,
+            right_metadata,
+            executor,
             collective_ids,
         )
 
@@ -1327,18 +1378,66 @@ async def join_actor(
             right_partitioning,
         )
         if ordered_adjustment is not None:
+            left_sample, right_sample = await _sample_join_inputs(
+                context,
+                comm,
+                ch_left,
+                ch_right,
+                left_metadata,
+                right_metadata,
+                executor,
+                collective_ids,
+            )
+            output_scheme = ordered_adjustment.output_metadata.partitioning.inter_rank
+            assert isinstance(output_scheme, OrderScheme)
+            assert executor.dynamic_planning is not None
+            ordered_adjustment = _ordered_join_adjustment(
+                context,
+                comm,
+                ir,
+                left_metadata,
+                right_metadata,
+                left_partitioning,
+                right_partitioning,
+                target_npartitions=max(
+                    _estimated_output_partitions(
+                        left_sample,
+                        right_sample,
+                        executor.target_partition_size,
+                    ),
+                    executor.dynamic_planning.sample_chunk_count
+                    * (output_scheme.num_boundaries + 1),
+                ),
+            )
+            assert ordered_adjustment is not None
             if tracer is not None:
                 tracer.decision = "adjust_orderscheme"
+            ch_left_replay = context.create_channel()
+            ch_right_replay = context.create_channel()
             ch_left_ordered = context.create_channel()
             ch_right_ordered = context.create_channel()
             await send_metadata(ch_out, context, ordered_adjustment.output_metadata)
             await gather_in_task_group(
+                _replay_data_channel(
+                    context,
+                    ch_left_replay,
+                    ch_left,
+                    left_sample.chunks,
+                    trace_ir=ir,
+                ),
+                _replay_data_channel(
+                    context,
+                    ch_right_replay,
+                    ch_right,
+                    right_sample.chunks,
+                    trace_ir=ir,
+                ),
                 _adjust_ordered_join_side(
                     context,
                     comm,
                     ir_context,
                     ch_left_ordered,
-                    ch_left,
+                    ch_left_replay,
                     ordered_adjustment.left_metadata,
                     ir.children[0],
                     ordered_adjustment.left_input_scheme,
@@ -1350,7 +1449,7 @@ async def join_actor(
                     comm,
                     ir_context,
                     ch_right_ordered,
-                    ch_right,
+                    ch_right_replay,
                     ordered_adjustment.right_metadata,
                     ir.children[1],
                     ordered_adjustment.right_input_scheme,
