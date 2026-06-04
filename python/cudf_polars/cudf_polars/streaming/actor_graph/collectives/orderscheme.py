@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from itertools import pairwise
 from math import ceil, floor
 from statistics import fmean, median
@@ -69,6 +70,7 @@ _UNSIGNED_BOUNDARY_IDS = {
     plc.TypeId.UINT64,
 }
 _FLOAT_BOUNDARY_IDS = {plc.TypeId.FLOAT32, plc.TypeId.FLOAT64}
+_ADJUST_ALGORITHM_ENV = "CUDF_POLARS_ADJUST_ORDERSCHEME_ALGORITHM"
 
 
 def _contiguous_owner(pid: int, nranks: int, npartitions: int) -> int:
@@ -409,6 +411,15 @@ def _source_output_range(
 
 def _ranges_overlap(left: tuple[int, int], right: tuple[int, int]) -> bool:
     return max(left[0], right[0]) < min(left[1], right[1])
+
+
+def _adjust_algorithm() -> Literal["windowed", "batch"]:
+    algorithm = os.environ.get(_ADJUST_ALGORITHM_ENV, "windowed").lower()
+    if algorithm == "windowed":
+        return "windowed"
+    if algorithm == "batch":
+        return "batch"
+    raise ValueError(f"{_ADJUST_ALGORITHM_ENV} must be 'windowed' or 'batch'.")
 
 
 def _unpack_remote_piece(
@@ -802,20 +813,21 @@ async def adjust_orderscheme(
                 upper_positions,
             )
             assert collective_id is not None
-            await _adjust_orderscheme_rank_windows(
-                context,
-                comm,
-                ref_ir,
-                ir_context,
-                ch_out,
-                ch_in,
-                input_scheme,
-                output_scheme,
-                collective_id,
-                lower_positions,
-                upper_positions,
-            )
-            return
+            if _adjust_algorithm() == "windowed":
+                await _adjust_orderscheme_rank_windows(
+                    context,
+                    comm,
+                    ref_ir,
+                    ir_context,
+                    ch_out,
+                    ch_in,
+                    input_scheme,
+                    output_scheme,
+                    collective_id,
+                    lower_positions,
+                    upper_positions,
+                )
+                return
         exchange = (
             SparseAlltoall(context, comm, collective_id, srcs=srcs, dsts=dsts)
             if comm.nranks > 1
