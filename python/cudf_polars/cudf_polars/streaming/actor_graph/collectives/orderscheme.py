@@ -828,6 +828,8 @@ async def adjust_orderscheme(
                     upper_positions,
                 )
                 return
+            srcs = [rank for rank in range(comm.nranks) if rank != comm.rank]
+            dsts = srcs
         exchange = (
             SparseAlltoall(context, comm, collective_id, srcs=srcs, dsts=dsts)
             if comm.nranks > 1
