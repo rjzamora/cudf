@@ -89,6 +89,35 @@ tell the engine; let the engine preserve and exploit that fact."
 
 ## Features Needed On Main
 
+### Immediate branch checklist
+
+The `ordered-optimizations` branch contains several experimental changes that
+should move to main as small, reviewable PRs. The high-priority items are:
+
+- Update the open `adjust-orderscheme` PR so the single-rank path streams data
+  instead of buffering the entire input. It should still emit one message for
+  every locally owned output range, including empty ranges.
+- Keep `adjust_orderscheme` metadata-agnostic: callers own channel metadata,
+  while the utility only transforms `TableChunk` messages.
+- Preserve a memory-safe multi-rank adjustment path by default. The experimental
+  windowed algorithm is safer for constrained memory; the batch algorithm is a
+  useful performance mode when aggregate GPU memory is large enough.
+- Move the parquet scan-size estimate fix to main. The lower bound on decoded
+  column size matters for GPU-written parquet where footer byte counts can
+  significantly under-estimate decoded memory.
+- Add explicit diagnostics for `HintSorted` footer failures. A trace decision of
+  `fallback` should be accompanied by the reason: missing stats, null stats,
+  non-integer stats, non-monotonic footer ranges, or unsorted min/max table.
+- Keep the `DateTime -> ts_bucket` propagation path. A monotonic truncation can
+  derive a new `OrderScheme`, but it may need to downgrade strictness because
+  distinct timestamp boundaries can collapse into repeated bucket boundaries.
+- Keep the strict-prefix final-sort optimization. Strict partitioning on
+  `ts_bucket` does not prove full `(ts_bucket, RIC)` ordering, but it is enough
+  to replace a global sort with local per-chunk sorting.
+- Add or maintain dataset validation tooling for presorted inputs: uniform
+  schema, no accidental Hive columns in files, footer min/max stats present,
+  and adjacent `messageTimestamp` ranges monotonic in scan order.
+
 ### 1. Scan-level sortedness hints
 
 `LazyFrame.set_sorted(...)` / hint-sorted support should become a metadata
