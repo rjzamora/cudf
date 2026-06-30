@@ -1037,28 +1037,63 @@ async def _aggregate_estimates(
     comm: Communicator,
     left_sample: TableSizeStats,
     right_sample: TableSizeStats,
+    left_metadata: ChannelMetadata,
+    right_metadata: ChannelMetadata,
     collective_ids: list[int],
 ) -> tuple[TableSizeStats, TableSizeStats]:
     """Aggregate table-size and row estimates across ranks."""
-    # AllGather size, row, and chunk count estimates across ranks
-    (
-        left_total,
-        right_total,
-        left_total_rows,
-        right_total_rows,
-        left_total_chunks,
-        right_total_chunks,
-    ) = await allgather_reduce(
-        context,
-        comm,
-        collective_ids.pop(0),
-        left_sample.total_size,
-        right_sample.total_size,
-        left_sample.total_rows,
-        right_sample.total_rows,
-        left_sample.total_chunks,
-        right_sample.total_chunks,
-    )
+    op_id = collective_ids.pop(0)
+    left_total = left_sample.total_size
+    left_total_rows = left_sample.total_rows
+    left_total_chunks = left_sample.total_chunks
+    right_total = right_sample.total_size
+    right_total_rows = right_sample.total_rows
+    right_total_chunks = right_sample.total_chunks
+
+    # AllGather size, row, and chunk count estimates across ranks for
+    # non-duplicated inputs. Duplicated inputs already represent every rank's
+    # local copy, and downstream broadcast/shuffle paths avoid N-way duplication.
+    if (
+        comm.nranks > 1
+        and not left_metadata.duplicated
+        and not right_metadata.duplicated
+    ):
+        (
+            left_total,
+            right_total,
+            left_total_rows,
+            right_total_rows,
+            left_total_chunks,
+            right_total_chunks,
+        ) = await allgather_reduce(
+            context,
+            comm,
+            op_id,
+            left_sample.total_size,
+            right_sample.total_size,
+            left_sample.total_rows,
+            right_sample.total_rows,
+            left_sample.total_chunks,
+            right_sample.total_chunks,
+        )
+    elif comm.nranks > 1 and not left_metadata.duplicated:
+        left_total, left_total_rows, left_total_chunks = await allgather_reduce(
+            context,
+            comm,
+            op_id,
+            left_sample.total_size,
+            left_sample.total_rows,
+            left_sample.total_chunks,
+        )
+    elif comm.nranks > 1 and not right_metadata.duplicated:
+        right_total, right_total_rows, right_total_chunks = await allgather_reduce(
+            context,
+            comm,
+            op_id,
+            right_sample.total_size,
+            right_sample.total_rows,
+            right_sample.total_chunks,
+        )
 
     new_left_sample = TableSizeStats(
         chunks=left_sample.chunks,
@@ -1173,12 +1208,23 @@ async def _choose_strategy_from_samples(
     # - Full: cannot broadcast (must shuffle both to preserve both sides)
 
     # Determine which sides may be broadcasted
-    broadcast_threshold = executor.broadcast_limit
-    left_size_ok = left_total < broadcast_threshold and (
-        left_total_rows < MAX_ROWS_PER_PARTITION or left_metadata.duplicated
+    left_size_ok = (
+        _broadcast_rejection_reason(
+            total_size=left_total,
+            total_rows=left_total_rows,
+            metadata=left_metadata,
+            executor=executor,
+        )
+        is None
     )
-    right_size_ok = right_total < broadcast_threshold and (
-        right_total_rows < MAX_ROWS_PER_PARTITION or right_metadata.duplicated
+    right_size_ok = (
+        _broadcast_rejection_reason(
+            total_size=right_total,
+            total_rows=right_total_rows,
+            metadata=right_metadata,
+            executor=executor,
+        )
+        is None
     )
     can_broadcast_left = left_size_ok and ir.options[0] in ("Inner", "Right")
     can_broadcast_right = right_size_ok and ir.options[0] in (
@@ -1298,6 +1344,8 @@ async def _choose_strategy(
             comm,
             left_sample,
             right_sample,
+            left_metadata,
+            right_metadata,
             collective_ids,
         )
 
@@ -1368,14 +1416,17 @@ async def _validate_broadcast_candidate(
         local_chunks += 1
         chunks.insert(Message(msg.sequence_number, chunk))
 
-    total_size, total_rows, total_chunks = await allgather_reduce(
-        context,
-        comm,
-        collective_id,
-        local_size,
-        local_rows,
-        local_chunks,
-    )
+    if comm.nranks > 1 and not metadata.duplicated:
+        total_size, total_rows, total_chunks = await allgather_reduce(
+            context,
+            comm,
+            collective_id,
+            local_size,
+            local_rows,
+            local_chunks,
+        )
+    else:
+        total_size, total_rows, total_chunks = local_size, local_rows, local_chunks
     reason = _broadcast_rejection_reason(
         total_size=total_size,
         total_rows=total_rows,
