@@ -5,19 +5,32 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 import pytest
 
 import polars as pl
 
+from cudf_streaming.channel_metadata import ChannelMetadata
+from cudf_streaming.table_chunk import TableChunk
+from rapidsmpf.streaming.core.message import Message
+
 from cudf_polars import Translator
+from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import Cache, Join
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.engine.options import StreamingOptions
+from cudf_polars.streaming.actor_graph.collectives.common import reserve_op_id
 from cudf_polars.streaming.actor_graph.join import (
     _select_join_prefilter,
     _use_pwise_join,
+    _validate_broadcast_candidate,
+)
+from cudf_polars.streaming.actor_graph.utils import (
+    ChunkStore,
+    TableSizeStats,
+    buffered_chunk_messages,
 )
 from cudf_polars.streaming.base import PartitionInfo
 from cudf_polars.streaming.parallel import lower_ir_graph
@@ -29,6 +42,17 @@ from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
 
 if TYPE_CHECKING:
     import concurrent.futures
+
+    from cudf_polars.engine.spmd import SPMDEngine
+
+
+def _make_chunk(engine: SPMDEngine, data: dict[str, object]) -> TableChunk:
+    context = engine.context
+    stream = context.br().stream_pool.get_stream()
+    df = DataFrame.from_polars(pl.DataFrame(data), stream)
+    return TableChunk.from_pylibcudf_table(
+        df.table, stream, exclusive_view=True, br=context.br()
+    )
 
 
 @pytest.fixture
@@ -95,6 +119,71 @@ def test_join_then_shuffle(left, right, streaming_engine_factory):
         (pl.col("y") * pl.col("y")).n_unique().alias("y2"),
     )
     assert_gpu_result_equal(q, engine=streaming_engine, check_row_order=False)
+
+
+@pytest.mark.spmd
+def test_broadcast_validation_rejects_underestimated_sample(
+    spmd_engine: SPMDEngine,
+) -> None:
+    async def run() -> None:
+        context = spmd_engine.context
+        ch = context.create_channel()
+
+        sample_chunk = _make_chunk(spmd_engine, {"k": [0], "v": [0]})
+        remaining_chunk = _make_chunk(
+            spmd_engine,
+            {"k": range(64), "v": range(64)},
+        )
+
+        sample_size = sample_chunk.data_alloc_size()
+        sample_store = ChunkStore(context)
+        sample_store.insert(Message(0, sample_chunk))
+        sample = TableSizeStats(
+            chunks=sample_store,
+            total_size=sample_size,
+            total_rows=1,
+            total_chunks=2,
+        )
+
+        executor = StreamingExecutor(
+            target_partition_size=1024,
+            broadcast_limit=sample_size + 1,
+        )
+
+        async def feed_remaining() -> None:
+            await ch.send(context, Message(1, remaining_chunk))
+            await ch.drain(context)
+
+        with reserve_op_id() as op_id:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(feed_remaining())
+                validation_task = tg.create_task(
+                    _validate_broadcast_candidate(
+                        context,
+                        spmd_engine.comm,
+                        ch,
+                        sample,
+                        ChannelMetadata(local_count=2),
+                        executor,
+                        op_id,
+                    )
+                )
+            validation = validation_task.result()
+
+        assert not validation.safe
+        assert validation.reason == "size_limit"
+        assert validation.sample.total_rows == 65 * spmd_engine.comm.nranks
+        assert validation.sample.total_chunks == 2 * spmd_engine.comm.nranks
+
+        seq_nums = []
+        row_counts = []
+        for msg in buffered_chunk_messages(validation.sample.chunks):
+            seq_nums.append(msg.sequence_number)
+            row_counts.append(TableChunk.from_message(msg, br=context.br()).shape[0])
+        assert seq_nums == [0, 1]
+        assert row_counts == [1, 64]
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("reverse", [True, False])

@@ -40,10 +40,12 @@ from cudf_polars.streaming.actor_graph.utils import (
     CUDF_ROW_LIMIT,
     MAX_ROWS_PER_PARTITION,
     ChannelManager,
+    ChunkStore,
     NormalizedPartitioning,
     TableSizeStats,
     _sample_chunks,
     allgather_reduce,
+    buffered_chunk_messages,
     chunk_to_frame,
     empty_table_chunk,
     gather_in_task_group,
@@ -90,6 +92,18 @@ class JoinStrategy:
     """The shuffle indices for the left side. Only used for shuffle joins."""
     right_indices: tuple[int, ...] = ()
     """The shuffle indices for the right side. Only used for shuffle joins."""
+
+
+@dataclass(frozen=True)
+class BroadcastValidation:
+    """Exact validation result for a sampled broadcast-join candidate."""
+
+    sample: TableSizeStats
+    """Fully drained candidate-side chunks and exact global statistics."""
+    safe: bool
+    """Whether the broadcast candidate still satisfies broadcast limits."""
+    reason: str | None = None
+    """Reason the broadcast candidate was rejected, if any."""
 
 
 @dataclass(frozen=True)
@@ -221,6 +235,7 @@ async def _collect_small_side_for_broadcast(
             if gathered.num_columns() == 0 and len(ir.schema) > 0
             else gathered
         )
+        size = sum(col.device_buffer_size() for col in table.columns())
         dfs = [
             DataFrame.from_table(
                 table,
@@ -997,6 +1012,26 @@ def _make_shuffle_strategy(
     )
 
 
+def _normalized_join_partitioning(
+    ir: Join,
+    left_metadata: ChannelMetadata,
+    right_metadata: ChannelMetadata,
+    nranks: int,
+) -> tuple[NormalizedPartitioning, NormalizedPartitioning]:
+    """Return normalized partitioning for both join inputs."""
+    left_partitioning = NormalizedPartitioning.from_keys(
+        left_metadata.partitioning,
+        nranks,
+        keys=names_to_indices(ir.left_on, ir.children[0].schema, concrete_prefix=True),
+    )
+    right_partitioning = NormalizedPartitioning.from_keys(
+        right_metadata.partitioning,
+        nranks,
+        keys=names_to_indices(ir.right_on, ir.children[1].schema, concrete_prefix=True),
+    )
+    return left_partitioning, right_partitioning
+
+
 async def _aggregate_estimates(
     context: Context,
     comm: Communicator,
@@ -1040,6 +1075,62 @@ async def _aggregate_estimates(
     return new_left_sample, new_right_sample
 
 
+def _make_shuffle_strategy_from_samples(
+    comm: Communicator,
+    ir: Join,
+    left_metadata: ChannelMetadata,
+    right_metadata: ChannelMetadata,
+    left_partitioning: NormalizedPartitioning,
+    right_partitioning: NormalizedPartitioning,
+    executor: StreamingExecutor,
+    *,
+    left_sample: TableSizeStats,
+    right_sample: TableSizeStats,
+    tracer: ActorTracer | None,
+) -> JoinStrategy:
+    """Choose a shuffle strategy from sampled/exact table statistics."""
+    estimated_output_size = max(left_sample.total_size, right_sample.total_size)
+    ideal_output_count = max(1, estimated_output_size // executor.target_partition_size)
+    # Limit the output count to 10x the larger input side.
+    # This is an arbitrary limit to prevent an oversized sample
+    # from blowing up the chunk count.
+    max_output_chunks = 10 * max(left_sample.total_chunks, right_sample.total_chunks)
+    min_shuffle_modulus = min(ideal_output_count, max_output_chunks)
+
+    # Stay away from cuDF's row limit
+    estimated_rows_count = max(left_sample.total_rows, right_sample.total_rows)
+    if estimated_rows_count > 0:
+        min_partitions_for_row_limit = (
+            estimated_rows_count + MAX_ROWS_PER_PARTITION - 1
+        ) // MAX_ROWS_PER_PARTITION
+        min_shuffle_modulus = max(min_shuffle_modulus, min_partitions_for_row_limit)
+
+    shuffle_modulus = _choose_shuffle_modulus(
+        comm,
+        left_partitioning,
+        right_partitioning,
+        min_shuffle_modulus,
+    )  # Global modulus
+
+    strategy = _make_shuffle_strategy(
+        ir,
+        shuffle_modulus,
+        left_partitioning,
+        right_partitioning,
+        left_metadata,
+        right_metadata,
+    )
+
+    if tracer is not None:
+        _log_shuffle_strategy_decision(
+            tracer,
+            strategy,
+            left_partitioning,
+            right_partitioning,
+        )
+    return strategy
+
+
 async def _choose_strategy_from_samples(
     comm: Communicator,
     ir: Join,
@@ -1072,10 +1163,6 @@ async def _choose_strategy_from_samples(
 
     left_total, right_total = left_sample.total_size, right_sample.total_size
     left_total_rows, right_total_rows = left_sample.total_rows, right_sample.total_rows
-    left_total_chunks, right_total_chunks = (
-        left_sample.total_chunks,
-        right_sample.total_chunks,
-    )
 
     # =====================================================================
     # Broadcast-Join Strategy Selection
@@ -1119,45 +1206,18 @@ async def _choose_strategy_from_samples(
         return JoinStrategy(broadcast_side=broadcast_side)
 
     # Couldn't broadcast - Use a shuffle join instead.
-    estimated_output_size = max(left_total, right_total)
-    ideal_output_count = max(1, estimated_output_size // executor.target_partition_size)
-    # Limit the output count to 10x the larger input side.
-    # This is an arbitrary limit to prevent an oversized sample
-    # from blowing up the chunk count.
-    max_output_chunks = 10 * max(left_total_chunks, right_total_chunks)
-    min_shuffle_modulus = min(ideal_output_count, max_output_chunks)
-
-    # Stay away from cuDF's row limit
-    if (estimated_rows_count := max(left_total_rows, right_total_rows)) > 0:
-        min_partitions_for_row_limit = (
-            estimated_rows_count + MAX_ROWS_PER_PARTITION - 1
-        ) // MAX_ROWS_PER_PARTITION
-        min_shuffle_modulus = max(min_shuffle_modulus, min_partitions_for_row_limit)
-
-    shuffle_modulus = _choose_shuffle_modulus(
+    return _make_shuffle_strategy_from_samples(
         comm,
-        left_partitioning,
-        right_partitioning,
-        min_shuffle_modulus,
-    )  # Global modulus
-
-    strategy = _make_shuffle_strategy(
         ir,
-        shuffle_modulus,
-        left_partitioning,
-        right_partitioning,
         left_metadata,
         right_metadata,
+        left_partitioning,
+        right_partitioning,
+        executor,
+        left_sample=left_sample,
+        right_sample=right_sample,
+        tracer=tracer,
     )
-
-    if tracer is not None:
-        _log_shuffle_strategy_decision(
-            tracer,
-            strategy,
-            left_partitioning,
-            right_partitioning,
-        )
-    return strategy
 
 
 def _choose_shuffle_modulus(
@@ -1202,15 +1262,8 @@ async def _choose_strategy(
 ) -> tuple[TableSizeStats, TableSizeStats, JoinStrategy]:
     """Sample both sides, aggregate estimates, and choose broadcast vs shuffle."""
     nranks = comm.nranks
-    left_partitioning = NormalizedPartitioning.from_keys(
-        left_metadata.partitioning,
-        nranks,
-        keys=names_to_indices(ir.left_on, ir.children[0].schema, concrete_prefix=True),
-    )
-    right_partitioning = NormalizedPartitioning.from_keys(
-        right_metadata.partitioning,
-        nranks,
-        keys=names_to_indices(ir.right_on, ir.children[1].schema, concrete_prefix=True),
+    left_partitioning, right_partitioning = _normalized_join_partitioning(
+        ir, left_metadata, right_metadata, nranks
     )
 
     if left_partitioning.is_aligned_with(right_partitioning, context.br()):
@@ -1263,6 +1316,82 @@ async def _choose_strategy(
     )
 
     return left_sample, right_sample, strategy
+
+
+def _broadcast_rejection_reason(
+    *,
+    total_size: int,
+    total_rows: int,
+    metadata: ChannelMetadata,
+    executor: StreamingExecutor,
+) -> str | None:
+    """Return why an exact broadcast candidate is unsafe, if it is unsafe."""
+    if total_size >= executor.broadcast_limit:
+        return "size_limit"
+    if total_rows >= MAX_ROWS_PER_PARTITION and not metadata.duplicated:
+        return "row_limit"
+    return None
+
+
+async def _validate_broadcast_candidate(
+    context: Context,
+    comm: Communicator,
+    ch: Channel[TableChunk],
+    sample: TableSizeStats,
+    metadata: ChannelMetadata,
+    executor: StreamingExecutor,
+    collective_id: int,
+) -> BroadcastValidation:
+    """
+    Drain a sampled broadcast candidate and validate exact global size limits.
+
+    The candidate-side chunks are kept in a spillable store so the final
+    broadcast or fallback shuffle can replay them without forcing them to stay
+    resident on device while the runtime is still making the strategy decision.
+    """
+    chunks = ChunkStore(context)
+    local_size = 0
+    local_rows = 0
+    local_chunks = 0
+
+    for msg in buffered_chunk_messages(sample.chunks):
+        chunk = TableChunk.from_message(msg, br=context.br())
+        local_size += chunk.data_alloc_size()
+        local_rows += chunk.shape[0]
+        local_chunks += 1
+        chunks.insert(Message(msg.sequence_number, chunk))
+
+    while (msg := await ch.recv(context)) is not None:
+        chunk = TableChunk.from_message(msg, br=context.br())
+        local_size += chunk.data_alloc_size()
+        local_rows += chunk.shape[0]
+        local_chunks += 1
+        chunks.insert(Message(msg.sequence_number, chunk))
+
+    total_size, total_rows, total_chunks = await allgather_reduce(
+        context,
+        comm,
+        collective_id,
+        local_size,
+        local_rows,
+        local_chunks,
+    )
+    reason = _broadcast_rejection_reason(
+        total_size=total_size,
+        total_rows=total_rows,
+        metadata=metadata,
+        executor=executor,
+    )
+    return BroadcastValidation(
+        sample=TableSizeStats(
+            chunks=chunks,
+            total_size=total_size,
+            total_rows=total_rows,
+            total_chunks=total_chunks,
+        ),
+        safe=reason is None,
+        reason=reason,
+    )
 
 
 @define_actor()
@@ -1318,6 +1447,7 @@ async def join_actor(
             recv_metadata(ch_right, context),
         )
 
+        estimate_collective_id = collective_ids[0] if collective_ids else 0
         left_sample, right_sample, strategy = await _choose_strategy(
             context,
             comm,
@@ -1330,6 +1460,52 @@ async def join_actor(
             collective_ids,
             tracer=tracer,
         )
+        if strategy.broadcast_side is not None:
+            broadcast_side = strategy.broadcast_side
+            validation = await _validate_broadcast_candidate(
+                context,
+                comm,
+                ch_left if broadcast_side == "left" else ch_right,
+                left_sample if broadcast_side == "left" else right_sample,
+                left_metadata if broadcast_side == "left" else right_metadata,
+                executor,
+                estimate_collective_id,
+            )
+            if broadcast_side == "left":
+                left_sample = validation.sample
+            else:
+                right_sample = validation.sample
+
+            if tracer is not None:
+                tracer.set_extra(
+                    "join_broadcast_validation",
+                    {
+                        "broadcast_side": broadcast_side,
+                        "safe": validation.safe,
+                        "reason": validation.reason,
+                        "total_size": validation.sample.total_size,
+                        "total_rows": validation.sample.total_rows,
+                        "total_chunks": validation.sample.total_chunks,
+                    },
+                )
+
+            if not validation.safe:
+                left_partitioning, right_partitioning = _normalized_join_partitioning(
+                    ir, left_metadata, right_metadata, comm.nranks
+                )
+                strategy = _make_shuffle_strategy_from_samples(
+                    comm,
+                    ir,
+                    left_metadata,
+                    right_metadata,
+                    left_partitioning,
+                    right_partitioning,
+                    executor,
+                    left_sample=left_sample,
+                    right_sample=right_sample,
+                    tracer=tracer,
+                )
+
         ch_left_replay = context.create_channel()
         ch_right_replay = context.create_channel()
         async with shutdown_on_error(
