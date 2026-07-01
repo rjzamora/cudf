@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -90,6 +91,46 @@ class JoinStrategy:
     """The shuffle indices for the left side. Only used for shuffle joins."""
     right_indices: tuple[int, ...] = ()
     """The shuffle indices for the right side. Only used for shuffle joins."""
+
+
+def _experimental_join_algo() -> (
+    Literal["shuffle", "broadcast_left", "broadcast_right"] | None
+):
+    algo = os.getenv("CUDF_POLARS__EXPERIMENTAL__JOIN_ALGO", "").lower()
+    if algo in ("", "dynamic"):
+        return None
+    if algo not in ("shuffle", "broadcast_left", "broadcast_right"):
+        raise ValueError(
+            "CUDF_POLARS__EXPERIMENTAL__JOIN_ALGO must be one of "
+            "'shuffle', 'broadcast_left', 'broadcast_right', or 'dynamic'"
+        )
+    return algo
+
+
+def _experimental_join_shuffle_modulus(nranks: int) -> int:
+    value = os.getenv("CUDF_POLARS__EXPERIMENTAL__JOIN_SHUFFLE_MODULUS")
+    modulus = nranks if value is None else int(value)
+    if modulus < 1:
+        raise ValueError(
+            "CUDF_POLARS__EXPERIMENTAL__JOIN_SHUFFLE_MODULUS must be positive"
+        )
+    return max(nranks, modulus)
+
+
+def _validate_experimental_broadcast_side(
+    ir: Join, side: Literal["left", "right"]
+) -> None:
+    join_type = ir.options[0]
+    allowed = (
+        join_type in ("Inner", "Right")
+        if side == "left"
+        else join_type in ("Inner", "Left", "Semi", "Anti")
+    )
+    if not allowed:
+        raise ValueError(
+            f"Cannot force broadcast_{side} for {join_type!r} join with "
+            "CUDF_POLARS__EXPERIMENTAL__JOIN_ALGO"
+        )
 
 
 @dataclass(frozen=True)
@@ -1212,6 +1253,31 @@ async def _choose_strategy(
         nranks,
         keys=names_to_indices(ir.right_on, ir.children[1].schema, concrete_prefix=True),
     )
+
+    experimental_algo = _experimental_join_algo()
+    if experimental_algo is not None:
+        left_sample = TableSizeStats(total_chunks=left_metadata.local_count)
+        right_sample = TableSizeStats(total_chunks=right_metadata.local_count)
+        if experimental_algo == "shuffle":
+            strategy = _make_shuffle_strategy(
+                ir,
+                _experimental_join_shuffle_modulus(nranks),
+                left_partitioning,
+                right_partitioning,
+                left_metadata,
+                right_metadata,
+            )
+            if tracer is not None:
+                tracer.decision = "experimental_shuffle"
+        else:
+            broadcast_side: Literal["left", "right"] = (
+                "left" if experimental_algo == "broadcast_left" else "right"
+            )
+            _validate_experimental_broadcast_side(ir, broadcast_side)
+            strategy = JoinStrategy(broadcast_side=broadcast_side)
+            if tracer is not None:
+                tracer.decision = f"experimental_broadcast_{broadcast_side}"
+        return left_sample, right_sample, strategy
 
     if left_partitioning.is_aligned_with(right_partitioning, context.br()):
         # We can use a chunkwise join

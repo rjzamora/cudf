@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import pylibcudf as plc
 from cudf_streaming.channel_metadata import (
@@ -56,6 +57,28 @@ if TYPE_CHECKING:
     from cudf_polars.streaming.actor_graph.dispatch import SubNetGenerator
     from cudf_polars.streaming.actor_graph.tracing import ActorTracer
     from cudf_polars.typing import Schema
+
+
+def _experimental_groupby_algo() -> Literal["tree", "shuffle"] | None:
+    algo = os.getenv("CUDF_POLARS__EXPERIMENTAL__GROUPBY_ALGO", "").lower()
+    if algo in ("", "dynamic"):
+        return None
+    if algo not in ("tree", "shuffle"):
+        raise ValueError(
+            "CUDF_POLARS__EXPERIMENTAL__GROUPBY_ALGO must be one of "
+            "'tree', 'shuffle', or 'dynamic'"
+        )
+    return algo
+
+
+def _experimental_groupby_shuffle_count(nranks: int) -> int:
+    value = os.getenv("CUDF_POLARS__EXPERIMENTAL__GROUPBY_SHUFFLE_OUTPUT_COUNT")
+    count = max(2, nranks) if value is None else int(value)
+    if count < 2:
+        raise ValueError(
+            "CUDF_POLARS__EXPERIMENTAL__GROUPBY_SHUFFLE_OUTPUT_COUNT must be at least 2"
+        )
+    return count
 
 
 @dataclass
@@ -666,6 +689,12 @@ async def groupby_actor(
             keys=_key_indices(ir, ir.children[0].schema, concrete_prefix=True),
         )
         maintain_order = _maintain_order(ir)
+        experimental_algo = _experimental_groupby_algo()
+        if experimental_algo == "shuffle" and maintain_order:
+            raise ValueError(
+                "Cannot force shuffle groupby/distinct when maintain-order "
+                "semantics are required"
+            )
         fully_partitioned = partitioning.is_strictly_partitioned()
         fallback_case = (
             # NOTE: This criteria means that we fell back
@@ -705,25 +734,34 @@ async def groupby_actor(
             ir_context,
             ch_in,
             target_partition_size,
-            allow_early_exit=not maintain_order,
+            allow_early_exit=not maintain_order and experimental_algo != "tree",
         )
 
         skip_global_comm = metadata_in.duplicated or isinstance(
             partitioning.inter_rank_scheme, HashScheme
         )
-        output_count = await _choose_strategy(
-            context,
-            comm,
-            metadata_in.local_count,
-            aggregated,
-            chunks_received,
-            input_drained,
-            collective_ids,
-            target_partition_size,
-            skip_global_comm,
-            maintain_order,
-            tracer,
-        )
+        if experimental_algo == "tree":
+            output_count = 1
+            if tracer is not None:
+                tracer.decision = "experimental_tree"
+        elif experimental_algo == "shuffle":
+            output_count = _experimental_groupby_shuffle_count(nranks)
+            if tracer is not None:
+                tracer.decision = "experimental_shuffle"
+        else:
+            output_count = await _choose_strategy(
+                context,
+                comm,
+                metadata_in.local_count,
+                aggregated,
+                chunks_received,
+                input_drained,
+                collective_ids,
+                target_partition_size,
+                skip_global_comm,
+                maintain_order,
+                tracer,
+            )
 
         if output_count == 1:
             await _tree_reduce(
