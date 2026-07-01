@@ -107,16 +107,6 @@ def _experimental_join_algo() -> (
     return algo
 
 
-def _experimental_join_shuffle_modulus(nranks: int) -> int:
-    value = os.getenv("CUDF_POLARS__EXPERIMENTAL__JOIN_SHUFFLE_MODULUS")
-    modulus = nranks if value is None else int(value)
-    if modulus < 1:
-        raise ValueError(
-            "CUDF_POLARS__EXPERIMENTAL__JOIN_SHUFFLE_MODULUS must be positive"
-        )
-    return max(nranks, modulus)
-
-
 def _validate_experimental_broadcast_side(
     ir: Join, side: Literal["left", "right"]
 ) -> None:
@@ -1259,9 +1249,14 @@ async def _choose_strategy(
         left_sample = TableSizeStats(total_chunks=left_metadata.local_count)
         right_sample = TableSizeStats(total_chunks=right_metadata.local_count)
         if experimental_algo == "shuffle":
+            shuffle_modulus = max(
+                nranks,
+                left_metadata.local_count,
+                right_metadata.local_count,
+            )
             strategy = _make_shuffle_strategy(
                 ir,
-                _experimental_join_shuffle_modulus(nranks),
+                shuffle_modulus,
                 left_partitioning,
                 right_partitioning,
                 left_metadata,

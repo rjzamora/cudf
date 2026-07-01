@@ -71,16 +71,6 @@ def _experimental_groupby_algo() -> Literal["tree", "shuffle"] | None:
     return algo
 
 
-def _experimental_groupby_shuffle_count(nranks: int) -> int:
-    value = os.getenv("CUDF_POLARS__EXPERIMENTAL__GROUPBY_SHUFFLE_OUTPUT_COUNT")
-    count = max(2, nranks) if value is None else int(value)
-    if count < 2:
-        raise ValueError(
-            "CUDF_POLARS__EXPERIMENTAL__GROUPBY_SHUFFLE_OUTPUT_COUNT must be at least 2"
-        )
-    return count
-
-
 @dataclass
 class DecomposedGroupBy:
     """Holds decomposed GroupBy or Distinct operations for multi-phase aggregation."""
@@ -541,6 +531,8 @@ async def _choose_strategy(
     skip_global_comm: bool,  # noqa: FBT001
     maintain_order: bool,  # noqa: FBT001
     tracer: ActorTracer | None,
+    *,
+    force_shuffle: bool = False,
 ) -> int:
     """
     Select the best algorithm for the given context and metadata.
@@ -569,6 +561,9 @@ async def _choose_strategy(
         Whether the operation should maintain input ordering semantics.
     tracer
         Optional tracer for runtime metrics.
+    force_shuffle
+        Whether to force a shuffle strategy while preserving dynamic output
+        sizing safeguards.
 
     Returns
     -------
@@ -612,9 +607,12 @@ async def _choose_strategy(
         ) // MAX_ROWS_PER_PARTITION
 
     ideal_count = 1
-    use_tree = maintain_order or (
-        total_need_shuffle == 0
-        and (skip_global_comm or total_estimated_rows < MAX_ROWS_PER_PARTITION)
+    use_tree = not force_shuffle and (
+        maintain_order
+        or (
+            total_need_shuffle == 0
+            and (skip_global_comm or total_estimated_rows < MAX_ROWS_PER_PARTITION)
+        )
     )
     if not use_tree:
         ideal_count = max(
@@ -625,16 +623,21 @@ async def _choose_strategy(
     output_count = min(ideal_count, output_count_limit)
     if not use_tree:
         output_count = max(2, output_count, min_row_limit_count)
+        if force_shuffle:
+            output_count = max(output_count, output_count_limit)
     if tracer is not None:
-        tracer.decision = (
-            "tree_local"
-            if skip_global_comm and use_tree
-            else "shuffle_local"
-            if skip_global_comm
-            else "tree_allgather"
-            if use_tree
-            else "shuffle"
-        )
+        if force_shuffle:
+            tracer.decision = "experimental_shuffle"
+        else:
+            tracer.decision = (
+                "tree_local"
+                if skip_global_comm and use_tree
+                else "shuffle_local"
+                if skip_global_comm
+                else "tree_allgather"
+                if use_tree
+                else "shuffle"
+            )
 
     return output_count
 
@@ -745,9 +748,20 @@ async def groupby_actor(
             if tracer is not None:
                 tracer.decision = "experimental_tree"
         elif experimental_algo == "shuffle":
-            output_count = _experimental_groupby_shuffle_count(nranks)
-            if tracer is not None:
-                tracer.decision = "experimental_shuffle"
+            output_count = await _choose_strategy(
+                context,
+                comm,
+                metadata_in.local_count,
+                aggregated,
+                chunks_received,
+                input_drained,
+                collective_ids,
+                target_partition_size,
+                skip_global_comm,
+                maintain_order,
+                tracer,
+                force_shuffle=True,
+            )
         else:
             output_count = await _choose_strategy(
                 context,
