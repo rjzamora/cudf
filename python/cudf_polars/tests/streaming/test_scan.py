@@ -27,7 +27,7 @@ from cudf_polars.dsl.utils.io import (
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.streaming.actor_graph.io import (
     MetadataMessagePayload,
-    collect_metadata_scans,
+    collect_metadata_table_groups,
     recv_prefetched_parquet_metadata_handler,
 )
 from cudf_polars.streaming.base import (
@@ -746,7 +746,7 @@ def test_scan_partition_plan_nearest(
     assert plan.flavor == expected_flavor
 
 
-def test_collect_metadata_scans_one_actor_per_streaming_scan() -> None:
+def test_collect_metadata_table_groups_one_actor_per_table() -> None:
     parquet_options = ParquetOptions(prefetch_file_metadata=True)
     paths = [f"part.{i}.parquet" for i in range(6)]
     base_scan = _make_parquet_scan(paths, parquet_options)
@@ -767,16 +767,68 @@ def test_collect_metadata_scans_one_actor_per_streaming_scan() -> None:
     partition_info: dict[IR, PartitionInfo] = {
         streaming_scan: PartitionInfo(count=partition_count, io_plan=plan),
     }
-    metadata_scans = collect_metadata_scans(
+    metadata_table_groups = collect_metadata_table_groups(
         streaming_scan,
         partition_info=partition_info,
         config_options=config_options,
         nranks=1,
     )
-    assert metadata_scans == [streaming_scan]
+    assert metadata_table_groups == {tuple(paths): [streaming_scan]}
 
 
-def test_collect_metadata_scans_union_disjoint_paths() -> None:
+def test_collect_metadata_table_groups_shared_table() -> None:
+    parquet_options = ParquetOptions(prefetch_file_metadata=True)
+    paths = ["left.parquet", "right.parquet"]
+    plan = IOPartitionPlan(1, IOPartitionFlavor.FUSED_FILES)
+    base = _make_parquet_scan(paths, parquet_options)
+    projected_base = Scan(
+        base.schema,
+        base.typ,
+        base.reader_options,
+        None,
+        base.paths,
+        ["x"],
+        base.skip_rows,
+        base.n_rows,
+        base.row_index,
+        base.include_file_paths,
+        base.predicate,
+        parquet_options,
+        None,
+    )
+    left = expand_scan_for_rank(
+        base,
+        plan,
+        2,
+        rank=0,
+        nranks=1,
+        parquet_options=parquet_options,
+    )
+    right = expand_scan_for_rank(
+        projected_base,
+        plan,
+        2,
+        rank=0,
+        nranks=1,
+        parquet_options=parquet_options,
+    )
+    union = Union(left.schema, None, False, left, right)  # noqa: FBT003
+    config_options = _make_prefetch_config(10_000)
+    partition_info: dict[IR, PartitionInfo] = {
+        left: PartitionInfo(count=2, io_plan=plan),
+        right: PartitionInfo(count=2, io_plan=plan),
+        union: PartitionInfo(count=4),
+    }
+    metadata_table_groups = collect_metadata_table_groups(
+        union,
+        partition_info=partition_info,
+        config_options=config_options,
+        nranks=1,
+    )
+    assert metadata_table_groups == {tuple(paths): [left, right]}
+
+
+def test_collect_metadata_table_groups_union_disjoint_paths() -> None:
     parquet_options = ParquetOptions(prefetch_file_metadata=True)
     plan = IOPartitionPlan(1, IOPartitionFlavor.FUSED_FILES)
     left = expand_scan_for_rank(
@@ -802,16 +854,19 @@ def test_collect_metadata_scans_union_disjoint_paths() -> None:
         right: PartitionInfo(count=1, io_plan=plan),
         union: PartitionInfo(count=2),
     }
-    metadata_scans = collect_metadata_scans(
+    metadata_table_groups = collect_metadata_table_groups(
         union,
         partition_info=partition_info,
         config_options=config_options,
         nranks=1,
     )
-    assert metadata_scans == [left, right]
+    assert metadata_table_groups == {
+        ("left.parquet",): [left],
+        ("right.parquet",): [right],
+    }
 
 
-def test_collect_metadata_scans_skips_empty_rank() -> None:
+def test_collect_metadata_table_groups_skips_empty_rank() -> None:
     parquet_options = ParquetOptions(prefetch_file_metadata=True)
     plan = IOPartitionPlan(3, IOPartitionFlavor.SINGLE_READ)
     paths = ["a.parquet", "b.parquet", "c.parquet"]
@@ -828,26 +883,24 @@ def test_collect_metadata_scans_skips_empty_rank() -> None:
     partition_info: dict[IR, PartitionInfo] = {
         streaming_scan: PartitionInfo(count=0, io_plan=plan),
     }
-    metadata_scans = collect_metadata_scans(
+    metadata_table_groups = collect_metadata_table_groups(
         streaming_scan,
         partition_info=partition_info,
         config_options=config_options,
         nranks=2,
     )
-    assert metadata_scans == []
+    assert metadata_table_groups == {}
 
 
 def test_recv_prefetched_parquet_metadata_handler_errors() -> None:
-    with pytest.raises(
-        AssertionError, match=r"Missing parquet metadata message for paths: .*"
-    ):
-        recv_prefetched_parquet_metadata_handler(None, ("file.parquet",))
+    with pytest.raises(AssertionError, match=r"Missing parquet metadata message"):
+        recv_prefetched_parquet_metadata_handler(None)
 
     msg = Message(
         0,
         ArbitraryChunk(
             MetadataMessagePayload(
-                group_key=("file.parquet",),
+                paths=("file.parquet",),
                 cached_parquet_info=[
                     # We don't use file_metadata, so just lie about it.
                     CachedParquetInfo(path="file.parquet", size=10, file_metadata=None)  # type: ignore[arg-type]
@@ -855,8 +908,21 @@ def test_recv_prefetched_parquet_metadata_handler_errors() -> None:
             )
         ),
     )
+    assert len(recv_prefetched_parquet_metadata_handler(msg)) == 1
+
+    bad_msg = Message(
+        0,
+        ArbitraryChunk(
+            MetadataMessagePayload(
+                paths=("file2.parquet",),
+                cached_parquet_info=[
+                    CachedParquetInfo(path="file.parquet", size=10, file_metadata=None)  # type: ignore[arg-type]
+                ],
+            )
+        ),
+    )
     with pytest.raises(
         AssertionError,
-        match=r"Unexpected parquet metadata key on scan input channel. .*",
+        match=r"Unexpected parquet metadata paths on scan input channel. .*",
     ):
-        recv_prefetched_parquet_metadata_handler(msg, ("file2.parquet",))
+        recv_prefetched_parquet_metadata_handler(bad_msg)

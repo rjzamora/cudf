@@ -59,8 +59,6 @@ class GenState(TypedDict):
         Statistics collector.
     collective_id_map
         The mapping of IR nodes to lists of collective IDs.
-    metadata_scans
-        Non-native parquet StreamingScan nodes that need metadata prefetch.
     metadata_channel_by_scan
         Mapping from each eligible StreamingScan node to its single metadata
         input channel.
@@ -75,7 +73,6 @@ class GenState(TypedDict):
     max_io_threads: int
     stats: StatsCollector
     collective_id_map: dict[IR, list[int]]
-    metadata_scans: list[StreamingScan]
     metadata_channel_by_scan: dict[
         StreamingScan, Channel[ArbitraryChunk[MetadataMessagePayload]]
     ]

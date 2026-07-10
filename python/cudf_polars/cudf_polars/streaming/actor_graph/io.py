@@ -11,7 +11,7 @@ import io
 import math
 import reprlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, NoReturn, TypeAlias, cast
 
 import polars as pl
 
@@ -84,14 +84,16 @@ if TYPE_CHECKING:
 
 
 MetadataChannel: TypeAlias = Channel[ArbitraryChunk["MetadataMessagePayload"]]
-MetadataChannelByScan: TypeAlias = dict[StreamingScan, MetadataChannel]
+MetadataTableKey: TypeAlias = tuple[str, ...]
+MetadataDependent: TypeAlias = tuple[tuple[str, ...], MetadataChannel]
+_PARQUET_METADATA_BATCH_SIZE = 32
 
 
 @dataclass(frozen=True)
 class MetadataMessagePayload:
     """Parquet metadata payload sent to scan actors."""
 
-    group_key: tuple[str, ...]
+    paths: tuple[str, ...]
     cached_parquet_info: list[CachedParquetInfo]
 
 
@@ -581,12 +583,14 @@ async def read_chunk(
 async def parquet_metadata_prefetch_node(
     context: Context,
     ir_context: IRExecutionContext,
-    ir: StreamingScan,
-    ch_out: Channel[ArbitraryChunk[MetadataMessagePayload]],
+    table_key: MetadataTableKey,
+    dependents: Sequence[MetadataDependent],
     stats: StatsCollector,
+    *,
+    trace_ir: StreamingScan,
 ) -> None:
     """
-    Fetch parquet metadata for each scan task and send it to the paired scan actor.
+    Fetch parquet metadata for a table and send path-keyed batches to scan actors.
 
     Parameters
     ----------
@@ -595,78 +599,147 @@ async def parquet_metadata_prefetch_node(
     ir_context
         The execution context for the IR node. Prefetching is offloaded to a thread from
         its thread pool.
-    ir
-        The StreamingScan node. This actor will send one a message per scan task in this
-        streaming scan node.
-    ch_out
-        The output channel. The Scan actor generated for this StreamingScan node will
-        read messages from this channel.
+    table_key
+        The full table path tuple, currently ``tuple(base_scan.paths)``.
+    dependents
+        Pairs of required path tuples and metadata channels for each scan actor
+        consuming metadata from this table actor.
     stats
         The statistics collector, used to populate the parquet metadata cache.
+    trace_ir
+        Representative scan node used for tracing / error logging.
 
     Notes
     -----
-    This actor emits one message per SplitScan / FusedScan in the streaming scan.
-    The messages are sent in the order of the scans.
+    This actor emits path-batch messages rather than messages aligned with
+    ``SplitScan`` / ``FusedScan`` tasks. Scan actors consume these messages into a
+    local path-keyed cache and assemble task-specific metadata locally.
     """
-    async with shutdown_on_error(context, ch_out, trace_ir=ir, ir_context=ir_context):
-        cached_by_key: dict[tuple[str, ...], list[CachedParquetInfo]] = {}
-        for scan in ir.scans:
-            scan = cast("SplitScan | FusedScan", scan)
-            key = tuple[str, ...](scan.paths)
-            if key not in cached_by_key:
-                cached_by_key[key] = await ir_context.to_thread(
+    channels = [channel for _, channel in dependents]
+    required_by_channel = [
+        (set(required_paths), channel) for required_paths, channel in dependents
+    ]
+    batches = [
+        table_key[start : start + _PARQUET_METADATA_BATCH_SIZE]
+        for start in range(0, len(table_key), _PARQUET_METADATA_BATCH_SIZE)
+    ]
+
+    async with shutdown_on_error(
+        context, *channels, trace_ir=trace_ir, ir_context=ir_context
+    ):
+        batch_tasks = [
+            asyncio.create_task(
+                ir_context.to_thread(
                     prefetch_cached_parquet_info_for_paths,
-                    list(key),
+                    list(batch),
                     stats=stats,
                 )
-            payload = MetadataMessagePayload(
-                group_key=key,
-                cached_parquet_info=cached_by_key[key],
             )
-            await ch_out.send(
-                context,
-                Message(0, ArbitraryChunk(payload)),
-            )
-        await ch_out.drain(context)
+            for batch in batches
+        ]
+        try:
+            for batch, task in zip(batches, batch_tasks, strict=True):
+                cached_parquet_info = await task
+                cached_by_path = {info.path: info for info in cached_parquet_info}
+                for required_paths, channel in required_by_channel:
+                    payload_info = [
+                        cached_by_path[path] for path in batch if path in required_paths
+                    ]
+                    if payload_info:
+                        payload = MetadataMessagePayload(
+                            paths=tuple(info.path for info in payload_info),
+                            cached_parquet_info=payload_info,
+                        )
+                        await channel.send(
+                            context,
+                            Message(0, ArbitraryChunk(payload)),
+                        )
+        finally:
+            for task in batch_tasks:
+                if not task.done():
+                    task.cancel()
+            for task in batch_tasks:
+                with contextlib.suppress(BaseException):
+                    await task
+
+        await gather_in_task_group(*(channel.drain(context) for channel in channels))
+
+
+def _scan_metadata_paths(scans: Sequence[SplitScan | FusedScan]) -> tuple[str, ...]:
+    """Return unique parquet paths required by scan tasks, preserving task order."""
+    return tuple(dict.fromkeys(path for scan in scans for path in scan.paths))
+
+
+def _fail_unfinished_metadata_futures(
+    futures_by_path: dict[str, asyncio.Future[CachedParquetInfo]],
+    exc: BaseException,
+) -> None:
+    """Propagate receiver failure to every unresolved path future."""
+    for future in futures_by_path.values():
+        if not future.done():
+            if isinstance(exc, asyncio.CancelledError):
+                future.cancel()
+            else:
+                future.set_exception(exc)
+
+
+def _raise_missing_metadata_error(
+    futures_by_path: dict[str, asyncio.Future[CachedParquetInfo]],
+) -> NoReturn:
+    """Raise an error naming paths whose metadata never arrived."""
+    missing = tuple(
+        path for path, future in futures_by_path.items() if not future.done()
+    )
+    raise AssertionError(
+        f"Missing parquet metadata message for paths: {reprlib.repr(missing)}"
+    )
+
+
+async def _receive_metadata_batches(
+    context: Context,
+    ch_metadata: Channel[ArbitraryChunk[MetadataMessagePayload]],
+    futures_by_path: dict[str, asyncio.Future[CachedParquetInfo]],
+) -> None:
+    """Receive path-batch metadata messages and resolve per-path futures."""
+    try:
+        while True:
+            msg = await recv_prefetched_parquet_metadata(context, ch_metadata)
+            if msg is None:
+                if any(not future.done() for future in futures_by_path.values()):
+                    _raise_missing_metadata_error(futures_by_path)
+                return
+            cached_parquet_info = recv_prefetched_parquet_metadata_handler(msg)
+            for info in cached_parquet_info:
+                future = futures_by_path.get(info.path)
+                if future is not None and not future.done():
+                    future.set_result(info)
+    except BaseException as exc:
+        _fail_unfinished_metadata_futures(futures_by_path, exc)
+        raise
 
 
 def _start_metadata_receiver(
     context: Context,
     ch_metadata: Channel[ArbitraryChunk[MetadataMessagePayload]],
     scans: Sequence[SplitScan | FusedScan],
-) -> tuple[list[asyncio.Future[list[CachedParquetInfo]]], asyncio.Task[None]]:
+) -> tuple[
+    dict[str, asyncio.Future[CachedParquetInfo]],
+    asyncio.Task[None],
+]:
     """
-    Receive metadata messages sequentially and expose one Future per scan task.
+    Receive metadata batches and expose one Future per parquet path.
 
-    A single receiver task preserves channel order while allowing concurrent
-    producers to await only the metadata for their assigned task index.
+    A single receiver task owns the channel, while concurrent producers await
+    the metadata for the paths needed by their assigned scan task.
     """
     loop = asyncio.get_running_loop()
-    futures = [loop.create_future() for _ in range(len(scans))]
-
-    async def _receive() -> None:
-        try:
-            for task_idx, scan in enumerate(scans):
-                msg = await recv_prefetched_parquet_metadata(context, ch_metadata)
-                cached = recv_prefetched_parquet_metadata_handler(
-                    msg, tuple(scan.paths)
-                )
-                futures[task_idx].set_result(cached)
-        except BaseException as exc:
-            # Propagate the failure (including cancellation / premature stop) to
-            # every unfinished future so downstream awaiters fail fast instead of
-            # hanging on metadata that will never arrive.
-            for future in futures:
-                if not future.done():
-                    if isinstance(exc, asyncio.CancelledError):
-                        future.cancel()
-                    else:
-                        future.set_exception(exc)
-            raise
-
-    receiver_task = asyncio.create_task(_receive())
-    return futures, receiver_task
+    futures_by_path = {
+        path: loop.create_future() for path in _scan_metadata_paths(scans)
+    }
+    receiver_task = asyncio.create_task(
+        _receive_metadata_batches(context, ch_metadata, futures_by_path)
+    )
+    return futures_by_path, receiver_task
 
 
 async def recv_prefetched_parquet_metadata(
@@ -679,19 +752,16 @@ async def recv_prefetched_parquet_metadata(
 
 def recv_prefetched_parquet_metadata_handler(
     msg: Message[ArbitraryChunk[MetadataMessagePayload]] | None,
-    group_key: tuple[str, ...],
 ) -> list[CachedParquetInfo]:
     """Synchronous handler for prefetched parquet metadata messages."""
     if msg is None:  # pragma: no cover; unreachable
-        raise AssertionError(
-            f"Missing parquet metadata message for paths: {reprlib.repr(group_key)}"
-        )
+        raise AssertionError("Missing parquet metadata message")
     payload = ArbitraryChunk[MetadataMessagePayload].from_message(msg).release()
-    if payload.group_key != group_key:  # pragma: no cover; unreachable
-        difference = set(group_key) ^ set(payload.group_key)
+    info_paths = tuple(info.path for info in payload.cached_parquet_info)
+    if payload.paths != info_paths:  # pragma: no cover; unreachable
         raise AssertionError(
-            "Unexpected parquet metadata key on scan input channel. "
-            f"{reprlib.repr(difference)}"
+            "Unexpected parquet metadata paths on scan input channel. "
+            f"payload={reprlib.repr(payload.paths)} info={reprlib.repr(info_paths)}"
         )
     return payload.cached_parquet_info
 
@@ -721,8 +791,7 @@ async def scan_node(
     ch_out
         The output Channel[TableChunk].
     ch_metadata
-        Optional channel carrying prefetched parquet metadata messages, one
-        per `SplitScan`/`FusedScan` in `ir.scans` order.
+        Optional channel carrying prefetched parquet metadata path batches.
     num_producers
         The number of producers to use for the scan node.
     estimated_chunk_bytes
@@ -730,19 +799,19 @@ async def scan_node(
         with block spilling to avoid thrashing.
     """
     scans = cast("Sequence[SplitScan | FusedScan]", ir.scans)
-    metadata_futures: list[asyncio.Future[list[CachedParquetInfo]]] | None = None
+    metadata_futures_by_path: dict[str, asyncio.Future[CachedParquetInfo]] | None = None
     _metadata_receiver_task: asyncio.Task[None] | None = None
     if ch_metadata is not None:
-        metadata_futures, _metadata_receiver_task = _start_metadata_receiver(
+        metadata_futures_by_path, _metadata_receiver_task = _start_metadata_receiver(
             context, ch_metadata, scans
         )
 
-    async def cached_parquet_info_for_task(
-        task_idx: int,
+    async def cached_parquet_info_for_scan(
+        scan: SplitScan | FusedScan,
     ) -> list[CachedParquetInfo] | None:
-        if metadata_futures is None:
+        if metadata_futures_by_path is None:
             return None
-        return await metadata_futures[task_idx]
+        return [await metadata_futures_by_path[path] for path in scan.paths]
 
     shutdown_channels: list[Channel[Any]] = [ch_out]
     if ch_metadata is not None:
@@ -771,7 +840,7 @@ async def scan_node(
             # skip the lineariser and read the chunks directly
             if len(scans) == 1 or num_producers == 1:
                 for seq_num, scan in enumerate(scans):
-                    cached_parquet_info = await cached_parquet_info_for_task(seq_num)
+                    cached_parquet_info = await cached_parquet_info_for_scan(scan)
                     await read_chunk(
                         context,
                         scan,
@@ -799,7 +868,7 @@ async def scan_node(
 
             async def _producer(producer_id: int, ch_out: Channel) -> None:
                 for task_idx, scan in producer_tasks[producer_id]:
-                    cached_parquet_info = await cached_parquet_info_for_task(task_idx)
+                    cached_parquet_info = await cached_parquet_info_for_scan(scan)
                     await read_chunk(
                         context,
                         scan,
@@ -1152,18 +1221,18 @@ def _(
     return nodes, channels
 
 
-def collect_metadata_scans(
+def collect_metadata_table_groups(
     ir: IR,
     *,
     partition_info: MutableMapping[IR, PartitionInfo],
     config_options: ConfigOptions,
     nranks: int,
-) -> list[StreamingScan]:
-    """Return non-native parquet StreamingScan nodes that need metadata prefetch."""
+) -> dict[MetadataTableKey, list[StreamingScan]]:
+    """Return table-keyed groups of StreamingScan nodes that need metadata prefetch."""
     if not config_options.parquet_options.prefetch_file_metadata:
-        return []
+        return {}
 
-    metadata_scans: list[StreamingScan] = []
+    metadata_table_groups: dict[MetadataTableKey, list[StreamingScan]] = {}
     for node in traversal([ir]):
         if not isinstance(node, StreamingScan):
             continue
@@ -1185,5 +1254,5 @@ def collect_metadata_scans(
         )
         if use_native:
             continue
-        metadata_scans.append(node)
-    return metadata_scans
+        metadata_table_groups.setdefault(tuple(node.base_scan.paths), []).append(node)
+    return metadata_table_groups

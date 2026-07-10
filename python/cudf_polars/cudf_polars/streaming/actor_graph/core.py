@@ -20,7 +20,7 @@ from cudf_polars.dsl.ir import (
 from cudf_polars.dsl.traversal import CachingVisitor, traversal
 from cudf_polars.streaming.actor_graph.dispatch import FanoutInfo
 from cudf_polars.streaming.actor_graph.io import (
-    collect_metadata_scans,
+    collect_metadata_table_groups,
     parquet_metadata_prefetch_node,
 )
 from cudf_polars.streaming.actor_graph.nodes import (
@@ -47,6 +47,10 @@ if TYPE_CHECKING:
     from cudf_polars.streaming.actor_graph.dispatch import (
         GenState,
         SubNetGenerator,
+    )
+    from cudf_polars.streaming.actor_graph.io import (
+        MetadataChannel,
+        MetadataDependent,
     )
     from cudf_polars.streaming.base import PartitionInfo, StatsCollector
     from cudf_polars.streaming.parallel import ConfigOptions
@@ -268,15 +272,24 @@ def generate_network(
     # Get max_io_threads from config (default: 2)
     max_io_threads_global = config_options.executor.max_io_threads
     max_io_threads_local = max(1, max_io_threads_global // max(1, num_io_nodes))
-    metadata_scans = collect_metadata_scans(
+    metadata_table_groups = collect_metadata_table_groups(
         ir,
         partition_info=partition_info,
         config_options=config_options,
         nranks=comm.nranks,
     )
-    metadata_channel_by_scan = {
-        scan: context.create_channel() for scan in metadata_scans
-    }
+    metadata_channel_by_scan: dict[StreamingScan, MetadataChannel] = {}
+    metadata_dependents_by_table: dict[tuple[str, ...], list[MetadataDependent]] = {}
+    for table_key, scans in metadata_table_groups.items():
+        dependents: list[MetadataDependent] = []
+        for scan in scans:
+            channel = context.create_channel()
+            metadata_channel_by_scan[scan] = channel
+            required_paths = tuple(
+                dict.fromkeys(path for task in scan.scans for path in task.paths)
+            )
+            dependents.append((required_paths, channel))
+        metadata_dependents_by_table[table_key] = dependents
 
     # Generate the network
     state: GenState = {
@@ -289,7 +302,6 @@ def generate_network(
         "max_io_threads": max_io_threads_local,
         "stats": stats,
         "collective_id_map": collective_id_map,
-        "metadata_scans": metadata_scans,
         "metadata_channel_by_scan": metadata_channel_by_scan,
     }
     mapper: SubNetGenerator = CachingVisitor(
@@ -301,11 +313,12 @@ def generate_network(
         parquet_metadata_prefetch_node(
             context,
             ir_context,
-            scan,
-            metadata_channel_by_scan[scan],
+            table_key,
+            dependents,
             stats,
+            trace_ir=metadata_table_groups[table_key][0],
         )
-        for scan in metadata_scans
+        for table_key, dependents in metadata_dependents_by_table.items()
     ]
 
     # Add node to drain metadata before pull_from_channel
