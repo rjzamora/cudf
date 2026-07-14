@@ -100,12 +100,16 @@ def _experimental_join_algo() -> (
     algo = os.getenv("CUDF_POLARS__EXPERIMENTAL__JOIN_ALGO", "").lower()
     if algo in ("", "dynamic"):
         return None
-    if algo not in ("shuffle", "broadcast_left", "broadcast_right"):
-        raise ValueError(
-            "CUDF_POLARS__EXPERIMENTAL__JOIN_ALGO must be one of "
-            "'shuffle', 'broadcast_left', 'broadcast_right', or 'dynamic'"
-        )
-    return algo
+    if algo == "shuffle":
+        return "shuffle"
+    if algo == "broadcast_left":
+        return "broadcast_left"
+    if algo == "broadcast_right":
+        return "broadcast_right"
+    raise ValueError(
+        "CUDF_POLARS__EXPERIMENTAL__JOIN_ALGO must be one of "
+        "'shuffle', 'broadcast_left', 'broadcast_right', or 'dynamic'"
+    )
 
 
 def _validate_experimental_broadcast_side(
@@ -376,6 +380,7 @@ async def _broadcast_join(
             ir,
             left_metadata.partitioning,
             child_ir=ir.children[0],
+            context=context,
         )
     else:
         small_ch, large_ch = ch_left, ch_right
@@ -387,6 +392,7 @@ async def _broadcast_join(
                 ir,
                 right_metadata.partitioning,
                 child_ir=ir.children[1],
+                context=context,
             )
             if ir.options[0] == "Right"
             else None
@@ -1247,8 +1253,14 @@ async def _choose_strategy(
 
     experimental_algo = _experimental_join_algo()
     if experimental_algo is not None:
-        left_sample = TableSizeStats(total_chunks=left_metadata.local_count)
-        right_sample = TableSizeStats(total_chunks=right_metadata.local_count)
+        left_sample = TableSizeStats(
+            chunks=ChunkStore(context),
+            total_chunks=left_metadata.local_count,
+        )
+        right_sample = TableSizeStats(
+            chunks=ChunkStore(context),
+            total_chunks=right_metadata.local_count,
+        )
         if experimental_algo == "shuffle":
             shuffle_modulus = max(
                 nranks,
@@ -1275,7 +1287,12 @@ async def _choose_strategy(
                 tracer.decision = f"experimental_broadcast_{broadcast_side}"
         return left_sample, right_sample, strategy
 
-    if left_partitioning.is_aligned_with(right_partitioning, context.br()):
+    hash_chunkwise = isinstance(
+        left_partitioning.inter_rank_scheme, HashScheme
+    ) and isinstance(right_partitioning.inter_rank_scheme, HashScheme)
+    if hash_chunkwise and left_partitioning.is_aligned_with(
+        right_partitioning, context.br()
+    ):
         # We can use a chunkwise join
         chunkwise = True
         left_sample = TableSizeStats(

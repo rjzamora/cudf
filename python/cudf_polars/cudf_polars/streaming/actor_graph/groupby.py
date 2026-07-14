@@ -63,12 +63,14 @@ def _experimental_groupby_algo() -> Literal["tree", "shuffle"] | None:
     algo = os.getenv("CUDF_POLARS__EXPERIMENTAL__GROUPBY_ALGO", "").lower()
     if algo in ("", "dynamic"):
         return None
-    if algo not in ("tree", "shuffle"):
-        raise ValueError(
-            "CUDF_POLARS__EXPERIMENTAL__GROUPBY_ALGO must be one of "
-            "'tree', 'shuffle', or 'dynamic'"
-        )
-    return algo
+    if algo == "tree":
+        return "tree"
+    if algo == "shuffle":
+        return "shuffle"
+    raise ValueError(
+        "CUDF_POLARS__EXPERIMENTAL__GROUPBY_ALGO must be one of "
+        "'tree', 'shuffle', or 'dynamic'"
+    )
 
 
 @dataclass
@@ -713,7 +715,10 @@ async def groupby_actor(
             metadata_out = ChannelMetadata(
                 local_count=metadata_in.local_count,
                 partitioning=maybe_remap_partitioning(
-                    ir, metadata_in.partitioning, child_ir=ir.children[0]
+                    ir,
+                    metadata_in.partitioning,
+                    child_ir=ir.children[0],
+                    context=context,
                 ),
                 duplicated=metadata_in.duplicated,
             )
