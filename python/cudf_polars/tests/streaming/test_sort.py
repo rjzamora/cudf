@@ -4,23 +4,16 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, cast
 
 import pytest
 
 import polars as pl
 
-import pylibcudf as plc
-from cudf_streaming.table_chunk import TableChunk
-
-from cudf_polars.containers import DataFrame, DataType
-from cudf_polars.dsl.ir import Empty, IRExecutionContext
+from cudf_polars.containers import DataType
+from cudf_polars.dsl.ir import Empty
 from cudf_polars.engine.options import StreamingOptions
-from cudf_polars.streaming.actor_graph.collectives.sort import (
-    _extract_partitions_and_send,
-)
-from cudf_polars.streaming.actor_graph.utils import gather_in_task_group
+from cudf_polars.streaming.actor_graph.collectives import sort as sort_collectives
 from cudf_polars.testing.asserts import assert_gpu_result_equal
 
 
@@ -106,60 +99,56 @@ def test_sort(df, engine):
 
 
 @pytest.mark.spmd
-def test_extract_partitions_and_send_preserves_empty_partitions(spmd_engine):
+def test_extract_partitions_and_send_preserves_empty_partitions(
+    spmd_engine, monkeypatch: pytest.MonkeyPatch
+):
     context = spmd_engine.context
     schema = {"x": DataType(pl.Int32())}
-    output: dict[int, pl.DataFrame] = {}
+    sent: list[tuple[int, Any]] = []
 
     class EmptyShuffle:
         def local_partitions(self):
             return range(3)
 
         def extract_chunk(self, partition_id, stream):
-            return plc.Table(
-                [
-                    plc.column_factories.make_empty_column(
-                        schema["x"].plc_type, stream=stream
-                    )
-                ]
-            )
+            return sort_collectives.empty_table_chunk(
+                Empty(schema), context, stream
+            ).table_view()
 
-    async def _run() -> None:
-        ch_out = context.create_channel()
+    class EmptyChannel:
+        drained = False
 
-        async def _consume() -> None:
-            while (msg := await ch_out.recv(context)) is not None:
-                chunk = TableChunk.from_message(msg, br=context.br())
-                output[msg.sequence_number] = DataFrame.from_table(
-                    chunk.table_view(),
-                    list(schema),
-                    list(schema.values()),
-                    chunk.stream,
-                ).to_polars()
+        async def drain(self, context) -> None:
+            self.drained = True
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            ir_context = IRExecutionContext(
-                executor, get_cuda_stream=context.br().stream_pool.get_stream
-            )
-            await gather_in_task_group(
-                _extract_partitions_and_send(
-                    context,
-                    ch_out,
-                    cast("Any", EmptyShuffle()),
-                    cast("Any", Empty(schema)),
-                    ir_context,
-                    schema,
-                    tracer=None,
-                ),
-                _consume(),
-            )
+    class IRContext:
+        def get_cuda_stream(self):
+            return context.br().stream_pool.get_stream()
 
-    asyncio.run(_run())
+    async def fake_send_chunk(context, ch_out, chunk, partition_id, *, tracer) -> None:
+        sent.append((partition_id, chunk))
 
-    assert set(output) == {0, 1, 2}
-    for result in output.values():
-        assert result.schema == {"x": pl.Int32}
-        assert result.height == 0
+    ch_out = EmptyChannel()
+    monkeypatch.setattr(sort_collectives, "send_chunk", fake_send_chunk)
+
+    asyncio.run(
+        sort_collectives._extract_partitions_and_send(
+            context,
+            cast("Any", ch_out),
+            cast("Any", EmptyShuffle()),
+            cast("Any", Empty(schema)),
+            cast("Any", IRContext()),
+            schema,
+            tracer=None,
+        )
+    )
+
+    assert ch_out.drained
+    assert [partition_id for partition_id, _ in sent] == [0, 1, 2]
+    for _, chunk in sent:
+        table = chunk.table_view()
+        assert table.num_rows() == 0
+        assert table.columns()[0].type() == schema["x"].plc_type
 
 
 @pytest.mark.parametrize("large_df,by,stable", list(large_frames()))

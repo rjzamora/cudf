@@ -60,7 +60,6 @@ from cudf_polars.streaming.sort import (
     find_sort_splits,
 )
 from cudf_polars.utils.cuda_stream import get_joined_cuda_stream
-from cudf_polars.utils.dtypes import make_empty_column
 
 if TYPE_CHECKING:
     from rapidsmpf.communicator.communicator import Communicator
@@ -421,6 +420,7 @@ async def _extract_partitions_and_send(
 ) -> None:
     """Extract each local partition from the shuffle, sort if needed, and send."""
     ncols_out = len(output_schema)
+    empty_ir = Empty(output_schema)
     for partition_id in shuffle.local_partitions():
         stream = ir_context.get_cuda_stream()
         table = shuffle.extract_chunk(partition_id, stream)
@@ -435,12 +435,10 @@ async def _extract_partitions_and_send(
                 ),
                 context=ir_context,
             ).table
-            if table.num_columns() > ncols_out:
-                table = plc.Table(table.columns()[:ncols_out])
         else:
-            table = plc.Table(
-                [make_empty_column(dtype, stream) for dtype in output_schema.values()]
-            )
+            table = empty_table_chunk(empty_ir, context, stream).table_view()
+        if table.num_columns() > ncols_out:
+            table = plc.Table(table.columns()[:ncols_out])
         chunk = TableChunk.from_pylibcudf_table(
             table, stream, exclusive_view=True, br=context.br()
         )
