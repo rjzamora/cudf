@@ -40,6 +40,10 @@ from cudf_polars.streaming.actor_graph.tracing import log_query_plan
 from cudf_polars.streaming.actor_graph.utils import empty_table_chunk
 from cudf_polars.streaming.base import StatsCollector
 from cudf_polars.streaming.parallel import lower_ir_graph_with_node_map
+from cudf_polars.streaming.partitioning_requests import (
+    OrderPartitioningRequest,
+    collect_partitioning_requests,
+)
 from cudf_polars.streaming.statistics import collect_statistics
 from cudf_polars.streaming.utils import _concat
 from cudf_polars.utils.config import Unspecified, get_total_device_memory
@@ -785,13 +789,22 @@ def evaluate_on_rank(
         py_executor, get_cuda_stream=ctx.br().stream_pool.get_stream, query_id=query_id
     )
 
+    partitioning_requests = collect_partitioning_requests(ir)
+    has_ordering_scan_request = any(
+        isinstance(request, OrderPartitioningRequest)
+        for requests in partitioning_requests.values()
+        for request in requests
+    )
     prefetch_file_metadata = config_options.parquet_options.prefetch_file_metadata
     if prefetch_file_metadata is not False:
         cached_parquet_info_map = prefetch_parquet_file_metadata_for_ir(
             ir,
             ir_context.py_executor,
             stats=stats,
-            remote_only=isinstance(prefetch_file_metadata, Unspecified),
+            remote_only=(
+                isinstance(prefetch_file_metadata, Unspecified)
+                and not has_ordering_scan_request
+            ),
         )
         attach_cached_parquet_metadata(ir, cached_parquet_info_map)
 

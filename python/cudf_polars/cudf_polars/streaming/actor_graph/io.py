@@ -13,7 +13,14 @@ from typing import TYPE_CHECKING, Any, cast
 
 import polars as pl
 
-from cudf_streaming.channel_metadata import ChannelMetadata
+import pylibcudf as plc
+from cudf_streaming.channel_metadata import (
+    ChannelMetadata,
+    OrderKey,
+    OrderScheme,
+    Ordering,
+    Partitioning,
+)
 from cudf_streaming.table_chunk import TableChunk
 from rapidsmpf.memory.memory_reservation import opaque_memory_usage
 from rapidsmpf.streaming.core.memory_reserve_or_wait import reserve_memory
@@ -22,6 +29,10 @@ from rapidsmpf.streaming.core.message import Message
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IR, DataFrameScan, PythonScan, Sink
 from cudf_polars.dsl.tracing import Scope, log
+from cudf_polars.dsl.utils.naming import names_to_indices
+from cudf_polars.streaming.actor_graph.collectives.sort import (
+    _extract_boundaries_from_endpoint_rows,
+)
 from cudf_polars.streaming.actor_graph.dispatch import generate_ir_sub_network
 from cudf_polars.streaming.actor_graph.nodes import define_actor, shutdown_on_error
 from cudf_polars.streaming.actor_graph.tracing import send_chunk
@@ -34,13 +45,16 @@ from cudf_polars.streaming.actor_graph.utils import (
     recv_metadata,
     send_metadata,
 )
+from cudf_polars.streaming.base import IOPartitionFlavor
 from cudf_polars.streaming.io import (
     StreamingScan,
     StreamingSink,
     _prepare_sink_directory,
     _sink_to_file,
 )
+from cudf_polars.streaming.partitioning_requests import OrderPartitioningRequest
 from cudf_polars.streaming.rank_aware_source import RankAwareSource
+from cudf_polars.utils import sorting
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -48,6 +62,7 @@ if TYPE_CHECKING:
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.streaming.core.channel import Channel
     from rapidsmpf.streaming.core.context import Context
+    from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.dsl.ir import IR, IRExecutionContext
     from cudf_polars.streaming.actor_graph.core import SubNetGenerator
@@ -57,6 +72,7 @@ if TYPE_CHECKING:
         PartitionInfo,
     )
     from cudf_polars.streaming.io import FusedScan, SplitScan
+    from cudf_polars.streaming.partitioning_requests import PartitioningRequest
 
 
 class Lineariser:
@@ -567,6 +583,166 @@ async def read_chunk(
     await send_chunk(context, ch_out, chunk, seq_num, tracer=tracer)
 
 
+def _scan_order_request(
+    requests: tuple[PartitioningRequest, ...],
+) -> OrderPartitioningRequest | None:
+    """Return the first ordering request, if one exists."""
+    for request in requests:
+        if isinstance(request, OrderPartitioningRequest):
+            return request
+    return None
+
+
+def _scan_path_groups(
+    ir: StreamingScan, plan: IOPartitionPlan
+) -> list[list[str]] | None:
+    """Return global path groups emitted by fused parquet scan partitions."""
+    if ir.base_scan.typ != "parquet" or plan.flavor == IOPartitionFlavor.SPLIT_FILES:
+        return None
+    paths = ir.base_scan.paths
+    return [
+        paths[offset : offset + plan.factor]
+        for offset in range(0, len(paths), plan.factor)
+    ]
+
+
+def _parquet_endpoint_rows_from_request(
+    ir: StreamingScan,
+    plan: IOPartitionPlan,
+    request: OrderPartitioningRequest,
+    stream: Stream,
+) -> tuple[list[OrderKey], plc.Table] | None:
+    """Build ordered endpoint rows from cached parquet row-group statistics."""
+    if len(request.keys) != 1 or ir.base_scan.cached_parquet_info is None:
+        return None
+
+    path_groups = _scan_path_groups(ir, plan)
+    if path_groups is None:
+        return None
+
+    key = request.keys[0]
+    try:
+        (column_index,) = names_to_indices((key.name,), ir.schema)
+    except ValueError:
+        return None
+
+    cached_info = ir.base_scan.cached_parquet_info
+    if len(cached_info) != len(ir.base_scan.paths):
+        return None
+    info_by_path = {info.path: info for info in cached_info}
+    if any(path not in info_by_path for group in path_groups for path in group):
+        return None
+
+    row_group_offsets = [0]
+    for info in cached_info:
+        row_group_offsets.append(
+            row_group_offsets[-1] + len(info.file_metadata.row_group_num_rows)
+        )
+
+    endpoint_indices: list[int] = []
+    path_to_index = {path: index for index, path in enumerate(ir.base_scan.paths)}
+    for group in path_groups:
+        start = row_group_offsets[path_to_index[group[0]]]
+        stop = row_group_offsets[path_to_index[group[-1]] + 1]
+        if start == stop:
+            return None
+        endpoint_indices.extend([start, stop - 1])
+
+    bounds = plc.io.parquet_metadata.read_parquet_column_chunk_bounds(
+        [info.file_metadata for info in cached_info],
+        columns=[key.name],
+        stream=stream,
+    )
+    _, _, min_column, max_column = bounds.columns()
+    if min_column.null_count() or max_column.null_count():
+        return None
+
+    endpoint_source = plc.concatenate.concatenate(
+        [
+            plc.Table([max_column if key.descending else min_column]),
+            plc.Table([min_column if key.descending else max_column]),
+        ],
+        stream=stream,
+    )
+    row_group_count = bounds.num_rows()
+    gather_indices = []
+    for start, stop in zip(endpoint_indices[::2], endpoint_indices[1::2], strict=True):
+        gather_indices.extend([start, row_group_count + stop])
+
+    endpoint_rows = plc.copying.gather(
+        endpoint_source,
+        plc.Column.from_iterable_of_py(
+            gather_indices,
+            plc.DataType(plc.TypeId.INT32),
+            stream=stream,
+        ),
+        plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+        stream=stream,
+    )
+    order, null_order = sorting.sort_order(
+        [key.descending], nulls_last=[key.nulls_last], num_keys=1
+    )
+    return [OrderKey(column_index, order[0], null_order[0])], endpoint_rows
+
+
+def _parquet_ordering_partitioning(
+    context: Context,
+    ir: StreamingScan,
+    partition_info: PartitionInfo,
+    requests: tuple[PartitioningRequest, ...],
+    ir_context: IRExecutionContext,
+) -> Partitioning | None:
+    """Extract scan ordering from cached parquet metadata, when safe."""
+    request = _scan_order_request(requests)
+    if request is None or partition_info.io_plan is None:
+        return None
+
+    stream = ir_context.get_cuda_stream()
+    result = _parquet_endpoint_rows_from_request(
+        ir,
+        partition_info.io_plan,
+        request,
+        stream,
+    )
+    if result is None:
+        return None
+
+    order_keys, endpoint_rows = result
+    column_order = [key.order for key in order_keys]
+    null_order = [key.null_order for key in order_keys]
+    if not plc.sorting.is_sorted(
+        endpoint_rows, column_order, null_order, stream=stream
+    ):
+        return None
+
+    num_partitions = endpoint_rows.num_rows() // 2
+    if num_partitions < 2:
+        boundaries = plc.Table(
+            [
+                plc.Column.from_iterable_of_py(
+                    [], endpoint_rows.columns()[0].type(), stream=stream
+                )
+            ]
+        )
+        strict = True
+    else:
+        boundaries, strict = _extract_boundaries_from_endpoint_rows(
+            endpoint_rows, num_partitions, stream
+        )
+    boundaries_chunk = TableChunk.from_pylibcudf_table(
+        boundaries,
+        stream,
+        exclusive_view=True,
+        br=context.br(),
+    )
+    return Partitioning(
+        inter_rank=OrderScheme(
+            [Ordering(order_keys, boundaries_chunk, strict_boundaries=strict)]
+        ),
+        local="inherit",
+    )
+
+
 @define_actor()
 async def scan_node(
     context: Context,
@@ -574,6 +750,8 @@ async def scan_node(
     ir_context: IRExecutionContext,
     ch_out: Channel[TableChunk],
     *,
+    partition_info: PartitionInfo,
+    partitioning_requests: tuple[PartitioningRequest, ...],
     num_producers: int,
     estimated_chunk_bytes: int,
 ) -> None:
@@ -590,6 +768,10 @@ async def scan_node(
         The execution context for the IR node.
     ch_out
         The output Channel[TableChunk].
+    partition_info
+        Partitioning information for this scan node.
+    partitioning_requests
+        Downstream partitioning requests for this scan node.
     num_producers
         The number of producers to use for the scan node.
     estimated_chunk_bytes
@@ -601,11 +783,17 @@ async def scan_node(
     async with shutdown_on_error(
         context, ch_out, trace_ir=ir, ir_context=ir_context
     ) as tracer:
-        # Send basic metadata
+        partitioning = _parquet_ordering_partitioning(
+            context,
+            ir,
+            partition_info,
+            partitioning_requests,
+            ir_context,
+        )
         await send_metadata(
             ch_out,
             context,
-            ChannelMetadata(local_count=len(scans)),
+            ChannelMetadata(local_count=len(scans), partitioning=partitioning),
         )
 
         # If there is nothing to scan, drain the channel and return
@@ -689,6 +877,8 @@ def _(
             ir,
             rec.state["ir_context"],
             ch_out,
+            partition_info=partition_info,
+            partitioning_requests=rec.state["partitioning_requests"].get(ir, ()),
             num_producers=num_producers,
             estimated_chunk_bytes=(
                 plan.estimated_chunk_bytes or executor.target_partition_size

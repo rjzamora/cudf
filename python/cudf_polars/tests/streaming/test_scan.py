@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import pytest
 
 import polars as pl
+
+import pylibcudf as plc
+from cudf_streaming.channel_metadata import OrderScheme
 
 from cudf_polars import Translator
 from cudf_polars.containers import DataType
@@ -22,10 +26,12 @@ from cudf_polars.dsl.utils.io import (
     prefetch_parquet_file_metadata_for_ir,
 )
 from cudf_polars.engine.options import StreamingOptions
+from cudf_polars.streaming.actor_graph.io import _parquet_ordering_partitioning
 from cudf_polars.streaming.base import (
     DataSourceInfo,
     IOPartitionFlavor,
     IOPartitionPlan,
+    PartitionInfo,
     StatsCollector,
 )
 from cudf_polars.streaming.io import (
@@ -36,6 +42,10 @@ from cudf_polars.streaming.io import (
     scan_partition_plan,
 )
 from cudf_polars.streaming.parallel import lower_ir_graph
+from cudf_polars.streaming.partitioning_requests import (
+    NamedOrderKey,
+    OrderPartitioningRequest,
+)
 from cudf_polars.streaming.statistics import collect_statistics
 from cudf_polars.testing.asserts import assert_gpu_result_equal
 from cudf_polars.testing.engine_utils import SMALL_MAX_ROWS_PER_PARTITION
@@ -45,10 +55,7 @@ from cudf_polars.utils.config import ConfigOptions, ParquetOptions
 if TYPE_CHECKING:
     import concurrent.futures
     from collections.abc import Callable
-    from pathlib import Path
     from typing import Any, Literal
-
-    import pylibcudf as plc
 
     import cudf_polars.engine.core
     from cudf_polars.engine.core import StreamingEngine
@@ -277,6 +284,63 @@ def _make_parquet_scan(
         parquet_options,
         None,
     )
+
+
+def test_parquet_scan_ordering_partitioning_from_cached_metadata(
+    tmp_path: Path, spmd_engine
+) -> None:
+    paths: list[str] = []
+    for i in range(3):
+        path = tmp_path / f"part-{i}.parquet"
+        pl.DataFrame({"x": range(i * 4, (i + 1) * 4)}).write_parquet(
+            path, row_group_size=2
+        )
+        paths.append(str(path))
+
+    scan = _make_parquet_scan(
+        paths, parquet_options=ParquetOptions(prefetch_file_metadata=True)
+    )
+    footers = plc.io.parquet_metadata.read_parquet_footers(plc.io.SourceInfo(paths))
+    cached = [
+        CachedParquetInfo(path, Path(path).stat().st_size, footer)
+        for path, footer in zip(paths, footers, strict=True)
+    ]
+    scan.cached_parquet_info = cached
+
+    plan = IOPartitionPlan(1, IOPartitionFlavor.SINGLE_FILE)
+    streaming_scan = StreamingScan.for_fused_files(
+        scan,
+        plan,
+        len(paths),
+        rank=spmd_engine.comm.rank,
+        nranks=spmd_engine.comm.nranks,
+        parquet_options=scan.parquet_options,
+    )
+    request = OrderPartitioningRequest(
+        (NamedOrderKey("x", descending=False, nulls_last=False),)
+    )
+    ir_context = IRExecutionContext(
+        get_cuda_stream=spmd_engine.context.br().stream_pool.get_stream
+    )
+
+    partitioning = _parquet_ordering_partitioning(
+        spmd_engine.context,
+        streaming_scan,
+        PartitionInfo(count=len(paths), io_plan=plan),
+        (request,),
+        ir_context,
+    )
+
+    assert partitioning is not None
+    assert partitioning.local == "inherit"
+    scheme = partitioning.inter_rank
+    assert isinstance(scheme, OrderScheme)
+    (ordering,) = scheme.orderings
+    assert ordering.strict_boundaries
+    assert ordering.num_boundaries == 2
+    assert ordering.get_boundaries(spmd_engine.context.br()).table_view().columns()[
+        0
+    ].to_pylist() == [4, 8]
 
 
 @pytest.mark.parametrize(
