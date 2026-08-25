@@ -13,6 +13,13 @@ import pytest
 
 import polars as pl
 
+import pylibcudf as plc
+from cudf_streaming.channel_metadata import (
+    OrderKey,
+    OrderScheme,
+    Ordering,
+    Partitioning,
+)
 from cudf_streaming.table_chunk import TableChunk
 
 from cudf_polars.containers import DataFrame
@@ -149,6 +156,32 @@ def test_dynamic_groupby_after_sort_on_group_keys(spmd_engine_factory, group_key
         .agg(pl.col("value").sum())
     )
     assert_gpu_result_equal(q, engine=streaming_engine)
+
+
+def test_groupby_ordered_adjust_accepts_nonstrict_prefix_ordering(
+    spmd_engine, strategy_chunk
+):
+    """A non-strict ordered prefix can be adjusted before final reduction."""
+    order = plc.types.Order.ASCENDING
+    null_order = plc.types.NullOrder.BEFORE
+    ordering = Ordering(
+        [OrderKey(0, order, null_order)],
+        strategy_chunk,
+        strict_boundaries=False,
+    )
+    partitioning = groupby_actor_graph.NormalizedPartitioning.from_keys(
+        Partitioning(OrderScheme([ordering]), "inherit"),
+        nranks=2,
+        keys=(0, 1),
+    )
+
+    assert not partitioning.is_ordered((0, 1), level="flat")
+    adjusted_ordering = groupby_actor_graph._input_ordering_for_groupby_adjustment(
+        partitioning
+    )
+    assert adjusted_ordering is not None
+    assert adjusted_ordering.keys == ordering.keys
+    assert adjusted_ordering.strict_boundaries == ordering.strict_boundaries
 
 
 def test_dynamic_groupby_single_group(streaming_engine):

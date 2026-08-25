@@ -29,7 +29,9 @@ from rapidsmpf.streaming.core.message import Message
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IR, DataFrameScan, PythonScan, Sink
 from cudf_polars.dsl.tracing import Scope, log
+from cudf_polars.dsl.utils.io import _prefetch_parquet_footers_for_paths
 from cudf_polars.dsl.utils.naming import names_to_indices
+from cudf_polars.streaming.actor_graph.collectives.allgather import AllGatherManager
 from cudf_polars.streaming.actor_graph.collectives.sort import (
     _extract_boundaries_from_endpoint_rows,
 )
@@ -55,6 +57,7 @@ from cudf_polars.streaming.io import (
 from cudf_polars.streaming.partitioning_requests import OrderPartitioningRequest
 from cudf_polars.streaming.rank_aware_source import RankAwareSource
 from cudf_polars.utils import sorting
+from cudf_polars.utils.dtypes import make_empty_column
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -65,6 +68,7 @@ if TYPE_CHECKING:
     from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.dsl.ir import IR, IRExecutionContext
+    from cudf_polars.dsl.utils.io import CachedParquetInfo
     from cudf_polars.streaming.actor_graph.core import SubNetGenerator
     from cudf_polars.streaming.actor_graph.tracing import ActorTracer
     from cudf_polars.streaming.base import (
@@ -593,66 +597,86 @@ def _scan_order_request(
     return None
 
 
-def _scan_path_groups(
-    ir: StreamingScan, plan: IOPartitionPlan
-) -> list[list[str]] | None:
-    """Return global path groups emitted by fused parquet scan partitions."""
-    if ir.base_scan.typ != "parquet" or plan.flavor == IOPartitionFlavor.SPLIT_FILES:
+def _empty_endpoint_table(
+    ir: StreamingScan, request: OrderPartitioningRequest, stream: Stream
+) -> plc.Table:
+    """Return an empty endpoint table for the requested ordering key."""
+    return plc.Table([make_empty_column(ir.schema[request.keys[0].name], stream)])
+
+
+def _cached_parquet_info_matches_paths(
+    cached_info: Sequence[CachedParquetInfo], paths: Sequence[str]
+) -> bool:
+    """Return whether cached parquet metadata exactly covers ``paths``."""
+    return [info.path for info in cached_info] == list(paths)
+
+
+async def _scan_cached_parquet_info(
+    scan: FusedScan | SplitScan,
+    ir_context: IRExecutionContext,
+    cache_by_paths: dict[tuple[str, ...], list[CachedParquetInfo]],
+) -> list[CachedParquetInfo]:
+    """Return cached parquet metadata for one local scan task."""
+    if scan.cached_parquet_info is not None:
+        cached = list(scan.cached_parquet_info)
+        if _cached_parquet_info_matches_paths(cached, scan.paths):
+            return cached
+        scan.cached_parquet_info = None
+        scan._non_child_args = (*scan._non_child_args[:-1], None)
+
+    paths_key = tuple(scan.paths)
+    cached_from_paths = cache_by_paths.get(paths_key)
+    if cached_from_paths is not None:
+        scan.cached_parquet_info = cached_from_paths
+        scan._non_child_args = (*scan._non_child_args[:-1], cached_from_paths)
+        return cached_from_paths
+
+    cached = await ir_context.to_thread(
+        _prefetch_parquet_footers_for_paths, list(scan.paths)
+    )
+    if not _cached_parquet_info_matches_paths(cached, scan.paths):
+        return []
+    cache_by_paths[paths_key] = cached
+    scan.cached_parquet_info = cached
+    scan._non_child_args = (*scan._non_child_args[:-1], cached)
+    return cached
+
+
+def _split_scan_row_group_range(
+    scan: SplitScan, cached_info: Sequence[CachedParquetInfo]
+) -> tuple[int, int] | None:
+    """Return the row-group range read by a row-group-aligned split scan."""
+    if len(cached_info) != 1:
         return None
-    paths = ir.base_scan.paths
-    return [
-        paths[offset : offset + plan.factor]
-        for offset in range(0, len(paths), plan.factor)
-    ]
+    total_row_groups = len(cached_info[0].file_metadata.row_group_num_rows)
+    if scan.total_splits > total_row_groups:
+        return None
+
+    rg_stride = total_row_groups // scan.total_splits
+    start = rg_stride * scan.split_index
+    stop = (
+        total_row_groups
+        if scan.split_index == scan.total_splits - 1
+        else start + rg_stride
+    )
+    return (start, stop) if start < stop else None
 
 
-def _parquet_endpoint_rows_from_request(
-    ir: StreamingScan,
-    plan: IOPartitionPlan,
+def _parquet_scan_endpoints_from_bounds(
+    bounds: plc.Table,
     request: OrderPartitioningRequest,
     stream: Stream,
-) -> tuple[list[OrderKey], plc.Table] | None:
-    """Build ordered endpoint rows from cached parquet row-group statistics."""
-    if len(request.keys) != 1 or ir.base_scan.cached_parquet_info is None:
-        return None
-
-    path_groups = _scan_path_groups(ir, plan)
-    if path_groups is None:
+    row_group_range: tuple[int, int] | None = None,
+) -> plc.Table | None:
+    """Extract one start/end endpoint pair from local parquet bounds."""
+    row_group_count = bounds.num_rows()
+    start, stop = (
+        row_group_range if row_group_range is not None else (0, row_group_count)
+    )
+    if row_group_count == 0 or not 0 <= start < stop <= row_group_count:
         return None
 
     key = request.keys[0]
-    try:
-        (column_index,) = names_to_indices((key.name,), ir.schema)
-    except ValueError:
-        return None
-
-    cached_info = ir.base_scan.cached_parquet_info
-    if len(cached_info) != len(ir.base_scan.paths):
-        return None
-    info_by_path = {info.path: info for info in cached_info}
-    if any(path not in info_by_path for group in path_groups for path in group):
-        return None
-
-    row_group_offsets = [0]
-    for info in cached_info:
-        row_group_offsets.append(
-            row_group_offsets[-1] + len(info.file_metadata.row_group_num_rows)
-        )
-
-    endpoint_indices: list[int] = []
-    path_to_index = {path: index for index, path in enumerate(ir.base_scan.paths)}
-    for group in path_groups:
-        start = row_group_offsets[path_to_index[group[0]]]
-        stop = row_group_offsets[path_to_index[group[-1]] + 1]
-        if start == stop:
-            return None
-        endpoint_indices.extend([start, stop - 1])
-
-    bounds = plc.io.parquet_metadata.read_parquet_column_chunk_bounds(
-        [info.file_metadata for info in cached_info],
-        columns=[key.name],
-        stream=stream,
-    )
     _, _, min_column, max_column = bounds.columns()
     if min_column.null_count() or max_column.null_count():
         return None
@@ -664,50 +688,123 @@ def _parquet_endpoint_rows_from_request(
         ],
         stream=stream,
     )
-    row_group_count = bounds.num_rows()
-    gather_indices = []
-    for start, stop in zip(endpoint_indices[::2], endpoint_indices[1::2], strict=True):
-        gather_indices.extend([start, row_group_count + stop])
-
-    endpoint_rows = plc.copying.gather(
+    return plc.copying.gather(
         endpoint_source,
         plc.Column.from_iterable_of_py(
-            gather_indices,
+            [start, row_group_count + stop - 1],
             plc.DataType(plc.TypeId.INT32),
             stream=stream,
         ),
         plc.copying.OutOfBoundsPolicy.DONT_CHECK,
         stream=stream,
     )
+
+
+async def _local_parquet_endpoint_rows_from_request(
+    ir: StreamingScan,
+    plan: IOPartitionPlan,
+    request: OrderPartitioningRequest,
+    ir_context: IRExecutionContext,
+    stream: Stream,
+) -> tuple[list[OrderKey], plc.Table] | None:
+    """Build rank-local ordered endpoint rows from parquet row-group statistics."""
+    if len(request.keys) != 1 or ir.base_scan.typ != "parquet":
+        return None
+
+    key = request.keys[0]
+    try:
+        (column_index,) = names_to_indices((key.name,), ir.schema)
+    except ValueError:
+        return None
     order, null_order = sorting.sort_order(
         [key.descending], nulls_last=[key.nulls_last], num_keys=1
     )
-    return [OrderKey(column_index, order[0], null_order[0])], endpoint_rows
+    order_keys = [OrderKey(column_index, order[0], null_order[0])]
+
+    scans = [cast("FusedScan | SplitScan", scan) for scan in ir.scans]
+    cache_by_paths: dict[tuple[str, ...], list[CachedParquetInfo]] = {}
+    cached_info_by_scan = [
+        await _scan_cached_parquet_info(scan, ir_context, cache_by_paths)
+        for scan in scans
+    ]
+    if any(
+        not _cached_parquet_info_matches_paths(cached_info, scan.paths)
+        for scan, cached_info in zip(scans, cached_info_by_scan, strict=True)
+    ):
+        return order_keys, _empty_endpoint_table(ir, request, stream)
+
+    endpoint_rows: list[plc.Table] = []
+    for scan, cached_info in zip(scans, cached_info_by_scan, strict=True):
+        row_group_range = (
+            _split_scan_row_group_range(cast("SplitScan", scan), cached_info)
+            if plan.flavor == IOPartitionFlavor.SPLIT_FILES
+            else None
+        )
+        if plan.flavor == IOPartitionFlavor.SPLIT_FILES and row_group_range is None:
+            return order_keys, _empty_endpoint_table(ir, request, stream)
+
+        bounds = plc.io.parquet_metadata.read_parquet_column_chunk_bounds(
+            [info.file_metadata for info in cached_info],
+            columns=[key.name],
+            stream=stream,
+        )
+        endpoints = _parquet_scan_endpoints_from_bounds(
+            bounds, request, stream, row_group_range
+        )
+        if endpoints is None:
+            return order_keys, _empty_endpoint_table(ir, request, stream)
+        endpoint_rows.append(endpoints)
+
+    return (
+        order_keys,
+        plc.concatenate.concatenate(endpoint_rows, stream=stream)
+        if endpoint_rows
+        else _empty_endpoint_table(ir, request, stream),
+    )
 
 
-def _parquet_ordering_partitioning(
+async def _parquet_ordering_partitioning(
     context: Context,
+    comm: Communicator,
     ir: StreamingScan,
     partition_info: PartitionInfo,
     requests: tuple[PartitioningRequest, ...],
     ir_context: IRExecutionContext,
+    collective_id: int | None,
 ) -> Partitioning | None:
-    """Extract scan ordering from cached parquet metadata, when safe."""
+    """Extract scan ordering from local parquet metadata, when safe."""
     request = _scan_order_request(requests)
     if request is None or partition_info.io_plan is None:
         return None
 
     stream = ir_context.get_cuda_stream()
-    result = _parquet_endpoint_rows_from_request(
+    result = await _local_parquet_endpoint_rows_from_request(
         ir,
         partition_info.io_plan,
         request,
+        ir_context,
         stream,
     )
     if result is None:
         return None
 
     order_keys, endpoint_rows = result
+    if comm.nranks > 1:
+        if collective_id is None:
+            return None
+        local_chunk = TableChunk.from_pylibcudf_table(
+            endpoint_rows, stream, exclusive_view=True, br=context.br()
+        )
+        allgather = AllGatherManager(context, comm, collective_id)
+        with allgather.inserting() as inserter:
+            inserter.insert(comm.rank, local_chunk)
+        endpoint_rows = await allgather.extract_concatenated(
+            stream, ordered=True, ir_context=ir_context
+        )
+
+    if endpoint_rows.num_rows() != 2 * partition_info.count:
+        return None
+
     column_order = [key.order for key in order_keys]
     null_order = [key.null_order for key in order_keys]
     if not plc.sorting.is_sorted(
@@ -715,7 +812,9 @@ def _parquet_ordering_partitioning(
     ):
         return None
 
-    num_partitions = endpoint_rows.num_rows() // 2
+    num_partitions = partition_info.count
+    if num_partitions == 0:
+        return None
     if num_partitions < 2:
         boundaries = plc.Table(
             [
@@ -746,12 +845,14 @@ def _parquet_ordering_partitioning(
 @define_actor()
 async def scan_node(
     context: Context,
+    comm: Communicator,
     ir: StreamingScan,
     ir_context: IRExecutionContext,
     ch_out: Channel[TableChunk],
     *,
     partition_info: PartitionInfo,
     partitioning_requests: tuple[PartitioningRequest, ...],
+    collective_id: int | None,
     num_producers: int,
     estimated_chunk_bytes: int,
 ) -> None:
@@ -762,6 +863,8 @@ async def scan_node(
     ----------
     context
         The rapidsmpf context.
+    comm
+        The communicator.
     ir
         The Scan node.
     ir_context
@@ -772,6 +875,8 @@ async def scan_node(
         Partitioning information for this scan node.
     partitioning_requests
         Downstream partitioning requests for this scan node.
+    collective_id
+        Collective ID used to allgather local parquet statistics.
     num_producers
         The number of producers to use for the scan node.
     estimated_chunk_bytes
@@ -783,12 +888,14 @@ async def scan_node(
     async with shutdown_on_error(
         context, ch_out, trace_ir=ir, ir_context=ir_context
     ) as tracer:
-        partitioning = _parquet_ordering_partitioning(
+        partitioning = await _parquet_ordering_partitioning(
             context,
+            comm,
             ir,
             partition_info,
             partitioning_requests,
             ir_context,
+            collective_id,
         )
         await send_metadata(
             ch_out,
@@ -874,11 +981,13 @@ def _(
     nodes[ir] = [
         scan_node(
             rec.state["context"],
+            rec.state["comm"],
             ir,
             rec.state["ir_context"],
             ch_out,
             partition_info=partition_info,
             partitioning_requests=rec.state["partitioning_requests"].get(ir, ()),
+            collective_id=next(iter(rec.state["collective_id_map"].get(ir, ())), None),
             num_producers=num_producers,
             estimated_chunk_bytes=(
                 plan.estimated_chunk_bytes or executor.target_partition_size

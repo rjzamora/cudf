@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
     from cudf_polars.dsl.ir import IRExecutionContext
     from cudf_polars.streaming.actor_graph.dispatch import SubNetGenerator
+    from cudf_polars.streaming.actor_graph.tracing import ActorTracer
 
 
 HintSortedOptions: TypeAlias = tuple[
@@ -130,10 +131,19 @@ async def extract_hint_sorted_metadata(
     metadata: ChannelMetadata,
     ch_in: Channel[TableChunk],
     ch_replay: Channel[TableChunk],
+    *,
+    tracer: ActorTracer | None = None,
 ) -> tuple[ChannelMetadata, Channel[TableChunk]]:
     """Resolve output metadata and the channel to forward for ``hint_sorted``."""
     keys = _hint_sorted_order_keys(ir)
-    if not keys or _metadata_satisfies_hint(metadata, keys):
+    if not keys:
+        if tracer is not None:
+            tracer.decision = "hint_sorted_empty"
+        return metadata, ch_in
+
+    if _metadata_satisfies_hint(metadata, keys):
+        if tracer is not None:
+            tracer.decision = "hint_sorted_existing"
         return metadata, ch_in
 
     # Future policy hook: use downstream partitioning hints to decide whether
@@ -146,6 +156,12 @@ async def extract_hint_sorted_metadata(
     # For now, only the trivial single-partition case can synthesize correct
     # strict boundaries without a collective.
     trivial_metadata = _trivial_ordering_metadata(context, comm, ir, metadata, keys)
+    if tracer is not None:
+        tracer.decision = (
+            "hint_sorted_skipped"
+            if trivial_metadata is None
+            else "hint_sorted_attached"
+        )
     return (metadata if trivial_metadata is None else trivial_metadata), ch_in
 
 
@@ -162,7 +178,7 @@ async def hint_sorted_actor(
     """Forward data and attach safe ordering metadata for ``hint_sorted``."""
     async with shutdown_on_error(
         context, ch_in, ch_replay, ch_out, trace_ir=ir, ir_context=ir_context
-    ):
+    ) as tracer:
         metadata = await recv_metadata(ch_in, context)
         metadata, ch_forward = await extract_hint_sorted_metadata(
             context,
@@ -172,6 +188,7 @@ async def hint_sorted_actor(
             metadata,
             ch_in,
             ch_replay,
+            tracer=tracer,
         )
         await send_metadata(ch_out, context, metadata)
         while (msg := await ch_forward.recv(context)) is not None:

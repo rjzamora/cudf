@@ -12,9 +12,13 @@ from rapidsmpf.shuffler import Shuffler
 
 from cudf_polars.dsl.ir import Distinct, GroupBy, Sort
 from cudf_polars.dsl.traversal import traversal
-from cudf_polars.streaming.io import StreamingSink
+from cudf_polars.streaming.io import StreamingScan, StreamingSink
 from cudf_polars.streaming.join import Join
 from cudf_polars.streaming.over import Over
+from cudf_polars.streaming.partitioning_requests import (
+    OrderPartitioningRequest,
+    collect_partitioning_requests,
+)
 from cudf_polars.streaming.repartition import Repartition
 from cudf_polars.streaming.shuffle import Shuffle
 
@@ -88,6 +92,7 @@ class ReserveOpIDs:
             config_options is not None
             and config_options.executor.dynamic_planning is not None
         )
+        partitioning_requests = collect_partitioning_requests(ir)
 
         # Find all collective IR nodes.
         collective_types: tuple[type, ...] = (
@@ -110,7 +115,16 @@ class ReserveOpIDs:
             )
 
         self.collective_nodes: list[IR] = [
-            node for node in traversal([ir]) if isinstance(node, collective_types)
+            node
+            for node in traversal([ir])
+            if isinstance(node, collective_types)
+            or (
+                isinstance(node, StreamingScan)
+                and any(
+                    isinstance(request, OrderPartitioningRequest)
+                    for request in partitioning_requests.get(node, ())
+                )
+            )
         ]
         self.collective_id_map: dict[IR, list[int]] = {}
 

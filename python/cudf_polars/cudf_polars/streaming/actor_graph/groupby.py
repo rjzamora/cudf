@@ -89,7 +89,9 @@ class DecomposedGroupBy:
     """The column indices to shuffle on."""
 
     @classmethod
-    def from_ir(cls, ir: GroupBy | Distinct) -> DecomposedGroupBy:
+    def from_ir(
+        cls, ir: GroupBy | Distinct, *, preserve_key_order: bool = False
+    ) -> DecomposedGroupBy:
         """Decompose a GroupBy IR node into multi-phase operations."""
         piecewise_ir: GroupBy | Distinct
         reduction_ir: GroupBy | Distinct
@@ -114,6 +116,7 @@ class DecomposedGroupBy:
                     )
                 )
             )
+            local_maintain_order = ir.maintain_order or preserve_key_order
 
             # Piecewise groupby schema and IR
             pwise_schema = {k.name: k.value.dtype for k in ir.keys} | {
@@ -123,7 +126,7 @@ class DecomposedGroupBy:
                 pwise_schema,
                 ir.keys,
                 piecewise_exprs,
-                ir.maintain_order,
+                local_maintain_order,
                 None,
                 ir.children[0],
             )
@@ -141,7 +144,7 @@ class DecomposedGroupBy:
                 reduction_schema,
                 groupby_keys,
                 reduction_exprs,
-                ir.maintain_order,
+                local_maintain_order,
                 None,
                 piecewise_ir,
             )
@@ -708,6 +711,22 @@ def _adjusted_ordering_metadata(
     )
 
 
+def _input_ordering_for_groupby_adjustment(
+    partitioning: NormalizedPartitioning,
+) -> Ordering | None:
+    """
+    Return the input ordering that can be made strict after local aggregation.
+
+    The ordering may cover only a prefix of the group keys. Making that prefix
+    strict is enough to co-locate every full group before the final reduction.
+    """
+    if partitioning.local_scheme != "inherit":
+        return None
+    if not isinstance(partitioning.inter_rank_scheme, OrderScheme):
+        return None
+    return partitioning.inter_rank_scheme.orderings[0]
+
+
 async def _choose_strategy(
     context: Context,
     comm: Communicator,
@@ -871,6 +890,9 @@ async def groupby_actor(
         partitioning_level: PartitioningLevel = (
             "local" if metadata_in.duplicated else "flat"
         )
+        stable_sorted_agg = isinstance(ir, GroupBy) and _has_stable_sorted_agg(
+            ir.agg_requests
+        )
         maintain_order = _maintain_order(ir)
         fully_partitioned = partitioning.is_strictly_partitioned(
             level=partitioning_level,
@@ -908,7 +930,19 @@ async def groupby_actor(
             )
             return
 
-        decomposed = DecomposedGroupBy.from_ir(ir)
+        input_ordering = (
+            None
+            if metadata_in.duplicated
+            else _input_ordering_for_groupby_adjustment(partitioning)
+        )
+        can_adjust_ordering = (
+            input_ordering is not None
+            and isinstance(ir, GroupBy)
+            and not stable_sorted_agg
+        )
+        decomposed = DecomposedGroupBy.from_ir(
+            ir, preserve_key_order=can_adjust_ordering
+        )
         assert not decomposed.need_preshuffle, "Should already be shuffled."
 
         aggregated, input_drained, chunks_received = await _local_aggregation(
@@ -917,7 +951,7 @@ async def groupby_actor(
             ir_context,
             ch_in,
             target_partition_size,
-            allow_early_exit=not maintain_order,
+            allow_early_exit=can_adjust_ordering or not maintain_order,
         )
 
         skip_global_comm = metadata_in.duplicated or isinstance(
@@ -933,7 +967,7 @@ async def groupby_actor(
             collective_ids,
             target_partition_size,
             skip_global_comm,
-            maintain_order,
+            maintain_order and not can_adjust_ordering,
             tracer,
         )
 
@@ -950,17 +984,8 @@ async def groupby_actor(
                 aggregated=aggregated,
                 tracer=tracer,
             )
-        elif (
-            # adjust_ordering requires row-ordered chunks. maintain_order=True
-            # preserves key order through local aggregation for ordered input.
-            maintain_order
-            and not metadata_in.duplicated
-            and partitioning.is_ordered(
-                group_keys,
-                level="flat",
-            )
-        ):
-            assert isinstance(partitioning.inter_rank_scheme, OrderScheme)
+        elif can_adjust_ordering:
+            assert input_ordering is not None
             await _ordered_adjust_reduce(
                 context,
                 comm,
@@ -973,7 +998,7 @@ async def groupby_actor(
                 target_partition_size,
                 aggregated=aggregated,
                 input_drained=input_drained,
-                input_ordering=partitioning.inter_rank_scheme.orderings[0],
+                input_ordering=input_ordering,
                 tracer=tracer,
             )
         else:
