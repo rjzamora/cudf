@@ -362,9 +362,11 @@ def clear_local_ordering(partitioning: Partitioning | None) -> Partitioning | No
     )
 
 
-def join_preserves_side_order(ir: Join, side: Literal["left", "right"]) -> bool:
+def join_preserves_side_order(
+    maintain_order: Literal["none", "left", "right", "left_right", "right_left"],
+    side: Literal["left", "right"],
+) -> bool:
     """Return True when join options preserve the requested input side's order."""
-    maintain_order = ir.options[5]
     return maintain_order == side or maintain_order.startswith(f"{side}_")
 
 

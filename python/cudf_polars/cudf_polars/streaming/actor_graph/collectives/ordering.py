@@ -44,11 +44,6 @@ _PID_DTYPE = DataType(pl.Int32())
 _PartitionRange = tuple[int, int]
 
 
-def get_strict_ordering(ordering: Ordering, _br: BufferResource) -> Ordering:
-    """Return an equivalent Ordering with strict boundaries."""
-    return ordering.as_strict()
-
-
 @dataclass(frozen=True)
 class _RoutingPlan:
     """Static ownership and exchange plan for one ordering adjustment."""

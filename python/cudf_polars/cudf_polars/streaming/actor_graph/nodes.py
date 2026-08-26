@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from cudf_streaming.channel_metadata import ChannelMetadata
 from cudf_streaming.table_chunk import (
@@ -57,8 +57,9 @@ def _preserves_local_order(ir: IR, partitioning_index: int | None = None) -> boo
     if isinstance(ir, Distinct):
         return ir.stable
     if isinstance(ir, Join) and partitioning_index is not None:
-        side: Literal["left", "right"] = "left" if partitioning_index == 0 else "right"
-        return join_preserves_side_order(ir, side)
+        if partitioning_index == 0:
+            return join_preserves_side_order(ir.options[5], "left")
+        return join_preserves_side_order(ir.options[5], "right")
     return True
 
 

@@ -330,7 +330,7 @@ async def _broadcast_join(
             child_ir=ir.children[0],
             context=context,
         )
-        if not join_preserves_side_order(ir, "left"):
+        if not join_preserves_side_order(ir.options[5], "left"):
             partitioning = clear_local_ordering(partitioning)
     else:
         small_ch, large_ch = ch_left, ch_right
@@ -347,7 +347,7 @@ async def _broadcast_join(
             if ir.options[0] == "Right"
             else None
         )
-        if not join_preserves_side_order(ir, "right"):
+        if not join_preserves_side_order(ir.options[5], "right"):
             partitioning = clear_local_ordering(partitioning)
 
     small_duplicated = small_metadata.duplicated

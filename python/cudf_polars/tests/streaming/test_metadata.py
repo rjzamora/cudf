@@ -6,8 +6,6 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -53,9 +51,6 @@ from cudf_polars.streaming.actor_graph.utils import (
 )
 from cudf_polars.utils.config import ConfigOptions
 from cudf_polars.utils.dtypes import make_empty_column
-
-if TYPE_CHECKING:
-    from cudf_polars.dsl.ir import Join
 
 
 @pytest.fixture(scope="module")
@@ -935,15 +930,11 @@ def test_clear_local_ordering_preserves_order_partitioning(spmd_engine):
         [
             _make_ordering(
                 spmd_engine.context,
-                key_indices=(0,),
                 strict=True,
-                locally_ordered=True,
             ),
             _make_ordering(
                 spmd_engine.context,
                 key_indices=(1,),
-                strict=False,
-                locally_ordered=True,
             ),
         ]
     )
@@ -979,12 +970,7 @@ def test_clear_local_ordering_preserves_order_partitioning(spmd_engine):
     ],
 )
 def test_join_preserves_side_order(maintain_order, side, expected) -> None:
-    ir = cast(
-        "Join",
-        SimpleNamespace(options=("Inner", False, None, "_right", True, maintain_order)),
-    )
-
-    assert join_preserves_side_order(ir, side) is expected
+    assert join_preserves_side_order(maintain_order, side) is expected
 
 
 @pytest.mark.parametrize(
@@ -1191,26 +1177,11 @@ def test_is_ordered(
     )
 
     ctx = spmd_engine.context
-    stream = ctx.br().stream_pool.get_stream()
-    keys = [OrderKey(i, asc, before) for i in range(scheme_key_count)]
-    boundary_chunk = TableChunk.from_pylibcudf_table(
-        DataFrame.from_polars(
-            pl.DataFrame({f"k{i}": [100, 200] for i in range(scheme_key_count)}),
-            stream,
-        ).table,
-        stream,
-        exclusive_view=False,
-        br=ctx.br(),
-    )
-    scheme = OrderScheme(
-        [
-            Ordering(
-                keys,
-                boundary_chunk,
-                strict_boundaries=strict_boundaries,
-                locally_ordered=locally_ordered,
-            )
-        ]
+    scheme = _make_order_scheme(
+        ctx,
+        key_indices=tuple(range(scheme_key_count)),
+        strict=strict_boundaries,
+        locally_ordered=locally_ordered,
     )
     meta = ChannelMetadata(
         3, partitioning=Partitioning(inter_rank=scheme, local="inherit")
