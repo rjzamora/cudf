@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 import pylibcudf as plc
-from cudf_streaming.channel_metadata import Ordering
 from cudf_streaming.partition_utils import (
     packed_data_from_cudf_packed_columns,
     unpack_and_concat,
@@ -30,6 +29,7 @@ from cudf_polars.streaming.actor_graph.utils import (
 from cudf_polars.utils.cuda_stream import stream_ordered_after
 
 if TYPE_CHECKING:
+    from cudf_streaming.channel_metadata import Ordering
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.memory.buffer_resource import BufferResource
     from rapidsmpf.memory.packed_data import PackedData
@@ -44,13 +44,9 @@ _PID_DTYPE = DataType(pl.Int32())
 _PartitionRange = tuple[int, int]
 
 
-def get_strict_ordering(ordering: Ordering, br: BufferResource) -> Ordering:
+def get_strict_ordering(ordering: Ordering, _br: BufferResource) -> Ordering:
     """Return an equivalent Ordering with strict boundaries."""
-    return Ordering(
-        ordering.keys,
-        ordering.get_boundaries(br),
-        strict_boundaries=True,
-    )
+    return ordering.as_strict()
 
 
 @dataclass(frozen=True)
@@ -202,6 +198,24 @@ def _split_points(
     )
 
 
+def _locally_sort_table(
+    table: plc.Table,
+    ordering: Ordering,
+    stream: Stream,
+    br: BufferResource,
+) -> plc.Table:
+    """Return ``table`` sorted by ``ordering`` keys."""
+    key_table = plc.Table([table.columns()[key.column_index] for key in ordering.keys])
+    return plc.sorting.sort_by_key(
+        table,
+        key_table,
+        [key.order for key in ordering.keys],
+        [key.null_order for key in ordering.keys],
+        stream=stream,
+        mr=br.device_mr,
+    )
+
+
 def _boundary_search_positions(
     input_boundary_table: plc.Table,
     output_boundary_table: plc.Table,
@@ -342,11 +356,13 @@ class _OutputPartitionBuffer:
         context: Context,
         ch_in: Channel[TableChunk],
         boundary_chunk: TableChunk,
+        input_ordering: Ordering,
         output_ordering: Ordering,
     ) -> None:
         self.context = context
         self.ch_in = ch_in
         self.boundary_chunk = boundary_chunk
+        self.input_ordering = input_ordering
         self.output_ordering = output_ordering
         self.pending: dict[int, ChunkStore] = {}
         self.input_done = False
@@ -380,6 +396,13 @@ class _OutputPartitionBuffer:
                 upstreams=(chunk.stream, self.boundary_chunk.stream),
             ) as stream:
                 table = chunk.table_view()
+                if not self.input_ordering.locally_ordered:
+                    table = _locally_sort_table(
+                        table,
+                        self.input_ordering,
+                        stream,
+                        self.context.br(),
+                    )
                 splits = _split_points(
                     table,
                     self.boundary_chunk.table_view(),
@@ -508,7 +531,9 @@ async def _adjust_ordering_impl(
     plan = _RoutingPlan.from_orderings(
         context, comm, input_ordering, output_ordering, output_boundaries
     )
-    buffer = _OutputPartitionBuffer(context, ch_in, output_boundaries, output_ordering)
+    buffer = _OutputPartitionBuffer(
+        context, ch_in, output_boundaries, input_ordering, output_ordering
+    )
 
     exchange = None
     if plan.remote_sources or plan.remote_destinations:

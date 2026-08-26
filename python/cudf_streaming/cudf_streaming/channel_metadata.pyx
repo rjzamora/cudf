@@ -128,7 +128,7 @@ cdef class OrderKey:
 
 
 cdef class Ordering:
-    """A valid ordering description for range-partitioned and optionally sorted data."""
+    """A valid ordering description for order-partitioned data."""
 
     def __init__(
         self,
@@ -186,7 +186,7 @@ cdef class Ordering:
 
     @property
     def locally_ordered(self) -> bool:
-        """Whether rows within each chunk are sorted by the ordering keys."""
+        """Whether rows within each partition are ordered by the ordering keys."""
         return self._handle.locally_ordered
 
     @property
@@ -219,7 +219,7 @@ cdef class Ordering:
             cpp_keys.push_back((<OrderKey?>key)._handle)
         return Ordering.from_cpp(self._handle.with_keys(move(cpp_keys)))
 
-    def with_locally_ordered(self, bint locally_ordered) -> Ordering:
+    def with_locally_ordered(self, *, bint locally_ordered) -> Ordering:
         """Return a new ``Ordering`` with updated local row-order metadata."""
         return Ordering.from_cpp(
             self._handle.with_locally_ordered(locally_ordered)
@@ -249,12 +249,12 @@ cdef class Ordering:
 
 
 cdef class OrderScheme:
-    """Order-based partitioning scheme for range-partitioned and optionally sorted data.
+    """Order-based partitioning scheme for order-partitioned data.
 
-    An OrderScheme advertises that the same stream is range-partitioned, and
-    may be locally sorted, with respect to any individual ``Ordering`` it
-    contains. Consumers should inspect the ``Ordering`` they intend to use for
-    keys, boundaries, strictness, and local row-order metadata.
+    An OrderScheme advertises that the same stream is order-partitioned with
+    respect to any individual ``Ordering`` it contains. Consumers should inspect
+    the ``Ordering`` they intend to use for keys, boundaries, strictness, and
+    local row-order metadata.
 
     Parameters
     ----------

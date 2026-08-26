@@ -340,6 +340,34 @@ def _update_ordering_indices(
     )
 
 
+def _clear_scheme_local_ordering(scheme: PartitioningScheme) -> PartitioningScheme:
+    """Return scheme with local row-order metadata cleared from any orderings."""
+    if isinstance(scheme, OrderScheme):
+        return OrderScheme(
+            tuple(
+                ordering.with_locally_ordered(locally_ordered=False)
+                for ordering in scheme.orderings
+            )
+        )
+    return scheme
+
+
+def clear_local_ordering(partitioning: Partitioning | None) -> Partitioning | None:
+    """Return partitioning with order/range metadata preserved but local row order cleared."""
+    if partitioning is None:
+        return None
+    return Partitioning(
+        inter_rank=_clear_scheme_local_ordering(partitioning.inter_rank),
+        local=_clear_scheme_local_ordering(partitioning.local),
+    )
+
+
+def join_preserves_side_order(ir: Join, side: Literal["left", "right"]) -> bool:
+    """Return True when join options preserve the requested input side's order."""
+    maintain_order = ir.options[5]
+    return maintain_order == side or maintain_order.startswith(f"{side}_")
+
+
 def _is_truncate_transparent_cast(expr: Cast) -> bool:
     src_id = expr.children[0].dtype.id()
     dst_id = expr.dtype.id()
@@ -454,6 +482,7 @@ def _derived_ordering(
         keys,
         boundaries,
         strict_boundaries=strict_boundaries,
+        locally_ordered=ordering.locally_ordered,
     )
 
 
@@ -1647,7 +1676,7 @@ def _leading_order_keys(metadata: ChannelMetadata | None) -> OrderingMetadata:
 
     candidates: dict[int, OrderKey | None] = {}
     for ordering in scheme.orderings:
-        if not ordering.keys:
+        if not ordering.locally_ordered or not ordering.keys:
             continue
         key = ordering.keys[0]
         current = candidates.get(key.column_index, key)

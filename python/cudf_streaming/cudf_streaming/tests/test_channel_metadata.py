@@ -271,7 +271,7 @@ def test_ordering_with_keys(context: Context) -> None:
 def test_ordering_with_locally_ordered(context: Context) -> None:
     """with_locally_ordered shares boundaries and updates local row-order metadata."""
     ordering = _two_key_order_scheme(context).orderings[0]
-    unordered = ordering.with_locally_ordered(False)
+    unordered = ordering.with_locally_ordered(locally_ordered=False)
     assert unordered.keys == ordering.keys
     assert unordered.num_boundaries == ordering.num_boundaries
     assert unordered.strict_boundaries == ordering.strict_boundaries

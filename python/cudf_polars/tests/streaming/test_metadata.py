@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -45,10 +47,15 @@ from cudf_polars.streaming.actor_graph.utils import (
     NormalizedPartitioning,
     _apply_ordering_metadata,
     _leading_order_keys,
+    clear_local_ordering,
+    join_preserves_side_order,
     maybe_remap_partitioning,
 )
 from cudf_polars.utils.config import ConfigOptions
 from cudf_polars.utils.dtypes import make_empty_column
+
+if TYPE_CHECKING:
+    from cudf_polars.dsl.ir import Join
 
 
 @pytest.fixture(scope="module")
@@ -504,7 +511,14 @@ def test_remap_partitioning_reorder_columns_projection(streaming_engine) -> None
     assert result.inter_rank.modulus == 8
 
 
-def _make_ordering(context, *, key_indices=(0,), values=(100, 200), strict=False):
+def _make_ordering(
+    context,
+    *,
+    key_indices=(0,),
+    values=(100, 200),
+    strict=False,
+    locally_ordered=True,
+):
     stream = context.br().stream_pool.get_stream()
     df = DataFrame.from_polars(
         pl.DataFrame({f"k{i}": list(values) for i in key_indices}), stream
@@ -514,12 +528,32 @@ def _make_ordering(context, *, key_indices=(0,), values=(100, 200), strict=False
     )
     asc, before = plc.types.Order.ASCENDING, plc.types.NullOrder.BEFORE
     keys = [OrderKey(i, asc, before) for i in key_indices]
-    return Ordering(keys, chunk, strict_boundaries=strict)
+    return Ordering(
+        keys,
+        chunk,
+        strict_boundaries=strict,
+        locally_ordered=locally_ordered,
+    )
 
 
-def _make_order_scheme(context, *, key_indices=(0,), values=(100, 200), strict=False):
+def _make_order_scheme(
+    context,
+    *,
+    key_indices=(0,),
+    values=(100, 200),
+    strict=False,
+    locally_ordered=True,
+):
     return OrderScheme(
-        [_make_ordering(context, key_indices=key_indices, values=values, strict=strict)]
+        [
+            _make_ordering(
+                context,
+                key_indices=key_indices,
+                values=values,
+                strict=strict,
+                locally_ordered=locally_ordered,
+            )
+        ]
     )
 
 
@@ -590,6 +624,24 @@ def test_apply_ordering_metadata_marks_leading_key_only(spmd_engine) -> None:
 
     assert result.column_map["a"].is_sorted == plc.types.Sorted.YES
     assert result.column_map["b"].is_sorted == plc.types.Sorted.NO
+
+
+def test_apply_ordering_metadata_ignores_locally_unordered_ordering(
+    spmd_engine,
+) -> None:
+    stream = spmd_engine.context.br().stream_pool.get_stream()
+    df = DataFrame.from_polars(pl.DataFrame({"a": [2, 1, 3]}), stream)
+    scheme = _make_order_scheme(
+        spmd_engine.context, key_indices=(0,), locally_ordered=False
+    )
+    metadata = ChannelMetadata(
+        local_count=1,
+        partitioning=Partitioning(scheme, local="inherit"),
+    )
+
+    result = _apply_ordering_metadata(df, _leading_order_keys(metadata))
+
+    assert result.column_map["a"].is_sorted == plc.types.Sorted.NO
 
 
 def test_apply_ordering_metadata_ignores_inter_rank_ordering_if_local_hash(
@@ -878,6 +930,63 @@ def test_remap_partitioning_order_scheme_adds_alias_ordering(spmd_engine):
     assert [o.strict_boundaries for o in result.inter_rank.orderings] == [True, True]
 
 
+def test_clear_local_ordering_preserves_order_partitioning(spmd_engine):
+    order_scheme = OrderScheme(
+        [
+            _make_ordering(
+                spmd_engine.context,
+                key_indices=(0,),
+                strict=True,
+                locally_ordered=True,
+            ),
+            _make_ordering(
+                spmd_engine.context,
+                key_indices=(1,),
+                strict=False,
+                locally_ordered=True,
+            ),
+        ]
+    )
+    part = Partitioning(inter_rank=order_scheme, local="inherit")
+
+    result = clear_local_ordering(part)
+
+    assert result is not None
+    assert isinstance(result.inter_rank, OrderScheme)
+    assert result.local == "inherit"
+    assert [
+        tuple(key.column_index for key in ordering.keys)
+        for ordering in result.inter_rank.orderings
+    ] == [(0,), (1,)]
+    assert [o.strict_boundaries for o in result.inter_rank.orderings] == [
+        True,
+        False,
+    ]
+    assert [o.locally_ordered for o in result.inter_rank.orderings] == [
+        False,
+        False,
+    ]
+
+
+@pytest.mark.parametrize(
+    "maintain_order,side,expected",
+    [
+        ("none", "left", False),
+        ("left", "left", True),
+        ("right", "left", False),
+        ("left_right", "left", True),
+        ("right_left", "right", True),
+    ],
+)
+def test_join_preserves_side_order(maintain_order, side, expected) -> None:
+    ir = cast(
+        "Join",
+        SimpleNamespace(options=("Inner", False, None, "_right", True, maintain_order)),
+    )
+
+    assert join_preserves_side_order(ir, side) is expected
+
+
 @pytest.mark.parametrize(
     "frequency,expected",
     [
@@ -1051,15 +1160,19 @@ def test_sort_output_metadata(spmd_engine_factory, by, descending, nulls_last) -
 
 
 @pytest.mark.parametrize(
-    "scheme_key_count,strict_boundaries,expected",
+    "scheme_key_count,strict_boundaries,locally_ordered,expected",
     [
-        (1, True, True),  # prefix match + strict → sorted
-        (1, False, False),  # prefix match + non-strict → not sorted
-        (2, True, True),  # exact match + strict → sorted
-        (2, False, True),  # exact match + non-strict → sorted
+        (1, True, True, True),  # prefix match + strict boundaries
+        (1, True, False, True),  # local order is not required for partitioning
+        (1, False, True, False),  # prefix match + non-strict boundaries
+        (2, True, True, True),  # exact match
+        (2, True, False, True),  # local order is not required for partitioning
+        (2, False, True, True),  # exact match + non-strict boundaries
     ],
 )
-def test_is_ordered(spmd_engine, scheme_key_count, strict_boundaries, expected) -> None:
+def test_is_ordered(
+    spmd_engine, scheme_key_count, strict_boundaries, locally_ordered, expected
+) -> None:
     df_lf = pl.LazyFrame({"x": list(range(5)), "y": list(range(5))})
     base_ir = Translator(df_lf._ldf.visit(), spmd_engine).translate_ir()
     asc, before = plc.types.Order.ASCENDING, plc.types.NullOrder.BEFORE
@@ -1090,7 +1203,14 @@ def test_is_ordered(spmd_engine, scheme_key_count, strict_boundaries, expected) 
         br=ctx.br(),
     )
     scheme = OrderScheme(
-        [Ordering(keys, boundary_chunk, strict_boundaries=strict_boundaries)]
+        [
+            Ordering(
+                keys,
+                boundary_chunk,
+                strict_boundaries=strict_boundaries,
+                locally_ordered=locally_ordered,
+            )
+        ]
     )
     meta = ChannelMetadata(
         3, partitioning=Partitioning(inter_rank=scheme, local="inherit")

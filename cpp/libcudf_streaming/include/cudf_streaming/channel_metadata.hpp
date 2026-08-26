@@ -60,7 +60,7 @@ struct order_key {
 };
 
 /**
- * @brief A valid ordering description for range-partitioned and optionally sorted data.
+ * @brief A valid ordering description for order-partitioned data.
  *
  * Data is partitioned by value ranges based on predetermined boundaries.
  * For N partitions, there are N-1 boundary rows:
@@ -78,9 +78,9 @@ struct order_key {
  * half-open key range (partition keys do not straddle chunk interiors). When false,
  * a chunk may contain keys spanning multiple partitions.
  *
- * `locally_ordered`: when true, rows within each chunk are sorted by `keys`. When false,
- * boundaries may still describe the range partitioning, but row order inside chunks is
- * not guaranteed.
+ * `locally_ordered`: when true, rows within each partition at this level are ordered by
+ * `keys`. When false, partitions are still ordered across partition boundaries, but row
+ * order within a partition is not guaranteed.
  */
 struct ordering {
   std::vector<order_key> keys;              ///< Sort keys (column, order, null_order per entry).
@@ -125,7 +125,7 @@ struct ordering {
   /**
    * @brief Return a new ordering with updated local row-order metadata.
    *
-   * @param locally_ordered Whether rows within each chunk are sorted by `keys`.
+   * @param locally_ordered Whether rows within each partition are ordered by `keys`.
    * @return A new ordering with the same keys, boundaries, and strictness.
    */
   [[nodiscard]] ordering with_locally_ordered(bool locally_ordered) const;
@@ -144,12 +144,11 @@ struct ordering {
 };
 
 /**
- * @brief Order-based partitioning scheme for range-partitioned and optionally sorted data.
+ * @brief Order-based partitioning scheme for order-partitioned data.
  *
- * An order_scheme advertises that the same stream is range-partitioned, and
- * may be locally sorted, with respect to any individual ordering it contains.
- * Consumers are responsible for selecting the ordering that is relevant to a
- * particular operation.
+ * An order_scheme advertises that the same stream is order-partitioned with
+ * respect to any individual ordering it contains. Consumers are responsible for
+ * selecting the ordering that is relevant to a particular operation.
  */
 struct order_scheme {
   std::vector<ordering> orderings;  ///< Ordering descriptions valid for the stream.

@@ -42,6 +42,7 @@ from cudf_polars.streaming.actor_graph.utils import (
     allgather_and_reduce,
     allgather_reduce,
     chunkwise_evaluate,
+    clear_local_ordering,
     empty_table_chunk,
     evaluate_batch,
     evaluate_chunk,
@@ -886,14 +887,17 @@ async def groupby_actor(
         if fully_partitioned or fallback_case:
             if tracer is not None:
                 tracer.decision = "chunkwise"
+            output_partitioning = maybe_remap_partitioning(
+                ir,
+                metadata_in.partitioning,
+                child_ir=ir.children[0],
+                context=context,
+            )
+            if not maintain_order:
+                output_partitioning = clear_local_ordering(output_partitioning)
             metadata_out = ChannelMetadata(
                 local_count=metadata_in.local_count,
-                partitioning=maybe_remap_partitioning(
-                    ir,
-                    metadata_in.partitioning,
-                    child_ir=ir.children[0],
-                    context=context,
-                ),
+                partitioning=output_partitioning,
                 duplicated=metadata_in.duplicated,
             )
             await chunkwise_evaluate(
