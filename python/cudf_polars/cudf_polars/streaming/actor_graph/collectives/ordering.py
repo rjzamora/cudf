@@ -14,8 +14,9 @@ from cudf_streaming.partition_utils import (
     packed_data_from_cudf_packed_columns,
     unpack_and_concat,
 )
-from cudf_streaming.table_chunk import TableChunk
+from cudf_streaming.table_chunk import TableChunk, make_table_chunks_available_or_wait
 from pylibcudf.contiguous_split import pack
+from rapidsmpf.memory.memory_reservation import opaque_memory_usage
 from rapidsmpf.streaming.coll.sparse_alltoall import SparseAlltoall
 from rapidsmpf.streaming.core.message import Message
 
@@ -151,11 +152,6 @@ def _validate_orderings(input_ordering: Ordering, output_ordering: Ordering) -> 
     """Validate the Ordering pair supported by this data-movement primitive."""
     if not output_ordering.strict_boundaries:
         raise ValueError("adjust_ordering requires strict output boundaries.")
-    if output_ordering.locally_ordered and not input_ordering.locally_ordered:
-        raise ValueError(
-            "adjust_ordering cannot guarantee locally ordered output from "
-            "locally unordered input."
-        )
     prefix_len = len(output_ordering.keys)
     if input_ordering.keys[:prefix_len] != output_ordering.keys:
         raise NotImplementedError(
@@ -458,6 +454,45 @@ def _store_chunk(
     stores[pid].insert(Message(pid, chunk))
 
 
+async def _assemble_partition(
+    context: Context,
+    schema_ir: IR,
+    ir_context: IRExecutionContext,
+    chunks: list[TableChunk],
+    ordering: Ordering,
+) -> TableChunk:
+    """Assemble pieces for one output partition."""
+    if not chunks:
+        return empty_table_chunk(schema_ir, context, ir_context.get_cuda_stream())
+    if not ordering.locally_ordered:
+        return await concat_batch(chunks, context, schema_ir.schema, ir_context)
+
+    chunks, extra = await make_table_chunks_available_or_wait(
+        context,
+        chunks,
+        reserve_extra=sum(chunk.data_alloc_size() for chunk in chunks),
+        net_memory_delta=0,
+    )
+    with opaque_memory_usage(extra):
+        if len(chunks) == 1:
+            return chunks[0]
+        stream = ir_context.get_cuda_stream()
+        table = plc.merge.merge(
+            [chunk.table_view() for chunk in chunks],
+            [key.column_index for key in ordering.keys],
+            [key.order for key in ordering.keys],
+            [key.null_order for key in ordering.keys],
+            stream=stream,
+            mr=context.br().device_mr,
+        )
+        return TableChunk.from_pylibcudf_table(
+            table,
+            stream,
+            exclusive_view=True,
+            br=context.br(),
+        )
+
+
 async def _send_remote_partition(
     context: Context,
     comm: Communicator,
@@ -467,6 +502,7 @@ async def _send_remote_partition(
     npartitions: int,
     pid: int,
     store: ChunkStore | None,
+    output_ordering: Ordering,
 ) -> None:
     """Send one packed payload for one remote-owned output partition."""
     chunks = (
@@ -474,10 +510,12 @@ async def _send_remote_partition(
         if store is not None
         else []
     )
-    chunk = (
-        await concat_batch(chunks, context, schema_ir.schema, ir_context)
-        if chunks
-        else empty_table_chunk(schema_ir, context, ir_context.get_cuda_stream())
+    chunk = await _assemble_partition(
+        context,
+        schema_ir,
+        ir_context,
+        chunks,
+        output_ordering,
     )
     stream = chunk.stream
     exchange.insert(
@@ -501,6 +539,7 @@ async def _emit_partition(
     ch_out: Channel[TableChunk],
     pid: int,
     store: ChunkStore | None,
+    output_ordering: Ordering,
 ) -> None:
     """Emit one output partition, using an empty chunk when no data is present."""
     chunks = (
@@ -508,10 +547,12 @@ async def _emit_partition(
         if store is not None
         else []
     )
-    chunk = (
-        await concat_batch(chunks, context, schema_ir.schema, ir_context)
-        if chunks
-        else empty_table_chunk(schema_ir, context, ir_context.get_cuda_stream())
+    chunk = await _assemble_partition(
+        context,
+        schema_ir,
+        ir_context,
+        chunks,
+        output_ordering,
     )
     await ch_out.send(context, Message(pid, chunk))
 
@@ -581,6 +622,7 @@ async def _adjust_ordering_impl(
                 plan.npartitions,
                 pid,
                 piece,
+                output_ordering,
             )
         elif owner == comm.rank and piece is not None:
             local_pieces[pid] = piece
@@ -592,6 +634,7 @@ async def _adjust_ordering_impl(
                 ch_out,
                 pid,
                 local_pieces.pop(pid, None),
+                output_ordering,
             )
 
     if exchange is not None:
@@ -631,10 +674,12 @@ async def _adjust_ordering_impl(
             chunks.extend(
                 TableChunk.from_message(msg, br=context.br()) for msg in pid_store
             )
-        chunk = (
-            await concat_batch(chunks, context, schema_ir.schema, ir_context)
-            if chunks
-            else empty_table_chunk(schema_ir, context, ir_context.get_cuda_stream())
+        chunk = await _assemble_partition(
+            context,
+            schema_ir,
+            ir_context,
+            chunks,
+            output_ordering,
         )
         await ch_out.send(context, Message(pid, chunk))
     await buffer.assert_input_drained()
@@ -682,8 +727,9 @@ async def adjust_ordering(
     This utility is intentionally narrow and only adjusts data messages. The
     caller is responsible for receiving input metadata and sending output
     metadata. Input rows are assumed to be order-partitioned by
-    ``input_ordering``. Locally unordered chunks are sorted before splitting,
-    but complete output partitions are not sorted again after assembly.
+    ``input_ordering``. Locally unordered chunks are sorted before splitting.
+    When ``output_ordering.locally_ordered`` is true, sorted pieces are merged
+    before emission so complete output partitions are locally ordered.
 
     The current implementation requires contiguous partition ownership, strict
     output boundaries, and output keys that are a prefix of the input keys.

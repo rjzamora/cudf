@@ -253,35 +253,6 @@ def test_adjust_ordering_rejects_invalid_orderings(
 
 
 @pytest.mark.spmd
-def test_adjust_ordering_rejects_ordered_output_for_locally_unordered_input(
-    spmd_engine: SPMDEngine,
-) -> None:
-    context = spmd_engine.context
-    stream = context.br().stream_pool.get_stream()
-    input_ordering = _make_ordering(
-        context,
-        4,
-        locally_ordered=False,
-        stream=stream,
-    )
-    output_ordering = _make_ordering(context, 4, stream=stream)
-
-    with (
-        pytest.raises(ValueError, match="locally ordered output"),
-        reserve_op_id() as op_id,
-    ):
-        asyncio.run(
-            _adjust_direct(
-                context,
-                spmd_engine.comm,
-                input_ordering,
-                output_ordering,
-                collective_id=op_id,
-            )
-        )
-
-
-@pytest.mark.spmd
 @pytest.mark.parametrize(
     "target_boundary,expected",
     [
@@ -580,12 +551,7 @@ def test_adjust_ordering_locally_sorts_unordered_input(
         locally_ordered=False,
         stream=stream,
     )
-    output_ordering = _make_ordering(
-        context,
-        4,
-        locally_ordered=False,
-        stream=stream,
-    )
+    output_ordering = _make_ordering(context, 4, stream=stream)
     with reserve_op_id() as op_id:
         output = asyncio.run(
             _adjust_and_collect(
@@ -602,7 +568,7 @@ def test_adjust_ordering_locally_sorts_unordered_input(
 
 
 @pytest.mark.spmd
-def test_adjust_ordering_locally_unordered_multi_chunk_output(
+def test_adjust_ordering_merges_locally_unordered_multi_chunk_output(
     spmd_engine: SPMDEngine,
 ) -> None:
     context = spmd_engine.context
@@ -617,12 +583,7 @@ def test_adjust_ordering_locally_unordered_multi_chunk_output(
         locally_ordered=False,
         stream=stream,
     )
-    output_ordering = _make_ordering(
-        context,
-        4,
-        locally_ordered=False,
-        stream=stream,
-    )
+    output_ordering = _make_ordering(context, 4, stream=stream)
     with reserve_op_id() as op_id:
         output = asyncio.run(
             _adjust_and_collect(
@@ -635,7 +596,7 @@ def test_adjust_ordering_locally_unordered_multi_chunk_output(
             )
         )
 
-    _assert_partition_output(output, {0: [0, 3, 1, 2], 1: [5, 7, 4, 6]})
+    _assert_partition_output(output, {0: [0, 1, 2, 3], 1: [4, 5, 6, 7]})
 
 
 @pytest.mark.spmd
