@@ -558,6 +558,7 @@ async def _ordered_adjust_reduce(
     aggregated: TableChunk,
     input_drained: bool,
     input_ordering: Ordering,
+    maintain_order: bool,
     tracer: ActorTracer | None = None,
 ) -> None:
     """Adjust locally aggregated data to strict ordering boundaries."""
@@ -565,6 +566,10 @@ async def _ordered_adjust_reduce(
         input_ordering,
         decomposed.shuffle_indices[: len(input_ordering.keys)],
     )
+    if not maintain_order:
+        partial_input_ordering = partial_input_ordering.with_locally_ordered(
+            locally_ordered=False
+        )
     partial_output_ordering = partial_input_ordering.as_strict()
     ch_local = context.create_channel()
     ch_adjusted = context.create_channel()
@@ -954,15 +959,9 @@ async def groupby_actor(
                 aggregated=aggregated,
                 tracer=tracer,
             )
-        elif (
-            # adjust_ordering requires row-ordered chunks. maintain_order=True
-            # preserves key order through local aggregation for ordered input.
-            maintain_order
-            and not metadata_in.duplicated
-            and partitioning.is_ordered(
-                group_keys,
-                level="flat",
-            )
+        elif not metadata_in.duplicated and partitioning.is_ordered(
+            group_keys,
+            level="flat",
         ):
             assert isinstance(partitioning.inter_rank_scheme, OrderScheme)
             await _ordered_adjust_reduce(
@@ -978,6 +977,7 @@ async def groupby_actor(
                 aggregated=aggregated,
                 input_drained=input_drained,
                 input_ordering=partitioning.inter_rank_scheme.orderings[0],
+                maintain_order=maintain_order,
                 tracer=tracer,
             )
         else:

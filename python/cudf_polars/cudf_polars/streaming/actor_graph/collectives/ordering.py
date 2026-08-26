@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Adjust streams between concrete Ordering boundary layouts without sorting."""
+"""Adjust streams between concrete Ordering boundary layouts."""
 
 from __future__ import annotations
 
@@ -368,10 +368,11 @@ class _OutputPartitionBuffer:
 
         Notes
         -----
-        This reads ordered input chunks until the requested output partition
-        is complete. All pieces produced by those chunks are held in a
-        spillable container, and pieces for later output partitions remain
-        cached for later calls.
+        This reads order-partitioned input chunks until the requested output
+        partition is complete. Locally unordered chunks are sorted before they
+        are split. All pieces produced by those chunks are held in a spillable
+        container, and pieces for later output partitions remain cached for
+        later calls.
         """
         stop = pid + 1
         while not self.input_done and not any(
