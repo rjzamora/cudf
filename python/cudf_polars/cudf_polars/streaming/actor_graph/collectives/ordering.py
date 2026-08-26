@@ -151,6 +151,11 @@ def _validate_orderings(input_ordering: Ordering, output_ordering: Ordering) -> 
     """Validate the Ordering pair supported by this data-movement primitive."""
     if not output_ordering.strict_boundaries:
         raise ValueError("adjust_ordering requires strict output boundaries.")
+    if output_ordering.locally_ordered and not input_ordering.locally_ordered:
+        raise ValueError(
+            "adjust_ordering cannot guarantee locally ordered output from "
+            "locally unordered input."
+        )
     prefix_len = len(output_ordering.keys)
     if input_ordering.keys[:prefix_len] != output_ordering.keys:
         raise NotImplementedError(
@@ -676,8 +681,9 @@ async def adjust_ordering(
     -----
     This utility is intentionally narrow and only adjusts data messages. The
     caller is responsible for receiving input metadata and sending output
-    metadata. Input rows are assumed to be globally ordered by ``input_ordering``;
-    sortedness is not checked here.
+    metadata. Input rows are assumed to be order-partitioned by
+    ``input_ordering``. Locally unordered chunks are sorted before splitting,
+    but complete output partitions are not sorted again after assembly.
 
     The current implementation requires contiguous partition ownership, strict
     output boundaries, and output keys that are a prefix of the input keys.

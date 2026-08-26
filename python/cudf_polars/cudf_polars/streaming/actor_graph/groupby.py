@@ -480,6 +480,7 @@ def _groupby_output_metadata(
     duplicated: bool,  # noqa: FBT001
     *,
     context: Context,
+    preserves_output_order: bool,
 ) -> ChannelMetadata:
     """Return groupby output metadata after final reduction/select."""
     partitioning = maybe_remap_partitioning(
@@ -502,6 +503,8 @@ def _groupby_output_metadata(
             child_ir=ir.children[0],
             context=context,
         )
+    if not preserves_output_order:
+        partitioning = clear_local_ordering(partitioning)
     return ChannelMetadata(
         local_count=local_count,
         partitioning=partitioning,
@@ -558,7 +561,7 @@ async def _ordered_adjust_reduce(
     aggregated: TableChunk,
     input_drained: bool,
     input_ordering: Ordering,
-    maintain_order: bool,
+    preserves_output_order: bool,
     tracer: ActorTracer | None = None,
 ) -> None:
     """Adjust locally aggregated data to strict ordering boundaries."""
@@ -566,7 +569,7 @@ async def _ordered_adjust_reduce(
         input_ordering,
         decomposed.shuffle_indices[: len(input_ordering.keys)],
     )
-    if not maintain_order:
+    if not preserves_output_order:
         partial_input_ordering = partial_input_ordering.with_locally_ordered(
             locally_ordered=False
         )
@@ -583,6 +586,7 @@ async def _ordered_adjust_reduce(
         adjusted_metadata.partitioning,
         adjusted_metadata.duplicated,
         context=context,
+        preserves_output_order=preserves_output_order,
     )
     if tracer is not None:
         tracer.decision = "adjust_ordering"
@@ -691,6 +695,13 @@ def _maintain_order(ir: GroupBy | Distinct) -> bool:
             plc.stream_compaction.DuplicateKeepOption.KEEP_FIRST,
             plc.stream_compaction.DuplicateKeepOption.KEEP_LAST,
         )
+
+
+def _preserves_output_order(ir: GroupBy | Distinct) -> bool:
+    if isinstance(ir, GroupBy):
+        return ir.maintain_order
+    else:
+        return ir.stable
 
 
 def _partition_count_for_rank(rank: int, nranks: int, npartitions: int) -> int:
@@ -878,6 +889,7 @@ async def groupby_actor(
             "local" if metadata_in.duplicated else "flat"
         )
         maintain_order = _maintain_order(ir)
+        preserves_output_order = _preserves_output_order(ir)
         fully_partitioned = partitioning.is_strictly_partitioned(
             level=partitioning_level,
         )
@@ -898,7 +910,7 @@ async def groupby_actor(
                 child_ir=ir.children[0],
                 context=context,
             )
-            if not maintain_order:
+            if not preserves_output_order:
                 output_partitioning = clear_local_ordering(output_partitioning)
             metadata_out = ChannelMetadata(
                 local_count=metadata_in.local_count,
@@ -977,7 +989,7 @@ async def groupby_actor(
                 aggregated=aggregated,
                 input_drained=input_drained,
                 input_ordering=partitioning.inter_rank_scheme.orderings[0],
-                maintain_order=maintain_order,
+                preserves_output_order=preserves_output_order,
                 tracer=tracer,
             )
         else:
