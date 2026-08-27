@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # TODO: remove need for this
 # ruff: noqa: D101
@@ -14,13 +14,22 @@ import pylibcudf as plc
 
 from cudf_polars.containers import Column
 from cudf_polars.dsl.nodebase import Node
+from cudf_polars.dsl.traversal import traversal
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from typing import Self
 
     from cudf_polars.containers import Column, DataFrame, DataType
 
-__all__ = ["Col", "ColRef", "ExecutionContext", "Expr", "NamedExpr"]
+__all__ = [
+    "Col",
+    "ColRef",
+    "ExecutionContext",
+    "Expr",
+    "NamedExpr",
+    "exprs_are_pointwise",
+]
 
 
 class ExecutionContext(IntEnum):
@@ -266,3 +275,8 @@ class ColRef(Expr):
         raise NotImplementedError(
             "Only expect this node as part of an expression translated to libcudf AST."
         )
+
+
+def exprs_are_pointwise(exprs: Sequence[Expr]) -> bool:
+    """Return True when every expression maps row ``i`` of input to row ``i`` of output."""
+    return all(e.is_pointwise for e in traversal(exprs))

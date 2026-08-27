@@ -50,7 +50,6 @@ from cudf_polars.dsl.expressions.base import ExecutionContext
 from cudf_polars.dsl.nodebase import Node
 from cudf_polars.dsl.to_ast import _DECIMAL_IDS, to_ast, to_parquet_filter
 from cudf_polars.dsl.tracing import log_do_evaluate, nvtx_annotate_cudf_polars
-from cudf_polars.dsl.traversal import traversal
 from cudf_polars.dsl.utils.naming import unique_names
 from cudf_polars.dsl.utils.reshape import broadcast
 from cudf_polars.dsl.utils.windows import (
@@ -204,11 +203,6 @@ class _SortedAggRequest:
 
     name: str
     value: expr.SortedAgg
-
-
-def _exprs_are_pointwise(exprs: Sequence[expr.NamedExpr]) -> bool:
-    """Return True when every expression maps row ``i`` of input to row ``i`` of output."""
-    return all(e.is_pointwise for e in traversal([ne.value for ne in exprs]))
 
 
 def apply_predicate(df: DataFrame, predicate: expr.NamedExpr | None) -> DataFrame:
@@ -1807,7 +1801,7 @@ class Select(IR):
     @property
     def preserves_output_order(self) -> bool:
         """Whether the selected expressions keep input appearance order."""
-        return _exprs_are_pointwise(self.exprs)
+        return expr.exprs_are_pointwise([e.value for e in self.exprs])
 
     @staticmethod
     def _is_len_expr(exprs: tuple[expr.NamedExpr, ...]) -> bool:  # pragma: no cover
@@ -3203,7 +3197,7 @@ class HStack(IR):
     @property
     def preserves_output_order(self) -> bool:
         """Whether the stacked expressions keep input appearance order."""
-        return _exprs_are_pointwise(self.columns)
+        return expr.exprs_are_pointwise([e.value for e in self.columns])
 
     @classmethod
     @log_do_evaluate
