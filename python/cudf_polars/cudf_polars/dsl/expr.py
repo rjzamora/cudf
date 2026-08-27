@@ -20,7 +20,6 @@ from cudf_polars.dsl.expressions.base import (
     ErrorExpr,
     Expr,
     NamedExpr,
-    exprs_are_pointwise,
 )
 from cudf_polars.dsl.expressions.binaryop import BinOp
 from cudf_polars.dsl.expressions.boolean import BooleanFunction
@@ -69,5 +68,4 @@ __all__ = [
     "TemporalFunction",
     "Ternary",
     "UnaryFunction",
-    "exprs_are_pointwise",
 ]

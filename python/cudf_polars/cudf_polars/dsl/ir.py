@@ -1801,7 +1801,7 @@ class Select(IR):
     @property
     def preserves_output_order(self) -> bool:
         """Whether the selected expressions keep input appearance order."""
-        return expr.exprs_are_pointwise([e.value for e in self.exprs])
+        return all(e.all_pointwise() for e in self.exprs)
 
     @staticmethod
     def _is_len_expr(exprs: tuple[expr.NamedExpr, ...]) -> bool:  # pragma: no cover
@@ -3197,7 +3197,7 @@ class HStack(IR):
     @property
     def preserves_output_order(self) -> bool:
         """Whether the stacked expressions keep input appearance order."""
-        return expr.exprs_are_pointwise([e.value for e in self.columns])
+        return all(e.all_pointwise() for e in self.columns)
 
     @classmethod
     @log_do_evaluate

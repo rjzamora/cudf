@@ -17,19 +17,11 @@ from cudf_polars.dsl.nodebase import Node
 from cudf_polars.dsl.traversal import traversal
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
     from typing import Self
 
     from cudf_polars.containers import Column, DataFrame, DataType
 
-__all__ = [
-    "Col",
-    "ColRef",
-    "ExecutionContext",
-    "Expr",
-    "NamedExpr",
-    "exprs_are_pointwise",
-]
+__all__ = ["Col", "ColRef", "ExecutionContext", "Expr", "NamedExpr"]
 
 
 class ExecutionContext(IntEnum):
@@ -117,6 +109,10 @@ class Expr(Node["Expr"]):
             are not perfect.
         """
         return self.do_evaluate(df, context=context)
+
+    def all_pointwise(self) -> bool:
+        """Return True when this expression and all descendants are pointwise."""
+        return all(e.is_pointwise for e in traversal([self]))
 
     @property
     def agg_request(self) -> plc.aggregation.Aggregation:
@@ -208,6 +204,10 @@ class NamedExpr:
         """
         return self.value.evaluate(df, context=context).rename(self.name)
 
+    def all_pointwise(self) -> bool:
+        """Return True when the underlying expression tree is pointwise."""
+        return self.value.all_pointwise()
+
     def reconstruct(self, expr: Expr) -> Self:
         """
         Rebuild with a new `Expr` value.
@@ -275,8 +275,3 @@ class ColRef(Expr):
         raise NotImplementedError(
             "Only expect this node as part of an expression translated to libcudf AST."
         )
-
-
-def exprs_are_pointwise(exprs: Sequence[Expr]) -> bool:
-    """Return True when every expression maps row ``i`` of input to row ``i`` of output."""
-    return all(e.is_pointwise for e in traversal(exprs))
