@@ -50,6 +50,7 @@ from cudf_polars.dsl.expressions.base import ExecutionContext
 from cudf_polars.dsl.nodebase import Node
 from cudf_polars.dsl.to_ast import _DECIMAL_IDS, to_ast, to_parquet_filter
 from cudf_polars.dsl.tracing import log_do_evaluate, nvtx_annotate_cudf_polars
+from cudf_polars.dsl.traversal import traversal
 from cudf_polars.dsl.utils.naming import unique_names
 from cudf_polars.dsl.utils.reshape import broadcast
 from cudf_polars.dsl.utils.windows import (
@@ -205,6 +206,11 @@ class _SortedAggRequest:
     value: expr.SortedAgg
 
 
+def _exprs_are_pointwise(exprs: Sequence[expr.NamedExpr]) -> bool:
+    """Return True when every expression maps row ``i`` of input to row ``i`` of output."""
+    return all(e.is_pointwise for e in traversal([ne.value for ne in exprs]))
+
+
 def apply_predicate(df: DataFrame, predicate: expr.NamedExpr | None) -> DataFrame:
     """Filter ``df`` by a predicate expression."""
     if predicate is None:
@@ -250,18 +256,21 @@ class IR(Node["IR"]):
     _non_child_args: tuple[Any, ...]
     # The number of non-child arguments to pass to do_evaluate.
     _n_non_child_args: ClassVar[int]
+    # Class-level opt-in for :attr:`preserves_output_order`.
+    _preserves_output_order: ClassVar[bool] = False
     schema: Schema
     """Mapping from column names to their data types."""
 
     @property
     def preserves_output_order(self) -> bool:
         """
-        Whether this node guarantees that output rows keep input appearance order.
+        Whether output rows appear in the same relative order as this node's input.
 
-        The default is conservative (``False``). Nodes whose contract
-        preserves row order should override this.
+        Only meaningful for nodes with a single input. Multi-input nodes
+        (``Join``, ``Union``) need per-child reasoning and are handled by
+        their streaming actors.
         """
-        return False
+        return self._preserves_output_order
 
     def get_hashable(self) -> Hashable:
         """
@@ -1570,6 +1579,7 @@ class Cache(IR):
     Used for CSE at the plan level.
     """
 
+    _preserves_output_order: ClassVar[bool] = True
     __slots__ = ("key", "refcount")
     _non_child = ("schema", "key", "refcount")
     _n_non_child_args = 2
@@ -1794,6 +1804,11 @@ class Select(IR):
         ):  # pragma: no cover
             raise NotImplementedError(f"Unsupported scan type: {df.typ}")
 
+    @property
+    def preserves_output_order(self) -> bool:
+        """Whether the selected expressions keep input appearance order."""
+        return _exprs_are_pointwise(self.exprs)
+
     @staticmethod
     def _is_len_expr(exprs: tuple[expr.NamedExpr, ...]) -> bool:  # pragma: no cover
         if len(exprs) == 1:
@@ -1923,6 +1938,7 @@ class Reduce(IR):
 class Rolling(IR):
     """Perform a (possibly grouped) rolling aggregation."""
 
+    _preserves_output_order: ClassVar[bool] = True
     __slots__ = (
         "agg_requests",
         "closed_window",
@@ -3184,6 +3200,11 @@ class HStack(IR):
         self._non_child_args = (self.columns, self.should_broadcast)
         self.children = (df,)
 
+    @property
+    def preserves_output_order(self) -> bool:
+        """Whether the stacked expressions keep input appearance order."""
+        return _exprs_are_pointwise(self.columns)
+
     @classmethod
     @log_do_evaluate
     @nvtx_annotate_cudf_polars(message="HStack")
@@ -3401,6 +3422,7 @@ class Sort(IR):
 class Slice(IR):
     """Slice a dataframe."""
 
+    _preserves_output_order: ClassVar[bool] = True
     __slots__ = ("length", "offset")
     _non_child = ("schema", "offset", "length")
     _n_non_child_args = 2
@@ -3429,6 +3451,7 @@ class Slice(IR):
 class Filter(IR):
     """Filter a dataframe with a boolean mask."""
 
+    _preserves_output_order: ClassVar[bool] = True
     __slots__ = ("mask",)
     _non_child = ("schema", "mask")
     _n_non_child_args = 1
@@ -3454,6 +3477,7 @@ class Filter(IR):
 class Projection(IR):
     """Select a subset of columns from a dataframe."""
 
+    _preserves_output_order: ClassVar[bool] = True
     __slots__ = ()
     _non_child = ("schema",)
     _n_non_child_args = 1
@@ -3641,6 +3665,11 @@ class MapFunction(IR):
                     tuple(nulls_last),
                 )
         self._non_child_args = (schema, name, self.options)
+
+    @property
+    def preserves_output_order(self) -> bool:
+        """Whether this map keeps input appearance order."""
+        return self.name in {"rechunk", "rename", "row_index", "hint_sorted"}
 
     def get_hashable(self) -> Hashable:
         """

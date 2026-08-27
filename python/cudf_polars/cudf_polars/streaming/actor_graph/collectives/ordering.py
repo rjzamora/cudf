@@ -383,40 +383,46 @@ class _OutputPartitionBuffer:
             if msg is None:
                 self.input_done = True
                 break
-            chunk = TableChunk.from_message(
-                msg, br=self.context.br()
-            ).make_available_and_spill(self.context.br(), allow_overbooking=True)
-            if chunk.table_view().num_rows() == 0:
-                continue
-            table = chunk.table_view()
-            if not self.input_ordering.locally_ordered:
-                table = _locally_sort_table(
-                    table,
-                    self.input_ordering,
-                    chunk.stream,
-                    self.context.br(),
-                )
-            with stream_ordered_after(
-                self.context.br().stream_pool.get_stream,
-                upstreams=(chunk.stream, self.boundary_chunk.stream),
-            ) as stream:
-                splits = _split_points(
-                    table,
-                    self.boundary_chunk.table_view(),
-                    self.output_ordering,
-                    stream,
-                )
-                for piece_pid, piece in enumerate(
-                    plc.copying.split(table, splits, stream=stream)
-                ):
-                    if piece.num_rows() == 0:
-                        continue
-                    _store_chunk(
-                        self.context,
-                        self.pending,
-                        piece_pid,
-                        _copy_to_owned_chunk(piece, stream, self.context.br()),
+            chunk = TableChunk.from_message(msg, br=self.context.br())
+            needs_sort = not self.input_ordering.locally_ordered
+            chunk, extra = await make_table_chunks_available_or_wait(
+                self.context,
+                chunk,
+                reserve_extra=chunk.data_alloc_size() if needs_sort else 0,
+                net_memory_delta=0,
+            )
+            with opaque_memory_usage(extra):
+                if chunk.table_view().num_rows() == 0:
+                    continue
+                table = chunk.table_view()
+                if needs_sort:
+                    table = _locally_sort_table(
+                        table,
+                        self.input_ordering,
+                        chunk.stream,
+                        self.context.br(),
                     )
+                with stream_ordered_after(
+                    self.context.br().stream_pool.get_stream,
+                    upstreams=(chunk.stream, self.boundary_chunk.stream),
+                ) as stream:
+                    splits = _split_points(
+                        table,
+                        self.boundary_chunk.table_view(),
+                        self.output_ordering,
+                        stream,
+                    )
+                    for piece_pid, piece in enumerate(
+                        plc.copying.split(table, splits, stream=stream)
+                    ):
+                        if piece.num_rows() == 0:
+                            continue
+                        _store_chunk(
+                            self.context,
+                            self.pending,
+                            piece_pid,
+                            _copy_to_owned_chunk(piece, stream, self.context.br()),
+                        )
         return self.pending.pop(pid, None)
 
     async def assert_input_drained(self) -> None:

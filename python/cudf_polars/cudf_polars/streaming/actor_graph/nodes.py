@@ -18,7 +18,7 @@ from rapidsmpf.streaming.core.actor import define_actor
 from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.core.spillable_messages import SpillableMessages
 
-from cudf_polars.dsl.ir import IR, Distinct, Empty, GroupBy, Join
+from cudf_polars.dsl.ir import IR, Empty, Join
 from cudf_polars.streaming.actor_graph.dispatch import (
     generate_ir_sub_network,
 )
@@ -52,15 +52,13 @@ if TYPE_CHECKING:
 
 def _preserves_local_order(ir: IR, partitioning_index: int | None = None) -> bool:
     """Return True when this IR node preserves advertised local row order."""
-    if isinstance(ir, (GroupBy, Distinct)):
-        return ir.preserves_output_order
     if isinstance(ir, Join) and partitioning_index is not None:
         # partitioning_index is the child whose partitioning we forwarded
         # (0 = left, 1 = right). Local row order holds only when join
         # maintain_order covers that side.
         side: Literal["left", "right"] = "left" if partitioning_index == 0 else "right"
         return join_preserves_side_order(ir.options[5], side)
-    return True
+    return ir.preserves_output_order
 
 
 @define_actor()

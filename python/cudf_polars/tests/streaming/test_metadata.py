@@ -25,14 +25,18 @@ from cudf_streaming.table_chunk import TableChunk
 from cudf_polars import Translator
 from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.dsl import expr
+from cudf_polars.dsl.expressions.base import ExecutionContext
 from cudf_polars.dsl.ir import (
     DataFrameScan,
+    Empty,
+    Filter,
     GroupBy,
     HStack,
     IRExecutionContext,
     MapFunction,
     Projection,
     Select,
+    Slice,
     Sort,
 )
 from cudf_polars.engine.options import StreamingOptions
@@ -41,6 +45,7 @@ from cudf_polars.streaming.actor_graph.collectives.sort import (
 )
 from cudf_polars.streaming.actor_graph.core import evaluate_logical_plan
 from cudf_polars.streaming.actor_graph.hint_sorted import extract_hint_sorted_metadata
+from cudf_polars.streaming.actor_graph.nodes import _preserves_local_order
 from cudf_polars.streaming.actor_graph.utils import (
     NormalizedPartitioning,
     _apply_ordering_metadata,
@@ -621,7 +626,7 @@ def test_apply_ordering_metadata_marks_leading_key_only(spmd_engine) -> None:
     assert result.column_map["b"].is_sorted == plc.types.Sorted.NO
 
 
-def test_apply_ordering_metadata_ignores_locally_unordered_ordering(
+def test_apply_ordering_metadata_does_not_mark_locally_unordered_as_sorted(
     spmd_engine,
 ) -> None:
     stream = spmd_engine.context.br().stream_pool.get_stream()
@@ -974,6 +979,59 @@ def test_clear_local_ordering_preserves_order_partitioning(spmd_engine):
 )
 def test_join_preserves_side_order(maintain_order, side, expected) -> None:
     assert join_preserves_side_order(maintain_order, side) is expected
+
+
+def test_preserves_output_order_is_explicit_opt_in() -> None:
+    schema = {"a": DataType(pl.Int64())}
+    child = Empty(schema)
+    mask = expr.NamedExpr("mask", expr.Literal(DataType(pl.Boolean()), True))  # noqa: FBT003
+    pointwise = expr.NamedExpr("a", expr.Col(DataType(pl.Int64()), "a"))
+    non_pointwise = expr.NamedExpr(
+        "a",
+        expr.Agg(
+            DataType(pl.Int64()),
+            "sum",
+            None,
+            ExecutionContext.FRAME,
+            expr.Col(schema["a"], "a"),
+        ),
+    )
+
+    assert Projection(schema, child).preserves_output_order
+    assert Filter(schema, mask, child).preserves_output_order
+    assert Slice(schema, 0, 1, child).preserves_output_order
+
+    # Select/HStack only preserve row order for pointwise expressions.
+    assert Select(
+        schema,
+        (pointwise,),
+        True,  # noqa: FBT003
+        child,
+    ).preserves_output_order
+    assert not Select(
+        schema,
+        (non_pointwise,),
+        True,  # noqa: FBT003
+        child,
+    ).preserves_output_order
+    assert HStack(
+        schema,
+        (pointwise,),
+        True,  # noqa: FBT003
+        child,
+    ).preserves_output_order
+    assert not HStack(
+        schema,
+        (non_pointwise,),
+        True,  # noqa: FBT003
+        child,
+    ).preserves_output_order
+
+    # Nodes that reorder rows, and unknown nodes, must not claim local order.
+    assert not Sort._preserves_output_order
+    assert not Empty(schema).preserves_output_order
+    assert _preserves_local_order(Projection(schema, child))
+    assert not _preserves_local_order(Empty(schema))
 
 
 @pytest.mark.parametrize(
