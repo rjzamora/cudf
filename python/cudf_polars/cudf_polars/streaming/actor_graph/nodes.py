@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from cudf_streaming.channel_metadata import ChannelMetadata
 from cudf_streaming.table_chunk import (
@@ -51,15 +51,15 @@ if TYPE_CHECKING:
 
 
 def _preserves_local_order(ir: IR, partitioning_index: int | None = None) -> bool:
-    """Return True when this actor preserves the advertised local row order."""
-    if isinstance(ir, GroupBy):
-        return ir.maintain_order
-    if isinstance(ir, Distinct):
-        return ir.stable
+    """Return True when this IR node preserves advertised local row order."""
+    if isinstance(ir, (GroupBy, Distinct)):
+        return ir.preserves_output_order
     if isinstance(ir, Join) and partitioning_index is not None:
-        if partitioning_index == 0:
-            return join_preserves_side_order(ir.options[5], "left")
-        return join_preserves_side_order(ir.options[5], "right")
+        # partitioning_index is the child whose partitioning we forwarded
+        # (0 = left, 1 = right). Local row order holds only when join
+        # maintain_order covers that side.
+        side: Literal["left", "right"] = "left" if partitioning_index == 0 else "right"
+        return join_preserves_side_order(ir.options[5], side)
     return True
 
 

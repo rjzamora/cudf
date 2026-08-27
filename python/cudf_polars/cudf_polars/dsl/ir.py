@@ -253,6 +253,16 @@ class IR(Node["IR"]):
     schema: Schema
     """Mapping from column names to their data types."""
 
+    @property
+    def preserves_output_order(self) -> bool:
+        """
+        Whether this node guarantees that output rows keep input appearance order.
+
+        The default is conservative (``False``). Nodes whose contract
+        preserves row order should override this.
+        """
+        return False
+
     def get_hashable(self) -> Hashable:
         """
         Hashable representation of node, treating schema dictionary.
@@ -2161,6 +2171,11 @@ class GroupBy(IR):
             self.zlice,
         )
 
+    @property
+    def preserves_output_order(self) -> bool:
+        """Whether grouped rows keep input appearance order."""
+        return self.maintain_order
+
     @classmethod
     @log_do_evaluate
     @nvtx_annotate_cudf_polars(message="GroupBy")
@@ -3232,6 +3247,11 @@ class Distinct(IR):
         self.stable = stable
         self._non_child_args = (keep, subset, zlice, stable)
         self.children = (df,)
+
+    @property
+    def preserves_output_order(self) -> bool:
+        """Whether distinct rows keep input appearance order."""
+        return self.stable
 
     _KEEP_MAP: ClassVar[dict[str, plc.stream_compaction.DuplicateKeepOption]] = {
         "first": plc.stream_compaction.DuplicateKeepOption.KEEP_FIRST,

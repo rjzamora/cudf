@@ -367,7 +367,7 @@ def join_preserves_side_order(
     side: Literal["left", "right"],
 ) -> bool:
     """Return True when join options preserve the requested input side's order."""
-    return maintain_order == side or maintain_order.startswith(f"{side}_")
+    return maintain_order.startswith(side)
 
 
 def _is_truncate_transparent_cast(expr: Cast) -> bool:

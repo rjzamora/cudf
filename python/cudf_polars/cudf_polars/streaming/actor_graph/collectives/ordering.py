@@ -388,18 +388,18 @@ class _OutputPartitionBuffer:
             ).make_available_and_spill(self.context.br(), allow_overbooking=True)
             if chunk.table_view().num_rows() == 0:
                 continue
+            table = chunk.table_view()
+            if not self.input_ordering.locally_ordered:
+                table = _locally_sort_table(
+                    table,
+                    self.input_ordering,
+                    chunk.stream,
+                    self.context.br(),
+                )
             with stream_ordered_after(
                 self.context.br().stream_pool.get_stream,
                 upstreams=(chunk.stream, self.boundary_chunk.stream),
             ) as stream:
-                table = chunk.table_view()
-                if not self.input_ordering.locally_ordered:
-                    table = _locally_sort_table(
-                        table,
-                        self.input_ordering,
-                        stream,
-                        self.context.br(),
-                    )
                 splits = _split_points(
                     table,
                     self.boundary_chunk.table_view(),
@@ -467,30 +467,36 @@ async def _assemble_partition(
     if not ordering.locally_ordered:
         return await concat_batch(chunks, context, schema_ir.schema, ir_context)
 
+    reserve_extra = (
+        0 if len(chunks) == 1 else sum(chunk.data_alloc_size() for chunk in chunks)
+    )
     chunks, extra = await make_table_chunks_available_or_wait(
         context,
         chunks,
-        reserve_extra=sum(chunk.data_alloc_size() for chunk in chunks),
+        reserve_extra=reserve_extra,
         net_memory_delta=0,
     )
     with opaque_memory_usage(extra):
         if len(chunks) == 1:
             return chunks[0]
-        stream = ir_context.get_cuda_stream()
-        table = plc.merge.merge(
-            [chunk.table_view() for chunk in chunks],
-            [key.column_index for key in ordering.keys],
-            [key.order for key in ordering.keys],
-            [key.null_order for key in ordering.keys],
-            stream=stream,
-            mr=context.br().device_mr,
-        )
-        return TableChunk.from_pylibcudf_table(
-            table,
-            stream,
-            exclusive_view=True,
-            br=context.br(),
-        )
+        with stream_ordered_after(
+            ir_context.get_cuda_stream,
+            upstreams=tuple(chunk.stream for chunk in chunks),
+        ) as stream:
+            table = plc.merge.merge(
+                [chunk.table_view() for chunk in chunks],
+                [key.column_index for key in ordering.keys],
+                [key.order for key in ordering.keys],
+                [key.null_order for key in ordering.keys],
+                stream=stream,
+                mr=context.br().device_mr,
+            )
+            return TableChunk.from_pylibcudf_table(
+                table,
+                stream,
+                exclusive_view=True,
+                br=context.br(),
+            )
 
 
 async def _send_remote_partition(

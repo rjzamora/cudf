@@ -127,9 +127,9 @@ def test_order_sensitive_execution_does_not_imply_output_order() -> None:
 
     with patch.object(groupby_actor_graph, "_has_stable_sorted_agg", return_value=True):
         assert groupby_actor_graph._maintain_order(groupby)
-    assert not groupby_actor_graph._preserves_output_order(groupby)
+    assert not groupby.preserves_output_order
     assert groupby_actor_graph._maintain_order(distinct)
-    assert not groupby_actor_graph._preserves_output_order(distinct)
+    assert not distinct.preserves_output_order
 
 
 @pytest.mark.parametrize("keys", [("key",), ("key", "key2")])

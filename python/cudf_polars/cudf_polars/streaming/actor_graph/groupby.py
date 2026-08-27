@@ -504,6 +504,8 @@ def _groupby_output_metadata(
             context=context,
         )
     if not preserves_output_order:
+        # Partitioning-level helper: clear local order on every Ordering
+        # in the inter-rank and local schemes.
         partitioning = clear_local_ordering(partitioning)
     return ChannelMetadata(
         local_count=local_count,
@@ -570,6 +572,9 @@ async def _ordered_adjust_reduce(
         decomposed.shuffle_indices[: len(input_ordering.keys)],
     )
     if not preserves_output_order:
+        # Ordering-level helper: this is a single Ordering passed into
+        # adjust_ordering, not a Partitioning, so clear_local_ordering
+        # does not apply.
         partial_input_ordering = partial_input_ordering.with_locally_ordered(
             locally_ordered=False
         )
@@ -695,13 +700,6 @@ def _maintain_order(ir: GroupBy | Distinct) -> bool:
             plc.stream_compaction.DuplicateKeepOption.KEEP_FIRST,
             plc.stream_compaction.DuplicateKeepOption.KEEP_LAST,
         )
-
-
-def _preserves_output_order(ir: GroupBy | Distinct) -> bool:
-    if isinstance(ir, GroupBy):
-        return ir.maintain_order
-    else:
-        return ir.stable
 
 
 def _partition_count_for_rank(rank: int, nranks: int, npartitions: int) -> int:
@@ -889,7 +887,7 @@ async def groupby_actor(
             "local" if metadata_in.duplicated else "flat"
         )
         maintain_order = _maintain_order(ir)
-        preserves_output_order = _preserves_output_order(ir)
+        preserves_output_order = ir.preserves_output_order
         fully_partitioned = partitioning.is_strictly_partitioned(
             level=partitioning_level,
         )

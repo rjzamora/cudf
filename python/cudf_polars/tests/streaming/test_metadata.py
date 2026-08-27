@@ -965,7 +965,10 @@ def test_clear_local_ordering_preserves_order_partitioning(spmd_engine):
         ("none", "left", False),
         ("left", "left", True),
         ("right", "left", False),
+        ("right", "right", True),
         ("left_right", "left", True),
+        ("left_right", "right", False),
+        ("right_left", "left", False),
         ("right_left", "right", True),
     ],
 )
