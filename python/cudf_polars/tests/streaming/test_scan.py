@@ -408,11 +408,13 @@ def test_scan_union(engine: pl.GPUEngine, tmp_path: Path) -> None:
 
 
 def _make_parquet_scan(
-    paths: list[str], parquet_options: ParquetOptions | None = None
+    paths: list[str],
+    parquet_options: ParquetOptions | None = None,
+    schema: dict[str, DataType] | None = None,
 ) -> Scan:
     parquet_options = parquet_options or ParquetOptions()
     return Scan(
-        {"x": DataType(pl.Int64())},
+        schema or {"x": DataType(pl.Int64())},
         "parquet",
         {},
         None,
@@ -428,10 +430,12 @@ def _make_parquet_scan(
     )
 
 
-def _scan_ordering_request() -> OrderPartitioningRequest:
+def _scan_ordering_request(
+    column: str = "x", *, descending: bool = False, nulls_last: bool = False
+) -> OrderPartitioningRequest:
     """Return a simple ordering request for the test scan schema."""
-    order, null_order = sort_order((False,), nulls_last=(False,), num_keys=1)
-    return OrderPartitioningRequest((NamedOrderKey("x", order[0], null_order[0]),))
+    order, null_order = sort_order((descending,), nulls_last=(nulls_last,), num_keys=1)
+    return OrderPartitioningRequest((NamedOrderKey(column, order[0], null_order[0]),))
 
 
 def _run_parquet_ordering_partitioning(
@@ -439,6 +443,7 @@ def _run_parquet_ordering_partitioning(
     streaming_scan: StreamingScan,
     plan: IOPartitionPlan,
     partition_count: int,
+    requests: tuple[OrderPartitioningRequest, ...] | None = None,
 ) -> Any:
     """Run parquet ordering extraction for scan tests."""
 
@@ -456,7 +461,7 @@ def _run_parquet_ordering_partitioning(
                 spmd_engine.comm,
                 streaming_scan,
                 PartitionInfo(count=partition_count, io_plan=plan),
-                (_scan_ordering_request(),),
+                requests or (_scan_ordering_request(),),
                 ir_context,
                 collective_id,
             )
@@ -512,6 +517,96 @@ def test_parquet_scan_ordering_partitioning_from_local_metadata(
     assert ordering.get_boundaries(spmd_engine.context.br()).table_view().columns()[
         0
     ].to_pylist() == [4, 8]
+
+
+def test_parquet_scan_ordering_partitioning_extracts_multiple_requests(
+    tmp_path: Path, spmd_engine: Any
+) -> None:
+    paths = [str(tmp_path / f"part-{i}.parquet") for i in range(3)]
+    for i, path in enumerate(paths):
+        pl.DataFrame(
+            {
+                "x": range(i * 4, (i + 1) * 4),
+                "y": range(20 - i * 4, 16 - i * 4, -1),
+            }
+        ).write_parquet(path, row_group_size=2)
+
+    scan = _make_parquet_scan(
+        paths, schema={"x": DataType(pl.Int64()), "y": DataType(pl.Int64())}
+    )
+    plan = IOPartitionPlan(1, IOPartitionFlavor.SINGLE_FILE)
+    streaming_scan = StreamingScan.for_fused_files(
+        scan,
+        plan,
+        len(paths),
+        rank=spmd_engine.comm.rank,
+        nranks=spmd_engine.comm.nranks,
+        parquet_options=scan.parquet_options,
+    )
+
+    partitioning = _run_parquet_ordering_partitioning(
+        spmd_engine,
+        streaming_scan,
+        plan,
+        len(paths),
+        (_scan_ordering_request(), _scan_ordering_request("y", descending=True)),
+    )
+
+    assert partitioning is not None
+    scheme = partitioning.inter_rank
+    assert isinstance(scheme, OrderScheme)
+    assert len(scheme.orderings) == 2
+    x_ordering, y_ordering = scheme.orderings
+    assert x_ordering.get_boundaries(spmd_engine.context.br()).table_view().columns()[
+        0
+    ].to_pylist() == [4, 8]
+    assert y_ordering.get_boundaries(spmd_engine.context.br()).table_view().columns()[
+        0
+    ].to_pylist() == [16, 12]
+
+
+@pytest.mark.parametrize(
+    "values_by_file,nulls_last,has_ordering",
+    [
+        ([[1, 2], [3, None]], True, True),
+        ([[None, 1], [2, 3]], True, False),
+        ([[None, None], [2, 3]], False, True),
+        ([[1, 2], [3, None]], False, False),
+    ],
+)
+def test_parquet_scan_ordering_partitioning_nulls_only_at_null_extreme(
+    tmp_path: Path,
+    spmd_engine: Any,
+    values_by_file: list[list[int | None]],
+    nulls_last,
+    has_ordering,
+) -> None:
+    paths = [str(tmp_path / f"part-{i}.parquet") for i in range(2)]
+    for path, values in zip(paths, values_by_file, strict=True):
+        pl.DataFrame({"x": values}, schema={"x": pl.Int64}).write_parquet(
+            path, row_group_size=2
+        )
+
+    scan = _make_parquet_scan(paths)
+    plan = IOPartitionPlan(1, IOPartitionFlavor.SINGLE_FILE)
+    streaming_scan = StreamingScan.for_fused_files(
+        scan,
+        plan,
+        len(paths),
+        rank=spmd_engine.comm.rank,
+        nranks=spmd_engine.comm.nranks,
+        parquet_options=scan.parquet_options,
+    )
+
+    partitioning = _run_parquet_ordering_partitioning(
+        spmd_engine,
+        streaming_scan,
+        plan,
+        len(paths),
+        (_scan_ordering_request(nulls_last=nulls_last),),
+    )
+
+    assert (partitioning is not None) is has_ordering
 
 
 def test_split_parquet_scan_ordering_partitioning_from_local_metadata(
