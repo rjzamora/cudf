@@ -12,7 +12,7 @@ from rapidsmpf.shuffler import Shuffler
 
 from cudf_polars.dsl.ir import Distinct, GroupBy, Sort
 from cudf_polars.dsl.traversal import traversal
-from cudf_polars.streaming.io import StreamingSink
+from cudf_polars.streaming.io import StreamingScan, StreamingSink
 from cudf_polars.streaming.join import Join
 from cudf_polars.streaming.over import Over
 from cudf_polars.streaming.repartition import Repartition
@@ -95,6 +95,7 @@ class ReserveOpIDs:
             Join,
             Repartition,
             StreamingSink,
+            StreamingScan,
             Sort,
         )
         if self.dynamic_planning_enabled:
@@ -103,6 +104,7 @@ class ReserveOpIDs:
                 Join,
                 Repartition,
                 StreamingSink,
+                StreamingScan,
                 Sort,
                 GroupBy,
                 Distinct,

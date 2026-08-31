@@ -3,12 +3,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, cast
 
 import pytest
 
 import polars as pl
+
+from cudf_streaming.channel_metadata import OrderScheme
 
 from cudf_polars import Translator
 from cudf_polars.containers import DataType
@@ -23,11 +27,16 @@ from cudf_polars.dsl.utils.io import (
     prefetch_parquet_file_metadata_for_ir,
 )
 from cudf_polars.engine.options import StreamingOptions
-from cudf_polars.streaming.actor_graph.io import resolve_max_concurrent_io_tasks
+from cudf_polars.streaming.actor_graph.collectives import ReserveOpIDs, reserve_op_id
+from cudf_polars.streaming.actor_graph.io import (
+    _parquet_ordering_partitioning,
+    resolve_max_concurrent_io_tasks,
+)
 from cudf_polars.streaming.base import (
     DataSourceInfo,
     IOPartitionFlavor,
     IOPartitionPlan,
+    PartitionInfo,
     StatsCollector,
 )
 from cudf_polars.streaming.io import (
@@ -38,6 +47,10 @@ from cudf_polars.streaming.io import (
     scan_partition_plan,
 )
 from cudf_polars.streaming.parallel import lower_ir_graph
+from cudf_polars.streaming.partitioning_requests import (
+    NamedOrderKey,
+    OrderPartitioningRequest,
+)
 from cudf_polars.streaming.statistics import collect_statistics
 from cudf_polars.testing.asserts import assert_gpu_result_equal
 from cudf_polars.testing.engine_utils import SMALL_MAX_ROWS_PER_PARTITION
@@ -47,6 +60,7 @@ from cudf_polars.utils.config import (
     MaxConcurrentIOTasks,
     ParquetOptions,
 )
+from cudf_polars.utils.sorting import sort_order
 
 if TYPE_CHECKING:
     import concurrent.futures
@@ -412,6 +426,149 @@ def _make_parquet_scan(
         parquet_options,
         None,
     )
+
+
+def _scan_ordering_request() -> OrderPartitioningRequest:
+    """Return a simple ordering request for the test scan schema."""
+    order, null_order = sort_order((False,), nulls_last=(False,), num_keys=1)
+    return OrderPartitioningRequest((NamedOrderKey("x", order[0], null_order[0]),))
+
+
+def _run_parquet_ordering_partitioning(
+    spmd_engine: Any,
+    streaming_scan: StreamingScan,
+    plan: IOPartitionPlan,
+    partition_count: int,
+) -> Any:
+    """Run parquet ordering extraction for scan tests."""
+
+    async def _run() -> Any:
+        with (
+            ThreadPoolExecutor(max_workers=1) as executor,
+            reserve_op_id() as collective_id,
+        ):
+            ir_context = IRExecutionContext(
+                executor,
+                get_cuda_stream=spmd_engine.context.br().stream_pool.get_stream,
+            )
+            return await _parquet_ordering_partitioning(
+                spmd_engine.context,
+                spmd_engine.comm,
+                streaming_scan,
+                PartitionInfo(count=partition_count, io_plan=plan),
+                (_scan_ordering_request(),),
+                ir_context,
+                collective_id,
+            )
+
+    return asyncio.run(_run())
+
+
+def test_streaming_scan_always_reserves_collective_id() -> None:
+    scan = _make_parquet_scan(["data.parquet"])
+    streaming_scan = StreamingScan(
+        [FusedScan(scan.schema, scan, scan.paths, scan.parquet_options, None)],
+        scan,
+        "fused",
+    )
+
+    with ReserveOpIDs(streaming_scan) as collective_id_map:
+        assert len(collective_id_map[streaming_scan]) == 1
+
+
+def test_parquet_scan_ordering_partitioning_from_local_metadata(
+    tmp_path: Path, spmd_engine: Any
+) -> None:
+    paths = [str(tmp_path / f"part-{i}.parquet") for i in range(3)]
+    for i, path in enumerate(paths):
+        pl.DataFrame({"x": range(i * 4, (i + 1) * 4)}).write_parquet(
+            path, row_group_size=2
+        )
+
+    scan = _make_parquet_scan(paths)
+    plan = IOPartitionPlan(1, IOPartitionFlavor.SINGLE_FILE)
+    streaming_scan = StreamingScan.for_fused_files(
+        scan,
+        plan,
+        len(paths),
+        rank=spmd_engine.comm.rank,
+        nranks=spmd_engine.comm.nranks,
+        parquet_options=scan.parquet_options,
+    )
+
+    partitioning = _run_parquet_ordering_partitioning(
+        spmd_engine, streaming_scan, plan, len(paths)
+    )
+
+    assert all(scan.cached_parquet_info is not None for scan in streaming_scan.scans)
+    assert partitioning is not None
+    assert partitioning.local == "inherit"
+    scheme = partitioning.inter_rank
+    assert isinstance(scheme, OrderScheme)
+    (ordering,) = scheme.orderings
+    assert ordering.strict_boundaries
+    assert not ordering.locally_ordered
+    assert ordering.num_boundaries == 2
+    assert ordering.get_boundaries(spmd_engine.context.br()).table_view().columns()[
+        0
+    ].to_pylist() == [4, 8]
+
+
+def test_split_parquet_scan_ordering_partitioning_from_local_metadata(
+    tmp_path: Path, spmd_engine: Any
+) -> None:
+    path = str(tmp_path / "data.parquet")
+    pl.DataFrame({"x": range(8)}).write_parquet(path, row_group_size=2)
+
+    scan = _make_parquet_scan([path])
+    plan = IOPartitionPlan(2, IOPartitionFlavor.SPLIT_FILES)
+    streaming_scan = StreamingScan.for_split_files(
+        scan,
+        plan,
+        partition_count=2,
+        rank=spmd_engine.comm.rank,
+        nranks=spmd_engine.comm.nranks,
+        parquet_options=scan.parquet_options,
+    )
+
+    partitioning = _run_parquet_ordering_partitioning(
+        spmd_engine, streaming_scan, plan, 2
+    )
+
+    assert all(scan.cached_parquet_info is not None for scan in streaming_scan.scans)
+    assert partitioning is not None
+    scheme = partitioning.inter_rank
+    assert isinstance(scheme, OrderScheme)
+    (ordering,) = scheme.orderings
+    assert ordering.strict_boundaries
+    assert not ordering.locally_ordered
+    assert ordering.num_boundaries == 1
+    assert ordering.get_boundaries(spmd_engine.context.br()).table_view().columns()[
+        0
+    ].to_pylist() == [4]
+
+
+def test_split_parquet_scan_ordering_partitioning_too_many_splits(
+    tmp_path: Path, spmd_engine: Any
+) -> None:
+    path = str(tmp_path / "data.parquet")
+    pl.DataFrame({"x": range(4)}).write_parquet(path, row_group_size=2)
+
+    scan = _make_parquet_scan([path])
+    plan = IOPartitionPlan(4, IOPartitionFlavor.SPLIT_FILES)
+    streaming_scan = StreamingScan.for_split_files(
+        scan,
+        plan,
+        partition_count=4,
+        rank=spmd_engine.comm.rank,
+        nranks=spmd_engine.comm.nranks,
+        parquet_options=scan.parquet_options,
+    )
+
+    assert (
+        _run_parquet_ordering_partitioning(spmd_engine, streaming_scan, plan, 4) is None
+    )
+    assert all(scan.cached_parquet_info is not None for scan in streaming_scan.scans)
 
 
 @pytest.mark.parametrize(
