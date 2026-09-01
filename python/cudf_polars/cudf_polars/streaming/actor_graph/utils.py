@@ -324,6 +324,8 @@ async def shutdown_on_error(
                     record["row_count"] = tracer.row_count
                 if tracer.decision is not None:
                     record["decision"] = tracer.decision
+                if tracer.extra:
+                    record["extra"] = tracer.extra
             cudf_polars.dsl.tracing.log(
                 "Streaming Actor", start=start, stop=stop, **record
             )
@@ -1396,10 +1398,22 @@ class NormalizedPartitioning:  # noqa: PLW1641 (frozen=True generates __hash__ e
         level: PartitioningLevel = "flat",
     ) -> bool:
         """True if the selected ordering covers order_keys."""
+        return self.matching_ordering(order_keys, level=level) is not None
+
+    def matching_ordering(
+        self,
+        order_keys: Sequence[int | OrderKey],
+        *,
+        level: PartitioningLevel = "flat",
+    ) -> Ordering | None:
+        """Return the ordering that covers order_keys, if present."""
         scheme = self._scheme_for_level(level)
         if not isinstance(scheme, OrderScheme):
-            return False
-        return self._ordering_covers_keys(scheme.orderings[0], order_keys)
+            return None
+        ordering = scheme.orderings[0]
+        if not self._ordering_covers_keys(ordering, order_keys):
+            return None
+        return ordering
 
     def is_aligned_with(
         self, other: NormalizedPartitioning, br: BufferResource

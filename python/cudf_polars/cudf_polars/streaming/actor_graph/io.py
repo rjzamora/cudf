@@ -1067,6 +1067,40 @@ async def _parquet_ordering_partitioning(
     )
 
 
+def _parquet_ordering_decision(partitioning: Partitioning | None) -> str | None:
+    """Return a trace decision for scan ordering extracted from parquet stats."""
+    if partitioning is None or not isinstance(partitioning.inter_rank, OrderScheme):
+        return None
+    strict_values = {
+        ordering.strict_boundaries for ordering in partitioning.inter_rank.orderings
+    }
+    if strict_values == {True}:
+        return "parquet_ordering_strict"
+    if strict_values == {False}:
+        return "parquet_ordering_non_strict"
+    return "parquet_ordering_mixed"
+
+
+def _parquet_ordering_trace_info(
+    partitioning: Partitioning | None,
+) -> dict[str, Any] | None:
+    if partitioning is None or not isinstance(partitioning.inter_rank, OrderScheme):
+        return None
+    return {
+        "ordering_count": len(partitioning.inter_rank.orderings),
+        "partition_counts": [
+            ordering.num_boundaries + 1
+            for ordering in partitioning.inter_rank.orderings
+        ],
+        "strict_boundaries": [
+            ordering.strict_boundaries for ordering in partitioning.inter_rank.orderings
+        ],
+        "locally_ordered": [
+            ordering.locally_ordered for ordering in partitioning.inter_rank.orderings
+        ],
+    }
+
+
 @define_actor()
 async def scan_node(
     context: Context,
@@ -1122,6 +1156,10 @@ async def scan_node(
             ir_context,
             collective_id,
         )
+        if tracer is not None:
+            tracer.decision = _parquet_ordering_decision(partitioning)
+            if (extra := _parquet_ordering_trace_info(partitioning)) is not None:
+                tracer.set_extra("parquet_ordering", extra)
         await send_metadata(
             ch_out,
             context,

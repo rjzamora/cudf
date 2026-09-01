@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 import pytest
@@ -12,7 +13,11 @@ import pytest
 import polars as pl
 
 import pylibcudf as plc
-from cudf_streaming.channel_metadata import OrderKey, OrderScheme, Ordering
+from cudf_streaming.channel_metadata import (
+    OrderKey,
+    OrderScheme,
+    Ordering,
+)
 from cudf_streaming.table_chunk import TableChunk
 
 from cudf_polars import Translator
@@ -20,6 +25,7 @@ from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import Cache, Join
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.engine.options import StreamingOptions
+from cudf_polars.streaming.actor_graph import join as join_actor_graph
 from cudf_polars.streaming.actor_graph.join import (
     _make_ordered_strategy,
     _use_pwise_join,
@@ -194,6 +200,66 @@ def test_ordered_join_strategy_checks_order_key_semantics(spmd_engine):
         is not None
     )
     assert _make_ordered_strategy(join_ir, left_partitioning, mismatched_right) is None
+
+
+def test_ordered_join_side_skips_adjust_when_aligned(spmd_engine, monkeypatch):
+    context = spmd_engine.context
+    stream = context.br().stream_pool.get_stream()
+    key = OrderKey(
+        0,
+        plc.types.Order.ASCENDING,
+        plc.types.NullOrder.BEFORE,
+    )
+    boundaries = TableChunk.from_pylibcudf_table(
+        DataFrame.from_polars(
+            pl.DataFrame(
+                {"k": range(1, spmd_engine.comm.nranks)},
+                schema={"k": pl.Int64},
+            ),
+            stream,
+        ).table,
+        stream,
+        exclusive_view=False,
+        br=context.br(),
+    )
+    ordering = Ordering(
+        [key],
+        boundaries,
+        strict_boundaries=True,
+        locally_ordered=False,
+    )
+    replayed = []
+
+    async def fail_adjust_ordering(*_args, **_kwargs) -> None:
+        raise AssertionError("aligned input should not call adjust_ordering")
+
+    async def record_replay(
+        _context, _ch_out, _ch_in, _buffered_chunks, metadata, **_kwargs
+    ) -> None:
+        replayed.append(metadata)
+
+    monkeypatch.setattr(join_actor_graph, "adjust_ordering", fail_adjust_ordering)
+    monkeypatch.setattr(join_actor_graph, "replay_buffered_channel", record_replay)
+
+    asyncio.run(
+        join_actor_graph._adjust_ordered_join_side(
+            context,
+            spmd_engine.comm,
+            object(),
+            object(),
+            object(),
+            object(),
+            ordering,
+            ordering,
+            collective_id=0,
+        )
+    )
+
+    (metadata,) = replayed
+    assert metadata.local_count == 1
+    assert metadata.partitioning.inter_rank.orderings[0].boundaries_aligned_with(
+        ordering, context.br()
+    )
 
 
 @pytest.mark.parametrize("how", ["right", "full"])

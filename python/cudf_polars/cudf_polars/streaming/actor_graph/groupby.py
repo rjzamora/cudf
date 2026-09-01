@@ -595,6 +595,13 @@ async def _ordered_adjust_reduce(
     )
     if tracer is not None:
         tracer.decision = "adjust_ordering"
+        tracer.set_extra("input_ordering", _ordering_trace_info(partial_input_ordering))
+        tracer.set_extra(
+            "output_ordering",
+            _ordering_trace_info(partial_output_ordering),
+        )
+        tracer.set_extra("output_local_count", adjusted_metadata.local_count)
+        tracer.set_extra("preserves_output_order", preserves_output_order)
 
     await send_metadata(ch_out, context, metadata_out)
     if tracer is not None and metadata_out.duplicated:
@@ -708,6 +715,15 @@ def _partition_count_for_rank(rank: int, nranks: int, npartitions: int) -> int:
     return stop - start
 
 
+def _ordering_trace_info(ordering: Ordering) -> dict[str, bool | int]:
+    return {
+        "partition_count": ordering.num_boundaries + 1,
+        "boundary_count": ordering.num_boundaries,
+        "strict_boundaries": ordering.strict_boundaries,
+        "locally_ordered": ordering.locally_ordered,
+    }
+
+
 def _adjusted_ordering_metadata(
     comm: Communicator,
     metadata_in: ChannelMetadata,
@@ -721,6 +737,15 @@ def _adjusted_ordering_metadata(
         partitioning=Partitioning(OrderScheme([output_ordering]), "inherit"),
         duplicated=metadata_in.duplicated,
     )
+
+
+def _input_ordering_for_adjust(partitioning: NormalizedPartitioning) -> Ordering | None:
+    """Return the input ordering to tighten with adjust_ordering, if available."""
+    if partitioning.local_scheme != "inherit" or not isinstance(
+        partitioning.inter_rank_scheme, OrderScheme
+    ):
+        return None
+    return partitioning.inter_rank_scheme.orderings[0]
 
 
 async def _choose_strategy(
@@ -886,6 +911,7 @@ async def groupby_actor(
         partitioning_level: PartitioningLevel = (
             "local" if metadata_in.duplicated else "flat"
         )
+        input_ordering = _input_ordering_for_adjust(partitioning)
         maintain_order = _maintain_order(ir)
         preserves_output_order = ir.preserves_output_order
         fully_partitioned = partitioning.is_strictly_partitioned(
@@ -969,11 +995,7 @@ async def groupby_actor(
                 aggregated=aggregated,
                 tracer=tracer,
             )
-        elif not metadata_in.duplicated and partitioning.is_ordered(
-            group_keys,
-            level="flat",
-        ):
-            assert isinstance(partitioning.inter_rank_scheme, OrderScheme)
+        elif not metadata_in.duplicated and input_ordering is not None:
             await _ordered_adjust_reduce(
                 context,
                 comm,
@@ -986,7 +1008,7 @@ async def groupby_actor(
                 target_partition_size,
                 aggregated=aggregated,
                 input_drained=input_drained,
-                input_ordering=partitioning.inter_rank_scheme.orderings[0],
+                input_ordering=input_ordering,
                 preserves_output_order=preserves_output_order,
                 tracer=tracer,
             )

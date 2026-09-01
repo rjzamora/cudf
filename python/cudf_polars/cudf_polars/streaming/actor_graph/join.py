@@ -744,6 +744,15 @@ def _local_count_for_ordering(comm: Communicator, ordering: Ordering) -> int:
     return stop - start
 
 
+def _ordering_trace_info(ordering: Ordering) -> dict[str, bool | int]:
+    return {
+        "partition_count": ordering.num_boundaries + 1,
+        "boundary_count": ordering.num_boundaries,
+        "strict_boundaries": ordering.strict_boundaries,
+        "locally_ordered": ordering.locally_ordered,
+    }
+
+
 async def _adjust_ordered_join_side(
     context: Context,
     comm: Communicator,
@@ -757,18 +766,26 @@ async def _adjust_ordered_join_side(
     collective_id: int,
 ) -> None:
     """Send metadata, then align one join side to output_ordering."""
-    await send_metadata(
-        ch_out,
-        context,
-        ChannelMetadata(
-            local_count=_local_count_for_ordering(comm, output_ordering),
-            partitioning=Partitioning(
-                OrderScheme([output_ordering]),
-                local="inherit",
-            ),
-            duplicated=False,
+    output_metadata = ChannelMetadata(
+        local_count=_local_count_for_ordering(comm, output_ordering),
+        partitioning=Partitioning(
+            OrderScheme([output_ordering]),
+            local="inherit",
         ),
+        duplicated=False,
     )
+    if input_ordering.boundaries_aligned_with(output_ordering, context.br()):
+        await replay_buffered_channel(
+            context,
+            ch_out,
+            ch_in,
+            ChunkStore(context),
+            output_metadata,
+            trace_ir=schema_ir,
+        )
+        return
+
+    await send_metadata(ch_out, context, output_metadata)
     await adjust_ordering(
         context,
         comm,
@@ -796,6 +813,40 @@ async def _ordered_join(
     tracer: ActorTracer | None,
 ) -> None:
     """Align ordered inputs to common boundaries, then join partition-wise."""
+    left_aligned = strategy.left_input_ordering.boundaries_aligned_with(
+        strategy.left_output_ordering, context.br()
+    )
+    right_aligned = strategy.right_input_ordering.boundaries_aligned_with(
+        strategy.right_output_ordering, context.br()
+    )
+    if tracer is not None:
+        tracer.decision = (
+            "ordered_aligned"
+            if left_aligned and right_aligned
+            else "ordered_adjust_right"
+            if left_aligned
+            else "ordered_adjust_left"
+            if right_aligned
+            else "ordered_adjust_both"
+        )
+        tracer.set_extra("left_aligned", left_aligned)
+        tracer.set_extra("right_aligned", right_aligned)
+        tracer.set_extra(
+            "target_local_count",
+            _local_count_for_ordering(comm, strategy.output_ordering),
+        )
+        tracer.set_extra(
+            "left_input_ordering",
+            _ordering_trace_info(strategy.left_input_ordering),
+        )
+        tracer.set_extra(
+            "right_input_ordering",
+            _ordering_trace_info(strategy.right_input_ordering),
+        )
+        tracer.set_extra(
+            "output_ordering",
+            _ordering_trace_info(strategy.output_ordering),
+        )
     metadata_out = ChannelMetadata(
         local_count=_local_count_for_ordering(comm, strategy.output_ordering),
         partitioning=Partitioning(
