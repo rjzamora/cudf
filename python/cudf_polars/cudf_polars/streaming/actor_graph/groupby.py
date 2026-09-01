@@ -410,7 +410,7 @@ async def _shuffle_reduce(
         collective_id,
     )
     async with shuffle.inserting() as inserter:
-        inserter.insert_hash(
+        await inserter.insert_hash(
             _enforce_schema(
                 aggregated,
                 decomposed.reduction_ir.schema,
@@ -428,7 +428,7 @@ async def _shuffle_reduce(
                 ch_in,
                 target_partition_size,
             )
-            inserter.insert_hash(
+            await inserter.insert_hash(
                 _enforce_schema(
                     aggregated, decomposed.reduction_ir.schema, context.br()
                 ),
@@ -441,7 +441,7 @@ async def _shuffle_reduce(
     for partition_id in shuffle.local_partitions():
         stream = ir_context.get_cuda_stream()
         partition_chunk = TableChunk.from_pylibcudf_table(
-            shuffle.extract_chunk(partition_id, stream),
+            await shuffle.extract_chunk(partition_id, stream),
             stream,
             exclusive_view=True,
             br=context.br(),
