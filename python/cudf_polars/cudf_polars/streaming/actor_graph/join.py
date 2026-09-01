@@ -744,15 +744,6 @@ def _local_count_for_ordering(comm: Communicator, ordering: Ordering) -> int:
     return stop - start
 
 
-def _ordering_trace_info(ordering: Ordering) -> dict[str, bool | int]:
-    return {
-        "partition_count": ordering.num_boundaries + 1,
-        "boundary_count": ordering.num_boundaries,
-        "strict_boundaries": ordering.strict_boundaries,
-        "locally_ordered": ordering.locally_ordered,
-    }
-
-
 async def _adjust_ordered_join_side(
     context: Context,
     comm: Communicator,
@@ -828,24 +819,6 @@ async def _ordered_join(
             else "ordered_adjust_left"
             if right_aligned
             else "ordered_adjust_both"
-        )
-        tracer.set_extra("left_aligned", left_aligned)
-        tracer.set_extra("right_aligned", right_aligned)
-        tracer.set_extra(
-            "target_local_count",
-            _local_count_for_ordering(comm, strategy.output_ordering),
-        )
-        tracer.set_extra(
-            "left_input_ordering",
-            _ordering_trace_info(strategy.left_input_ordering),
-        )
-        tracer.set_extra(
-            "right_input_ordering",
-            _ordering_trace_info(strategy.right_input_ordering),
-        )
-        tracer.set_extra(
-            "output_ordering",
-            _ordering_trace_info(strategy.output_ordering),
         )
     metadata_out = ChannelMetadata(
         local_count=_local_count_for_ordering(comm, strategy.output_ordering),

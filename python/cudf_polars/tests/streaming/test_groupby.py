@@ -161,7 +161,7 @@ def test_groupby_adjust_accepts_non_strict_ordered_prefix(spmd_engine) -> None:
     )
 
     assert not partitioning.is_ordered((0, 1))
-    input_ordering = groupby_actor_graph._input_ordering_for_adjust(partitioning)
+    input_ordering = groupby_actor_graph._adjustable_ordering(partitioning)
     assert input_ordering is not None
     assert input_ordering.keys == ordering.keys
     assert not input_ordering.strict_boundaries
