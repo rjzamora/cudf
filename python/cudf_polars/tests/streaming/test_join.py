@@ -204,30 +204,9 @@ def test_ordered_join_strategy_checks_order_key_semantics(spmd_engine):
 
 def test_ordered_join_side_skips_adjust_when_aligned(spmd_engine, monkeypatch):
     context = spmd_engine.context
-    stream = context.br().stream_pool.get_stream()
-    key = OrderKey(
-        0,
-        plc.types.Order.ASCENDING,
-        plc.types.NullOrder.BEFORE,
-    )
-    boundaries = TableChunk.from_pylibcudf_table(
-        DataFrame.from_polars(
-            pl.DataFrame(
-                {"k": range(1, spmd_engine.comm.nranks)},
-                schema={"k": pl.Int64},
-            ),
-            stream,
-        ).table,
-        stream,
-        exclusive_view=False,
-        br=context.br(),
-    )
-    ordering = Ordering(
-        [key],
-        boundaries,
-        strict_boundaries=True,
-        locally_ordered=False,
-    )
+    partitioning = _order_partitioning(spmd_engine, (0,))
+    assert isinstance(partitioning.inter_rank_scheme, OrderScheme)
+    ordering = partitioning.inter_rank_scheme.orderings[0]
     replayed = []
 
     async def fail_adjust_ordering(*_args, **_kwargs) -> None:
@@ -236,6 +215,7 @@ def test_ordered_join_side_skips_adjust_when_aligned(spmd_engine, monkeypatch):
     async def record_replay(
         _context, _ch_out, _ch_in, _buffered_chunks, metadata, **_kwargs
     ) -> None:
+        assert _buffered_chunks == ()
         replayed.append(metadata)
 
     monkeypatch.setattr(join_actor_graph, "adjust_ordering", fail_adjust_ordering)
@@ -256,7 +236,9 @@ def test_ordered_join_side_skips_adjust_when_aligned(spmd_engine, monkeypatch):
     )
 
     (metadata,) = replayed
-    assert metadata.local_count == 1
+    assert metadata.local_count == join_actor_graph._local_count_for_ordering(
+        spmd_engine.comm, ordering
+    )
     assert metadata.partitioning.inter_rank.orderings[0].boundaries_aligned_with(
         ordering, context.br()
     )

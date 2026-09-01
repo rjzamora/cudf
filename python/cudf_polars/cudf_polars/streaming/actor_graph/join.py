@@ -770,7 +770,7 @@ async def _adjust_ordered_join_side(
             context,
             ch_out,
             ch_in,
-            ChunkStore(context),
+            (),
             output_metadata,
             trace_ir=schema_ir,
         )
