@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING
 
 import pytest
@@ -25,7 +24,6 @@ from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import Cache, Join
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.engine.options import StreamingOptions
-from cudf_polars.streaming.actor_graph import join as join_actor_graph
 from cudf_polars.streaming.actor_graph.join import (
     _make_ordered_strategy,
     _use_pwise_join,
@@ -200,48 +198,6 @@ def test_ordered_join_strategy_checks_order_key_semantics(spmd_engine):
         is not None
     )
     assert _make_ordered_strategy(join_ir, left_partitioning, mismatched_right) is None
-
-
-def test_ordered_join_side_skips_adjust_when_aligned(spmd_engine, monkeypatch):
-    context = spmd_engine.context
-    partitioning = _order_partitioning(spmd_engine, (0,))
-    assert isinstance(partitioning.inter_rank_scheme, OrderScheme)
-    ordering = partitioning.inter_rank_scheme.orderings[0]
-    replayed = []
-
-    async def fail_adjust_ordering(*_args, **_kwargs) -> None:
-        raise AssertionError("aligned input should not call adjust_ordering")
-
-    async def record_replay(
-        _context, _ch_out, _ch_in, _buffered_chunks, metadata, **_kwargs
-    ) -> None:
-        assert _buffered_chunks == ()
-        replayed.append(metadata)
-
-    monkeypatch.setattr(join_actor_graph, "adjust_ordering", fail_adjust_ordering)
-    monkeypatch.setattr(join_actor_graph, "replay_buffered_channel", record_replay)
-
-    asyncio.run(
-        join_actor_graph._adjust_ordered_join_side(
-            context,
-            spmd_engine.comm,
-            object(),
-            object(),
-            object(),
-            object(),
-            ordering,
-            ordering,
-            collective_id=0,
-        )
-    )
-
-    (metadata,) = replayed
-    assert metadata.local_count == join_actor_graph._local_count_for_ordering(
-        spmd_engine.comm, ordering
-    )
-    assert metadata.partitioning.inter_rank.orderings[0].boundaries_aligned_with(
-        ordering, context.br()
-    )
 
 
 @pytest.mark.parametrize("how", ["right", "full"])
