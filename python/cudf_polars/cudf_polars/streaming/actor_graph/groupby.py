@@ -895,7 +895,6 @@ async def groupby_actor(
         partitioning_level: PartitioningLevel = (
             "local" if metadata_in.duplicated else "flat"
         )
-        input_ordering = _adjustable_ordering(partitioning)
         maintain_order = _maintain_order(ir)
         preserves_output_order = ir.preserves_output_order
         fully_partitioned = partitioning.is_strictly_partitioned(
@@ -979,7 +978,10 @@ async def groupby_actor(
                 aggregated=aggregated,
                 tracer=tracer,
             )
-        elif not metadata_in.duplicated and input_ordering is not None:
+        elif (
+            not metadata_in.duplicated
+            and (input_ordering := _adjustable_ordering(partitioning)) is not None
+        ):
             await _ordered_adjust_reduce(
                 context,
                 comm,
