@@ -735,15 +735,6 @@ def _build_order_scheme(
     )
 
 
-def _ordering_trace_info(ordering: Ordering) -> dict[str, bool | int]:
-    return {
-        "partition_count": ordering.num_boundaries + 1,
-        "boundary_count": ordering.num_boundaries,
-        "strict_boundaries": ordering.strict_boundaries,
-        "locally_ordered": ordering.locally_ordered,
-    }
-
-
 async def _global_sort(
     context: Context,
     comm: Communicator,
@@ -851,7 +842,6 @@ async def sort_actor(
                     if ordering.locally_ordered
                     else "order_partitioned_local_sort"
                 )
-                tracer.set_extra("input_ordering", _ordering_trace_info(ordering))
             await chunkwise_evaluate(
                 context,
                 ir,
