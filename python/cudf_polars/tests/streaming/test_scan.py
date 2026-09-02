@@ -28,9 +28,9 @@ from cudf_polars.dsl.utils.io import (
 )
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.streaming.actor_graph.collectives import ReserveOpIDs, reserve_op_id
-from cudf_polars.streaming.actor_graph.io import (
-    _parquet_ordering_partitioning,
-    resolve_max_concurrent_io_tasks,
+from cudf_polars.streaming.actor_graph.io import resolve_max_concurrent_io_tasks
+from cudf_polars.streaming.actor_graph.scan_ordering import (
+    extract_parquet_ordering_partitioning,
 )
 from cudf_polars.streaming.base import (
     DataSourceInfo,
@@ -456,7 +456,7 @@ def _run_parquet_ordering_partitioning(
                 executor,
                 get_cuda_stream=spmd_engine.context.br().stream_pool.get_stream,
             )
-            return await _parquet_ordering_partitioning(
+            return await extract_parquet_ordering_partitioning(
                 spmd_engine.context,
                 spmd_engine.comm,
                 streaming_scan,
