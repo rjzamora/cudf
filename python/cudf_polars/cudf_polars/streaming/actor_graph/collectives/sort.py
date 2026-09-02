@@ -817,6 +817,7 @@ async def sort_actor(
         trace_ir=ir,
         ir_context=ir_context,
     ) as tracer:
+        # Skip sort if OrderScheme metadata is present and compatible
         metadata_in = await recv_metadata(ch_in, context)
 
         if ir.zlice is not None:
