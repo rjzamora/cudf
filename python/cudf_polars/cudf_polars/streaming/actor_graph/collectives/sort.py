@@ -304,7 +304,7 @@ async def _simple_top_or_bottom_k(
     tracer: ActorTracer | None,
 ) -> None:
     """Sort + simple head/tail slice."""
-    # TODO: We may need to gate this optimization on the slice size
+    # TODO: We may need to gate this optimization on the slice size.
     await send_metadata(
         ch_out,
         context,
@@ -817,7 +817,7 @@ async def sort_actor(
         trace_ir=ir,
         ir_context=ir_context,
     ) as tracer:
-        # TODO: Skip sort if OrderScheme metadata is present and compatible
+        # TODO: Skip sort if OrderScheme metadata is present and compatible.
         metadata_in = await recv_metadata(ch_in, context)
 
         if ir.zlice is not None:
