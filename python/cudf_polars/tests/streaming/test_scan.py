@@ -20,6 +20,7 @@ from cudf_polars.dsl.ir import (
 from cudf_polars.dsl.utils.io import (
     CachedParquetInfo,
     _prefetch_parquet_footers_for_paths,
+    attach_cached_parquet_metadata,
     prefetch_parquet_file_metadata_for_ir,
 )
 from cudf_polars.engine.options import StreamingOptions
@@ -32,6 +33,7 @@ from cudf_polars.streaming.base import (
 )
 from cudf_polars.streaming.io import (
     FusedScan,
+    ParquetScanTask,
     SplitScan,
     StreamingScan,
     expand_scan_for_rank,
@@ -494,6 +496,54 @@ def test_expand_scan_for_rank_split_files(
         assert scan.split_index == split_index
         assert scan.total_splits == total_splits
         assert scan.paths == ["file.parquet"]
+
+
+def test_attach_cached_parquet_metadata_creates_parquet_scan_tasks(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "data.parquet"
+    pl.DataFrame({"x": range(4)}).write_parquet(source, row_group_size=2)
+
+    base = _make_parquet_scan([str(source)])
+    streaming_scan = StreamingScan.for_split_files(
+        base,
+        IOPartitionPlan(2, IOPartitionFlavor.SPLIT_FILES),
+        partition_count=2,
+        rank=0,
+        nranks=1,
+        parquet_options=base.parquet_options,
+    )
+
+    cached = prefetch_parquet_file_metadata_for_ir(streaming_scan, None)
+    attach_cached_parquet_metadata(streaming_scan, cached)
+
+    parquet_tasks = [
+        scan for scan in streaming_scan.scans if isinstance(scan, ParquetScanTask)
+    ]
+    assert len(parquet_tasks) == len(streaming_scan.scans)
+    assert [scan.row_groups for scan in parquet_tasks] == [[[0]], [[1]]]
+
+
+def test_attach_cached_parquet_metadata_keeps_sub_row_group_split_scan(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "data.parquet"
+    pl.DataFrame({"x": range(4)}).write_parquet(source, row_group_size=2)
+
+    base = _make_parquet_scan([str(source)])
+    streaming_scan = StreamingScan.for_split_files(
+        base,
+        IOPartitionPlan(4, IOPartitionFlavor.SPLIT_FILES),
+        partition_count=4,
+        rank=0,
+        nranks=1,
+        parquet_options=base.parquet_options,
+    )
+
+    cached = prefetch_parquet_file_metadata_for_ir(streaming_scan, None)
+    attach_cached_parquet_metadata(streaming_scan, cached)
+
+    assert all(isinstance(scan, SplitScan) for scan in streaming_scan.scans)
 
 
 def test_streaming_scan_raises() -> None:

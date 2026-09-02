@@ -60,7 +60,7 @@ if TYPE_CHECKING:
         IOPartitionPlan,
         PartitionInfo,
     )
-    from cudf_polars.streaming.io import FusedScan, SplitScan
+    from cudf_polars.streaming.io import StreamingScanTask
     from cudf_polars.utils.config import MaxConcurrentIOTasks
 
 
@@ -613,7 +613,7 @@ async def scan_node(
         Estimated retained output size of each chunk in bytes. Used to estimate
         peak memory for admission before launching each read.
     """
-    scans: Sequence[SplitScan] | Sequence[FusedScan] = ir.scans
+    scans: Sequence[StreamingScanTask] = ir.scans
 
     async with shutdown_on_error(
         context, ch_out, trace_ir=ir, ir_context=ir_context
@@ -651,13 +651,12 @@ async def scan_node(
         lineariser = Lineariser(context, ch_out, num_producers)
 
         # Assign tasks to producers using round-robin
-        producer_tasks: list[list[tuple[int, SplitScan | FusedScan]]] = [
+        producer_tasks: list[list[tuple[int, StreamingScanTask]]] = [
             [] for _ in range(num_producers)
         ]
         for task_idx, scan in enumerate(scans):
             producer_id = task_idx % num_producers
-            # mypy resolves __iter__ on union-of-sequences to the common base (IR)
-            producer_tasks[producer_id].append((task_idx, scan))  # type: ignore[arg-type]
+            producer_tasks[producer_id].append((task_idx, scan))
 
         async def _producer(producer_id: int, ch_out: Channel) -> None:
             for task_idx, scan in producer_tasks[producer_id]:
