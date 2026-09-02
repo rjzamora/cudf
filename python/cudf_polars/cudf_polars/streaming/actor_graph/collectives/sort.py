@@ -304,7 +304,7 @@ async def _simple_top_or_bottom_k(
     tracer: ActorTracer | None,
 ) -> None:
     """Sort + simple head/tail slice."""
-    # TODO: We may need to gate this optimization on the slice size.
+    # TODO: We may need to gate this optimization on the slice size
     await send_metadata(
         ch_out,
         context,
