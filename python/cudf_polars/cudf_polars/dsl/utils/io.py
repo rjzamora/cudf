@@ -240,6 +240,23 @@ def prefetch_parquet_file_metadata_for_ir(
     return cached_parquet_info
 
 
+def _attach_cached_metadata_to_scan_task(
+    scan: StreamingScanTask,
+    cached_parquet_info_map: dict[str, CachedParquetInfo],
+) -> StreamingScanTask:
+    """Attach cached parquet metadata and specialize row-group-aligned tasks."""
+    if isinstance(scan, ParquetScanTask):
+        return scan
+    if not all(path in cached_parquet_info_map for path in scan.paths):
+        return scan
+
+    cached = [cached_parquet_info_map[path] for path in scan.paths]
+    Scan._validate_cached_parquet_info(scan.paths, cached)
+    scan.cached_parquet_info = cached
+    scan._non_child_args = (*scan._non_child_args[:-1], cached)
+    return ParquetScanTask.from_scan(scan) or scan
+
+
 def attach_cached_parquet_metadata(
     root: IR,
     cached_parquet_info_map: dict[str, CachedParquetInfo],
@@ -257,26 +274,13 @@ def attach_cached_parquet_metadata(
         Mapping from file paths to cached parquet metadata.
     """
     for node in traversal([root]):
-        if isinstance(node, StreamingScan) and node.base_scan.typ == "parquet":
-            scans: list[StreamingScanTask] = []
-            changed = False
-            for scan in node.scans:
-                generic_scan = scan.scan if isinstance(scan, ParquetScanTask) else scan
-                if not all(
-                    path in cached_parquet_info_map for path in generic_scan.paths
-                ):
-                    scans.append(scan)
-                    continue
-                cached = [cached_parquet_info_map[path] for path in generic_scan.paths]
-                Scan._validate_cached_parquet_info(generic_scan.paths, cached)
-                generic_scan.cached_parquet_info = cached
-                generic_scan._non_child_args = (
-                    *generic_scan._non_child_args[:-1],
-                    cached,
-                )
-                task = ParquetScanTask.from_scan(generic_scan)
-                scans.append(task or generic_scan)
-                changed = changed or task is not None or scan is not generic_scan
-            if changed:
-                node.scans = scans
-                node._non_child_args = (node.scans, node.base_scan, node.scan_type)
+        if not isinstance(node, StreamingScan) or node.base_scan.typ != "parquet":
+            continue
+
+        scans = [
+            _attach_cached_metadata_to_scan_task(scan, cached_parquet_info_map)
+            for scan in node.scans
+        ]
+        if any(scan is not old for scan, old in zip(scans, node.scans, strict=True)):
+            node.scans = scans
+            node._non_child_args = (node.scans, node.base_scan, node.scan_type)

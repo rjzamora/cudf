@@ -921,26 +921,36 @@ class Scan(IR):
         n_rows: int,
         parquet_options: ParquetOptions,
         cached_parquet_info: list[CachedParquetInfo] | None,
+        row_groups: list[list[int]] | None = None,
     ) -> int:
         # Zero-width parquet files lose their row count when read through
         # pylibcudf. See https://github.com/NVIDIA/cudf/issues/21428
         if cached_parquet_info is not None:
             Scan._validate_cached_parquet_info(paths, cached_parquet_info)
-            parquet_metadatas = [
-                info.file_metadata for info in cached_parquet_info
-            ]  # pragma: no cover
-            num_rows = sum(
-                metadata.num_rows for metadata in parquet_metadatas
-            )  # pragma: no cover
+            if row_groups is None:
+                num_rows = sum(
+                    info.file_metadata.num_rows for info in cached_parquet_info
+                )  # pragma: no cover
+            else:
+                num_rows = sum(
+                    info.file_metadata.row_group_num_rows[row_group]
+                    for info, file_row_groups in zip(
+                        cached_parquet_info, row_groups, strict=True
+                    )
+                    for row_group in file_row_groups
+                )
         else:
+            if row_groups is not None:  # pragma: no cover
+                raise ValueError("Explicit parquet row groups require cached metadata.")
             meta = plc.io.parquet_metadata.read_parquet_metadata(
                 plc.io.SourceInfo(paths)
             )
             num_rows = meta.num_rows()
 
-        num_rows -= skip_rows
-        if n_rows != -1:
-            num_rows = min(num_rows, n_rows)
+        if row_groups is None:
+            num_rows -= skip_rows
+            if n_rows != -1:
+                num_rows = min(num_rows, n_rows)
         return max(num_rows, 0)
 
     @staticmethod
@@ -957,9 +967,7 @@ class Scan(IR):
         return plc.Table([columns[name] for name in with_columns]), with_columns
 
     @classmethod
-    @log_do_evaluate
-    @nvtx_annotate_cudf_polars(message="Scan")
-    def do_evaluate(
+    def _do_evaluate(
         cls,
         schema: Schema,
         typ: str,
@@ -973,6 +981,7 @@ class Scan(IR):
         predicate: expr.NamedExpr | None,
         parquet_options: ParquetOptions,
         cached_parquet_info: list[CachedParquetInfo] | None,
+        row_groups: list[list[int]] | None = None,
         *,
         context: IRExecutionContext,
     ) -> DataFrame:
@@ -1089,6 +1098,13 @@ class Scan(IR):
                     df,
                 )
         elif typ == "parquet":
+            if row_groups is not None and (
+                skip_rows != 0 or n_rows != -1 or row_index is not None
+            ):  # pragma: no cover
+                raise ValueError(
+                    "Explicit parquet row groups cannot be combined with row "
+                    "slicing or row indexes."
+                )
             if cached_parquet_info is not None:
                 Scan._validate_cached_parquet_info(paths, cached_parquet_info)
                 filepath_sources = []
@@ -1129,10 +1145,13 @@ class Scan(IR):
                 parquet_reader_options.set_column_names(with_columns)
             if filters is not None:
                 parquet_reader_options.set_filter(filters)
-            if n_rows != -1:
-                parquet_reader_options.set_num_rows(n_rows)
-            if skip_rows != 0:
-                parquet_reader_options.set_skip_rows(skip_rows)
+            if row_groups is not None:
+                parquet_reader_options.set_row_groups(row_groups)
+            else:
+                if n_rows != -1:
+                    parquet_reader_options.set_num_rows(n_rows)
+                if skip_rows != 0:
+                    parquet_reader_options.set_skip_rows(skip_rows)
             if parquet_options.chunked:
                 reader = plc.io.parquet.ChunkedParquetReader(
                     parquet_reader_options,
@@ -1165,6 +1184,7 @@ class Scan(IR):
                             n_rows,
                             parquet_options,
                             cached_parquet_info,
+                            row_groups,
                         ),
                     )
                 df = DataFrame.from_table(
@@ -1197,6 +1217,7 @@ class Scan(IR):
                             n_rows,
                             parquet_options,
                             cached_parquet_info,
+                            row_groups,
                         ),
                     )
                 df = DataFrame.from_table(
@@ -1261,6 +1282,43 @@ class Scan(IR):
             c.obj.type() == schema[name].plc_type for name, c in df.column_map.items()
         )
         return apply_predicate(df, effective_predicate)
+
+    @classmethod
+    @log_do_evaluate
+    @nvtx_annotate_cudf_polars(message="Scan")
+    def do_evaluate(
+        cls,
+        schema: Schema,
+        typ: str,
+        reader_options: dict[str, Any],
+        paths: list[str],
+        with_columns: list[str] | None,
+        skip_rows: int,
+        n_rows: int,
+        row_index: tuple[str, int] | None,
+        include_file_paths: str | None,
+        predicate: expr.NamedExpr | None,
+        parquet_options: ParquetOptions,
+        cached_parquet_info: list[CachedParquetInfo] | None,
+        *,
+        context: IRExecutionContext,
+    ) -> DataFrame:
+        """Evaluate and return a dataframe."""
+        return cls._do_evaluate(
+            schema,
+            typ,
+            reader_options,
+            paths,
+            with_columns,
+            skip_rows,
+            n_rows,
+            row_index,
+            include_file_paths,
+            predicate,
+            parquet_options,
+            cached_parquet_info,
+            context=context,
+        )
 
 
 class Sink(IR):
