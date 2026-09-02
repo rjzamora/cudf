@@ -244,9 +244,12 @@ def attach_cached_parquet_metadata(
     cached_parquet_info_map: dict[str, CachedParquetInfo],
 ) -> None:
     """
-    Attach prefetched metadata to scan nodes.
+    Attach prefetched metadata to scan nodes and specialize parquet scan tasks.
 
-    This is an optimization only and does not affect IR identity.
+    This is an optimization only and does not affect IR identity. When cached
+    metadata is available, row-group-aligned parquet scan tasks are converted to
+    ``ParquetScanTask`` so downstream parquet-specific code can use the resolved
+    path and row-group assignment directly.
 
     Parameters
     ----------
