@@ -396,7 +396,12 @@ def test_scan_union(engine: pl.GPUEngine, tmp_path: Path) -> None:
 
 
 def _make_parquet_scan(
-    paths: list[str], parquet_options: ParquetOptions | None = None
+    paths: list[str],
+    parquet_options: ParquetOptions | None = None,
+    *,
+    skip_rows: int = 0,
+    n_rows: int = -1,
+    row_index: tuple[str, int] | None = None,
 ) -> Scan:
     parquet_options = parquet_options or ParquetOptions()
     return Scan(
@@ -406,9 +411,9 @@ def _make_parquet_scan(
         None,
         paths,
         None,
-        0,
-        -1,
-        None,
+        skip_rows,
+        n_rows,
+        row_index,
         None,
         None,
         parquet_options,
@@ -544,6 +549,37 @@ def test_attach_cached_parquet_metadata_keeps_sub_row_group_split_scan(
     attach_cached_parquet_metadata(streaming_scan, cached)
 
     assert all(isinstance(scan, SplitScan) for scan in streaming_scan.scans)
+
+
+@pytest.mark.parametrize(
+    "skip_rows,n_rows,row_index",
+    [(1, -1, None), (0, 2, None), (0, -1, ("index", 0))],
+)
+def test_attach_cached_parquet_metadata_keeps_sliced_fused_scan(
+    tmp_path: Path,
+    skip_rows: int,
+    n_rows: int,
+    row_index: tuple[str, int] | None,
+) -> None:
+    source = tmp_path / "data.parquet"
+    pl.DataFrame({"x": range(4)}).write_parquet(source, row_group_size=2)
+
+    base = _make_parquet_scan(
+        [str(source)], skip_rows=skip_rows, n_rows=n_rows, row_index=row_index
+    )
+    streaming_scan = StreamingScan.for_fused_files(
+        base,
+        IOPartitionPlan(1, IOPartitionFlavor.SINGLE_READ),
+        partition_count=1,
+        rank=0,
+        nranks=1,
+        parquet_options=base.parquet_options,
+    )
+
+    cached = prefetch_parquet_file_metadata_for_ir(streaming_scan, None)
+    attach_cached_parquet_metadata(streaming_scan, cached)
+
+    assert all(isinstance(scan, FusedScan) for scan in streaming_scan.scans)
 
 
 def test_streaming_scan_raises() -> None:

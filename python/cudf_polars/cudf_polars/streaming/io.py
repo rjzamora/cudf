@@ -750,7 +750,14 @@ class ParquetScanTask(IR):
     def from_scan(cls, scan: FusedScan | SplitScan) -> Self | None:
         """Create a parquet row-group task for scans that are fully row-group based."""
         cached_parquet_info = scan.cached_parquet_info
-        if scan.base_scan.typ != "parquet" or cached_parquet_info is None:
+        base_scan = scan.base_scan
+        if base_scan.typ != "parquet" or cached_parquet_info is None:
+            return None
+        if (
+            base_scan.skip_rows != 0
+            or base_scan.n_rows != -1
+            or base_scan.row_index is not None
+        ):
             return None
 
         if isinstance(scan, SplitScan):
@@ -767,7 +774,7 @@ class ParquetScanTask(IR):
             n_rows = -1
 
         return cls(
-            scan.base_scan,
+            base_scan,
             scan.paths,
             row_groups,
             skip_rows,
