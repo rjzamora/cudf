@@ -838,14 +838,7 @@ async def sort_actor(
             len(ordering.keys) == len(order_keys) or ordering.strict_boundaries
         ):
             if tracer is not None:
-                needs_local_sort = not ordering.locally_ordered or len(
-                    ordering.keys
-                ) < len(order_keys)
-                tracer.decision = (
-                    "order_partitioned_local_sort"
-                    if needs_local_sort
-                    else "already_sorted"
-                )
+                tracer.decision = "already_sorted"
             await chunkwise_evaluate(
                 context,
                 ir,
