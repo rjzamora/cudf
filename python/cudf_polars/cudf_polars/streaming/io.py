@@ -338,6 +338,40 @@ def _read_with_hybrid_scan(
         return DataFrame(columns, stream=stream).select(list(schema.keys()))
 
 
+def _row_slice_from_row_groups(
+    cached_parquet_info: list[CachedParquetInfo], row_groups: list[list[int]]
+) -> tuple[int, int]:
+    """Translate a contiguous row-group selection to skip_rows and n_rows."""
+    skip_rows = n_rows = total_rows = 0
+    selected_started = selected_stopped = False
+
+    for info, file_row_groups in zip(cached_parquet_info, row_groups, strict=True):
+        file_row_counts = info.file_metadata.row_group_num_rows
+        if file_row_groups != sorted(set(file_row_groups)):  # pragma: no cover
+            raise ValueError("Expected row groups in on-disk order without duplicates.")
+        if file_row_groups and (
+            file_row_groups[0] < 0 or file_row_groups[-1] >= len(file_row_counts)
+        ):  # pragma: no cover
+            raise ValueError("Row group index out of range.")
+
+        selected = set(file_row_groups)
+        for row_group, rows in enumerate(file_row_counts):
+            total_rows += rows
+            if row_group in selected:
+                if selected_stopped:  # pragma: no cover
+                    raise ValueError("Expected one contiguous row-group selection.")
+                selected_started = True
+                n_rows += rows
+            elif selected_started:
+                selected_stopped = True
+            else:
+                skip_rows += rows
+
+    if selected_started and skip_rows + n_rows == total_rows:
+        return skip_rows, -1
+    return skip_rows, n_rows
+
+
 def _split_scan_row_groups(scan: SplitScan) -> list[list[int]] | None:
     """Return the complete row groups read by a row-group-aligned split."""
     cached_parquet_info = scan.cached_parquet_info
@@ -801,20 +835,31 @@ class ParquetScanTask(IR):
                 )
 
         with nvtx_annotate_cudf_polars(message=f"ParquetScan: {', '.join(paths)}"):
-            return Scan._do_evaluate(
+            if (
+                base_scan.skip_rows != 0
+                or base_scan.n_rows != -1
+                or base_scan.row_index is not None
+            ):  # pragma: no cover
+                raise ValueError(
+                    "Parquet row-group tasks cannot be combined with row slicing "
+                    "or row indexes."
+                )
+            skip_rows, n_rows = _row_slice_from_row_groups(
+                cached_parquet_info, row_groups
+            )
+            return Scan.do_evaluate(
                 base_scan.schema,
                 base_scan.typ,
                 base_scan.reader_options,
                 paths,
                 base_scan.with_columns,
-                base_scan.skip_rows,
-                base_scan.n_rows,
+                skip_rows,
+                n_rows,
                 base_scan.row_index,
                 base_scan.include_file_paths,
                 base_scan.predicate,
                 parquet_options,
                 cached_parquet_info,
-                row_groups,
                 context=context,
             )
 
