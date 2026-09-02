@@ -808,7 +808,6 @@ async def sort_actor(
         trace_ir=ir,
         ir_context=ir_context,
     ) as tracer:
-        # TODO: Skip sort if OrderScheme metadata is present and compatible.
         metadata_in = await recv_metadata(ch_in, context)
 
         if ir.zlice is not None:
@@ -832,15 +831,20 @@ async def sort_actor(
         partitioning = NormalizedPartitioning.from_keys(
             metadata_in.partitioning, comm.nranks, keys=order_keys
         )
-        ordering = partitioning.matching_ordering(
-            order_keys, level="local" if metadata_in.duplicated else "flat"
+        ordering = partitioning.get_ordering(
+            level="local" if metadata_in.duplicated else "flat"
         )
-        if ordering is not None:
+        if ordering is not None and (
+            len(ordering.keys) == len(order_keys) or ordering.strict_boundaries
+        ):
             if tracer is not None:
+                needs_local_sort = not ordering.locally_ordered or len(
+                    ordering.keys
+                ) < len(order_keys)
                 tracer.decision = (
-                    "already_sorted"
-                    if ordering.locally_ordered
-                    else "order_partitioned_local_sort"
+                    "order_partitioned_local_sort"
+                    if needs_local_sort
+                    else "already_sorted"
                 )
             await chunkwise_evaluate(
                 context,
