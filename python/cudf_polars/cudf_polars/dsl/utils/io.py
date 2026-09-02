@@ -25,7 +25,6 @@ from cudf_polars.streaming.io import (
 if TYPE_CHECKING:
     from cudf_polars.dsl.ir import IR
     from cudf_polars.streaming.base import StatsCollector
-    from cudf_polars.streaming.io import StreamingScanTask
 
 
 @dataclass(frozen=True)
@@ -240,23 +239,6 @@ def prefetch_parquet_file_metadata_for_ir(
     return cached_parquet_info
 
 
-def _attach_cached_metadata_to_scan_task(
-    scan: StreamingScanTask,
-    cached_parquet_info_map: dict[str, CachedParquetInfo],
-) -> StreamingScanTask:
-    """Attach cached parquet metadata and specialize row-group-aligned tasks."""
-    if isinstance(scan, ParquetScanTask):
-        return scan
-    if not all(path in cached_parquet_info_map for path in scan.paths):
-        return scan
-
-    cached = [cached_parquet_info_map[path] for path in scan.paths]
-    Scan._validate_cached_parquet_info(scan.paths, cached)
-    scan.cached_parquet_info = cached
-    scan._non_child_args = (*scan._non_child_args[:-1], cached)
-    return ParquetScanTask.from_scan(scan) or scan
-
-
 def attach_cached_parquet_metadata(
     root: IR,
     cached_parquet_info_map: dict[str, CachedParquetInfo],
@@ -274,13 +256,24 @@ def attach_cached_parquet_metadata(
         Mapping from file paths to cached parquet metadata.
     """
     for node in traversal([root]):
-        if not isinstance(node, StreamingScan) or node.base_scan.typ != "parquet":
-            continue
+        if isinstance(node, StreamingScan) and node.base_scan.typ == "parquet":
+            scans = list(node.scans)
+            converted = False
+            for i, scan in enumerate(scans):
+                if isinstance(scan, ParquetScanTask) or not all(
+                    path in cached_parquet_info_map for path in scan.paths
+                ):
+                    continue
 
-        scans = [
-            _attach_cached_metadata_to_scan_task(scan, cached_parquet_info_map)
-            for scan in node.scans
-        ]
-        if any(scan is not old for scan, old in zip(scans, node.scans, strict=True)):
-            node.scans = scans
-            node._non_child_args = (node.scans, node.base_scan, node.scan_type)
+                cached = [cached_parquet_info_map[path] for path in scan.paths]
+                Scan._validate_cached_parquet_info(scan.paths, cached)
+                scan.cached_parquet_info = cached
+                scan._non_child_args = (*scan._non_child_args[:-1], cached)
+
+                if (parquet_scan := ParquetScanTask.from_scan(scan)) is not None:
+                    scans[i] = parquet_scan
+                    converted = True
+
+            if converted:
+                node.scans = scans
+                node._non_child_args = (node.scans, node.base_scan, node.scan_type)

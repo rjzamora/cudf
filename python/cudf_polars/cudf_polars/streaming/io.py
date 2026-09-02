@@ -338,47 +338,16 @@ def _read_with_hybrid_scan(
         return DataFrame(columns, stream=stream).select(list(schema.keys()))
 
 
-def _row_slice_from_row_groups(
-    cached_parquet_info: list[CachedParquetInfo], row_groups: list[list[int]]
-) -> tuple[int, int]:
-    """Translate a contiguous row-group selection to skip_rows and n_rows."""
-    skip_rows = n_rows = total_rows = 0
-    selected_started = selected_stopped = False
-
-    for info, file_row_groups in zip(cached_parquet_info, row_groups, strict=True):
-        file_row_counts = info.file_metadata.row_group_num_rows
-        if file_row_groups != sorted(set(file_row_groups)):  # pragma: no cover
-            raise ValueError("Expected row groups in on-disk order without duplicates.")
-        if file_row_groups and (
-            file_row_groups[0] < 0 or file_row_groups[-1] >= len(file_row_counts)
-        ):  # pragma: no cover
-            raise ValueError("Row group index out of range.")
-
-        selected = set(file_row_groups)
-        for row_group, rows in enumerate(file_row_counts):
-            total_rows += rows
-            if row_group in selected:
-                if selected_stopped:  # pragma: no cover
-                    raise ValueError("Expected one contiguous row-group selection.")
-                selected_started = True
-                n_rows += rows
-            elif selected_started:
-                selected_stopped = True
-            else:
-                skip_rows += rows
-
-    if selected_started and skip_rows + n_rows == total_rows:
-        return skip_rows, -1
-    return skip_rows, n_rows
-
-
-def _split_scan_row_groups(scan: SplitScan) -> list[list[int]] | None:
-    """Return the complete row groups read by a row-group-aligned split."""
+def _split_scan_row_groups_and_slice(
+    scan: SplitScan,
+) -> tuple[list[list[int]], int, int] | None:
+    """Return the row groups and row slice for a row-group-aligned split."""
     cached_parquet_info = scan.cached_parquet_info
     if cached_parquet_info is None or len(cached_parquet_info) != 1:
         return None
 
-    total_row_groups = len(cached_parquet_info[0].file_metadata.row_group_num_rows)
+    row_group_num_rows = cached_parquet_info[0].file_metadata.row_group_num_rows
+    total_row_groups = len(row_group_num_rows)
     if scan.total_splits > total_row_groups:
         return None
 
@@ -389,7 +358,13 @@ def _split_scan_row_groups(scan: SplitScan) -> list[list[int]] | None:
         if scan.split_index == scan.total_splits - 1
         else start + row_group_stride
     )
-    return [list(range(start, stop))] if start < stop else None
+    row_groups = list(range(start, stop))
+    if not row_groups:
+        return None
+
+    skip_rows = sum(row_group_num_rows[:start])
+    n_rows = -1 if stop == total_row_groups else sum(row_group_num_rows[start:stop])
+    return [row_groups], skip_rows, n_rows
 
 
 class SplitScan(IR):
@@ -694,19 +669,23 @@ class ParquetScanTask(IR):
     __slots__ = (
         "base_scan",
         "cached_parquet_info",
+        "n_rows",
         "parquet_options",
         "paths",
         "row_groups",
         "schema",
+        "skip_rows",
     )
     _non_child = (
         "base_scan",
         "paths",
         "row_groups",
+        "skip_rows",
+        "n_rows",
         "parquet_options",
         "cached_parquet_info",
     )
-    _n_non_child_args = 5
+    _n_non_child_args = 7
 
     base_scan: Scan
     """Scan operation this task is based on."""
@@ -714,6 +693,10 @@ class ParquetScanTask(IR):
     """File paths assigned to this task."""
     row_groups: list[list[int]]
     """Row-group indices to read from each input path."""
+    skip_rows: int
+    """Number of rows to skip for the fallback parquet read."""
+    n_rows: int
+    """Number of rows to read for the fallback parquet read."""
     parquet_options: ParquetOptions
     """Parquet-specific options."""
     cached_parquet_info: list[CachedParquetInfo]
@@ -724,6 +707,8 @@ class ParquetScanTask(IR):
         base_scan: Scan,
         paths: list[str],
         row_groups: list[list[int]],
+        skip_rows: int,
+        n_rows: int,
         parquet_options: ParquetOptions,
         cached_parquet_info: list[CachedParquetInfo],
     ):
@@ -731,11 +716,22 @@ class ParquetScanTask(IR):
             raise ValueError(f"Expected a parquet scan task, got: {base_scan.typ}")
         if len(paths) != len(row_groups):  # pragma: no cover
             raise ValueError("Expected one row-group list for each input path.")
+        if (
+            base_scan.skip_rows != 0
+            or base_scan.n_rows != -1
+            or base_scan.row_index is not None
+        ):  # pragma: no cover
+            raise ValueError(
+                "Parquet row-group tasks cannot be combined with row slicing "
+                "or row indexes."
+            )
 
         Scan._validate_cached_parquet_info(paths, cached_parquet_info)
         self.base_scan = base_scan
         self.paths = paths
         self.row_groups = row_groups
+        self.skip_rows = skip_rows
+        self.n_rows = n_rows
         self.parquet_options = parquet_options
         self.cached_parquet_info = cached_parquet_info
         self.schema = base_scan.schema
@@ -743,6 +739,8 @@ class ParquetScanTask(IR):
             base_scan,
             paths,
             row_groups,
+            skip_rows,
+            n_rows,
             parquet_options,
             cached_parquet_info,
         )
@@ -756,19 +754,24 @@ class ParquetScanTask(IR):
             return None
 
         if isinstance(scan, SplitScan):
-            row_groups = _split_scan_row_groups(scan)
-            if row_groups is None:
+            result = _split_scan_row_groups_and_slice(scan)
+            if result is None:
                 return None
+            row_groups, skip_rows, n_rows = result
         else:
             row_groups = [
                 list(range(len(info.file_metadata.row_group_num_rows)))
                 for info in cached_parquet_info
             ]
+            skip_rows = 0
+            n_rows = -1
 
         return cls(
             scan.base_scan,
             scan.paths,
             row_groups,
+            skip_rows,
+            n_rows,
             scan.parquet_options,
             cached_parquet_info,
         )
@@ -781,6 +784,8 @@ class ParquetScanTask(IR):
             tuple(self.paths),
             self.parquet_options,
             tuple(tuple(row_groups) for row_groups in self.row_groups),
+            self.skip_rows,
+            self.n_rows,
         )
 
     @classmethod
@@ -789,6 +794,8 @@ class ParquetScanTask(IR):
         base_scan: Scan,
         paths: list[str],
         row_groups: list[list[int]],
+        skip_rows: int,
+        n_rows: int,
         parquet_options: ParquetOptions,
         cached_parquet_info: list[CachedParquetInfo],
         *,
@@ -835,18 +842,6 @@ class ParquetScanTask(IR):
                 )
 
         with nvtx_annotate_cudf_polars(message=f"ParquetScan: {', '.join(paths)}"):
-            if (
-                base_scan.skip_rows != 0
-                or base_scan.n_rows != -1
-                or base_scan.row_index is not None
-            ):  # pragma: no cover
-                raise ValueError(
-                    "Parquet row-group tasks cannot be combined with row slicing "
-                    "or row indexes."
-                )
-            skip_rows, n_rows = _row_slice_from_row_groups(
-                cached_parquet_info, row_groups
-            )
             return Scan.do_evaluate(
                 base_scan.schema,
                 base_scan.typ,
