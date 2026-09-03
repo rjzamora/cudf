@@ -351,35 +351,6 @@ class ParquetTaskBounds(NamedTuple):
     n_rows: int
 
 
-def _split_scan_bounds(
-    row_group_num_rows: Sequence[int],
-    split_index: int,
-    total_splits: int,
-) -> ParquetTaskBounds:
-    """Return row and row-group bounds for a file split."""
-    total_row_groups = len(row_group_num_rows)
-    if total_splits <= total_row_groups:
-        row_group_stride = total_row_groups // total_splits
-        row_group_start = row_group_stride * split_index
-        row_group_stop = (
-            total_row_groups
-            if split_index == total_splits - 1
-            else row_group_start + row_group_stride
-        )
-        skip_rows = sum(row_group_num_rows[:row_group_start])
-        n_rows = sum(row_group_num_rows[row_group_start:row_group_stop])
-        row_groups = [list(range(row_group_start, row_group_stop))]
-    else:
-        row_groups = []
-        total_rows = sum(row_group_num_rows)
-        n_rows = total_rows // total_splits
-        skip_rows = n_rows * split_index
-
-    if split_index == total_splits - 1:
-        n_rows = -1
-    return ParquetTaskBounds(row_groups, skip_rows, n_rows)
-
-
 def _cached_parquet_info_for_paths(
     base_scan: Scan,
     paths: list[str],
@@ -453,6 +424,49 @@ class SplitScan(IR):
             raise NotImplementedError(
                 f"Unhandled Scan type for file splitting: {base_scan.typ}"
             )
+
+    def _parquet_task_bounds(
+        self,
+        cached_parquet_info: list[CachedParquetInfo] | None,
+        *,
+        fetch_missing_metadata: bool,
+    ) -> ParquetTaskBounds | None:
+        """Return parquet read bounds for this split task."""
+        if len(self.paths) > 1:  # pragma: no cover
+            raise ValueError(f"Expected a single path, got: {self.paths}")
+        if cached_parquet_info is not None:
+            row_group_num_rows = cached_parquet_info[0].file_metadata.row_group_num_rows
+        elif fetch_missing_metadata:
+            row_group_num_rows = [
+                rg["num_rows"]
+                for rg in plc.io.parquet_metadata.read_parquet_metadata(
+                    plc.io.SourceInfo(self.paths)
+                ).rowgroup_metadata()
+            ]
+        else:
+            return None
+
+        total_row_groups = len(row_group_num_rows)
+        if self.total_splits <= total_row_groups:
+            row_group_stride = total_row_groups // self.total_splits
+            row_group_start = row_group_stride * self.split_index
+            row_group_stop = (
+                total_row_groups
+                if self.split_index == self.total_splits - 1
+                else row_group_start + row_group_stride
+            )
+            skip_rows = sum(row_group_num_rows[:row_group_start])
+            n_rows = sum(row_group_num_rows[row_group_start:row_group_stop])
+            row_groups = [list(range(row_group_start, row_group_stop))]
+        else:
+            row_groups = []
+            total_rows = sum(row_group_num_rows)
+            n_rows = total_rows // self.total_splits
+            skip_rows = n_rows * self.split_index
+
+        if self.split_index == self.total_splits - 1:
+            n_rows = -1
+        return ParquetTaskBounds(row_groups, skip_rows, n_rows)
 
     def get_hashable(self) -> Hashable:
         """Hashable representation of the node."""
@@ -601,25 +615,9 @@ class ParquetScanTask(IR):
         base_scan = base_task.base_scan
 
         if isinstance(base_task, SplitScan):
-            if len(base_task.paths) > 1:  # pragma: no cover
-                raise ValueError(f"Expected a single path, got: {base_task.paths}")
-            if cached_parquet_info is not None:
-                row_group_num_rows = cached_parquet_info[
-                    0
-                ].file_metadata.row_group_num_rows
-            elif fetch_missing_metadata:
-                row_group_num_rows = [
-                    rg["num_rows"]
-                    for rg in plc.io.parquet_metadata.read_parquet_metadata(
-                        plc.io.SourceInfo(base_task.paths)
-                    ).rowgroup_metadata()
-                ]
-            else:
-                return None
-            return _split_scan_bounds(
-                row_group_num_rows,
-                base_task.split_index,
-                base_task.total_splits,
+            return base_task._parquet_task_bounds(
+                cached_parquet_info,
+                fetch_missing_metadata=fetch_missing_metadata,
             )
 
         row_groups: list[list[int]] = []
