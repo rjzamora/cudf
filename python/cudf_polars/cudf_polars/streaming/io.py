@@ -420,24 +420,14 @@ class SplitScan(IR):
     def _parquet_task_bounds(
         self,
         cached_parquet_info: list[CachedParquetInfo] | None,
-        *,
-        fetch_missing_metadata: bool,
     ) -> ParquetTaskBounds | None:
         """Return parquet read bounds for this split task."""
         if len(self.paths) > 1:  # pragma: no cover
             raise ValueError(f"Expected a single path, got: {self.paths}")
-        if cached_parquet_info is not None:
-            row_group_num_rows = cached_parquet_info[0].file_metadata.row_group_num_rows
-        elif fetch_missing_metadata:
-            row_group_num_rows = [
-                rg["num_rows"]
-                for rg in plc.io.parquet_metadata.read_parquet_metadata(
-                    plc.io.SourceInfo(self.paths)
-                ).rowgroup_metadata()
-            ]
-        else:
+        if cached_parquet_info is None:
             return None
 
+        row_group_num_rows = cached_parquet_info[0].file_metadata.row_group_num_rows
         total_row_groups = len(row_group_num_rows)
         if self.total_splits <= total_row_groups:
             row_group_stride = total_row_groups // self.total_splits
@@ -588,14 +578,9 @@ class ParquetScanTask(IR):
         self._non_child_args = (base_task,)
         self.children = ()
 
-    def get_task_bounds(
-        self, *, fetch_missing_metadata: bool = False
-    ) -> ParquetTaskBounds | None:
+    def get_task_bounds(self) -> ParquetTaskBounds | None:
         """Return parquet read bounds for this task."""
-        return self._task_bounds_from_cached(
-            self._cached_parquet_info(),
-            fetch_missing_metadata=fetch_missing_metadata,
-        )
+        return self._task_bounds_from_cached(self._cached_parquet_info())
 
     def _cached_parquet_info(self) -> list[CachedParquetInfo] | None:
         """Return cached parquet metadata matching this task's paths."""
@@ -610,20 +595,24 @@ class ParquetScanTask(IR):
             return None
         return [cached_by_path[path] for path in self.paths]
 
+    def _fetch_parquet_info(self) -> list[CachedParquetInfo]:
+        """Fetch parquet metadata for this task's paths."""
+        from cudf_polars.dsl.utils.io import _prefetch_parquet_footers_for_paths
+
+        return _prefetch_parquet_footers_for_paths(
+            self.paths,
+            parse_hybrid_metadata=self.base_task.parquet_options.use_hybrid_scan,
+        )
+
     def _task_bounds_from_cached(
         self,
         cached_parquet_info: list[CachedParquetInfo] | None,
-        *,
-        fetch_missing_metadata: bool,
     ) -> ParquetTaskBounds | None:
         base_task = self.base_task
         base_scan = self.base_scan
 
         if isinstance(base_task, SplitScan):
-            return base_task._parquet_task_bounds(
-                cached_parquet_info,
-                fetch_missing_metadata=fetch_missing_metadata,
-            )
+            return base_task._parquet_task_bounds(cached_parquet_info)
 
         row_groups: list[list[int]] | None = None
         if (
@@ -658,14 +647,13 @@ class ParquetScanTask(IR):
         paths = task.paths
         parquet_options = base_task.parquet_options
         cached_parquet_info = task._cached_parquet_info()
-        bounds = task._task_bounds_from_cached(
-            cached_parquet_info,
-            fetch_missing_metadata=True,
-        )
+        if cached_parquet_info is None and isinstance(base_task, SplitScan):
+            cached_parquet_info = task._fetch_parquet_info()
+        bounds = task._task_bounds_from_cached(cached_parquet_info)
 
         assert bounds is not None
-        # Hybrid scan reads through the prefetched, shared file metadata, so
-        # it is only used when footer prefetching is enabled.
+        # Hybrid scan reads through cached parquet metadata, so it is only used
+        # when the metadata is available to this task.
         # TODO: Investigate re-enabling for some of the excluded paths
         # (row_index / include_file_paths). Needs performance investigation.
         if (
