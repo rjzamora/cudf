@@ -11,7 +11,7 @@ import math
 import statistics
 from collections import defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Self, TypeAlias, overload
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Self, TypeAlias, overload
 
 import polars as pl
 
@@ -356,27 +356,58 @@ def _split_scan_row_groups_and_slice(
     if scan.total_splits > total_row_groups:
         return None
 
-    row_group_stride = total_row_groups // scan.total_splits
-    start = row_group_stride * scan.split_index
-    stop = (
-        total_row_groups
-        if scan.split_index == scan.total_splits - 1
-        else start + row_group_stride
-    )
-    row_groups = list(range(start, stop))
+    bounds = _split_scan_bounds(row_group_num_rows, scan.split_index, scan.total_splits)
+    row_groups = list(range(bounds.row_group_start, bounds.row_group_stop))
     if not row_groups:
         return None
 
-    skip_rows = sum(row_group_num_rows[:start])
-    n_rows = -1 if stop == total_row_groups else sum(row_group_num_rows[start:stop])
-    return [row_groups], skip_rows, n_rows
+    return [row_groups], bounds.skip_rows, bounds.n_rows
 
 
-def _cached_parquet_info_for_paths(
-    paths: list[str],
-    cached_parquet_info: list[CachedParquetInfo] | None,
+class _SplitScanBounds(NamedTuple):
+    """Row and row-group bounds for a split scan."""
+
+    row_group_start: int
+    row_group_stop: int
+    skip_rows: int
+    n_rows: int
+
+
+def _split_scan_bounds(
+    row_group_num_rows: Sequence[int],
+    split_index: int,
+    total_splits: int,
+) -> _SplitScanBounds:
+    """Return row and row-group bounds for a file split."""
+    total_row_groups = len(row_group_num_rows)
+    if total_splits <= total_row_groups:
+        row_group_stride = total_row_groups // total_splits
+        row_group_start = row_group_stride * split_index
+        row_group_stop = (
+            total_row_groups
+            if split_index == total_splits - 1
+            else row_group_start + row_group_stride
+        )
+        skip_rows = sum(row_group_num_rows[:row_group_start])
+        n_rows = sum(row_group_num_rows[row_group_start:row_group_stop])
+    else:
+        row_group_start = 0
+        row_group_stop = 0
+        total_rows = sum(row_group_num_rows)
+        n_rows = total_rows // total_splits
+        skip_rows = n_rows * split_index
+
+    if split_index == total_splits - 1:
+        n_rows = -1
+    return _SplitScanBounds(row_group_start, row_group_stop, skip_rows, n_rows)
+
+
+def _cached_parquet_info_for_scan(
+    scan: SplitScan | FusedScan,
 ) -> list[CachedParquetInfo] | None:
-    """Return cached parquet metadata matching ``paths``."""
+    """Return cached parquet metadata matching a scan task."""
+    paths = scan.paths
+    cached_parquet_info = scan.base_scan.cached_parquet_info
     if cached_parquet_info is None or cached_parquet_info == []:
         return None
     if paths == [info.path for info in cached_parquet_info]:
@@ -386,16 +417,6 @@ def _cached_parquet_info_for_paths(
     if not all(path in cached_by_path for path in paths):
         return None
     return [cached_by_path[path] for path in paths]
-
-
-def _set_scan_cached_parquet_info(
-    scan: Scan,
-    cached_parquet_info: list[CachedParquetInfo],
-) -> None:
-    """Attach cached parquet metadata to a scan."""
-    Scan._validate_cached_parquet_info(scan.paths, cached_parquet_info)
-    scan.cached_parquet_info = cached_parquet_info
-    scan._non_child_args = (*scan._non_child_args[:-1], cached_parquet_info)
 
 
 class SplitScan(IR):
@@ -495,24 +516,13 @@ class SplitScan(IR):
         if len(paths) > 1:  # pragma: no cover
             raise ValueError(f"Expected a single path, got: {paths}")
 
-        # Parquet logic:
-        # - We are one of "total_splits" SplitScan nodes
-        #   assigned to the same file.
-        # - We know our index within this file ("split_index")
-        # - We can also use parquet metadata to query the
-        #   total number of rows in each row-group of the file.
-        # - We can use all this information to calculate the
-        #   "skip_rows" and "n_rows" options to use locally.
-
         if cached_parquet_info is not None:
             parquet_metadatas = [info.file_metadata for info in cached_parquet_info]
-
             row_group_num_rows = [
                 num_rows
                 for metadata in parquet_metadatas
                 for num_rows in metadata.row_group_num_rows
             ]
-
         else:
             row_group_num_rows = [
                 rg["num_rows"]
@@ -520,30 +530,7 @@ class SplitScan(IR):
                     plc.io.SourceInfo(paths)
                 ).rowgroup_metadata()
             ]
-
-        total_row_groups = len(row_group_num_rows)
-        if total_splits <= total_row_groups:
-            # We have enough row-groups in the file to align
-            # all "total_splits" of our reads with row-group
-            # boundaries. Calculate which row-groups to include
-            # in the current read, and use metadata to translate
-            # the row-group indices to "skip_rows" and "n_rows".
-            rg_stride = total_row_groups // total_splits
-            skip_rgs = rg_stride * split_index
-            skip_rows = sum(row_group_num_rows[:skip_rgs])
-            n_rows = sum(row_group_num_rows[skip_rgs : skip_rgs + rg_stride])
-        else:
-            # There are not enough row-groups to align
-            # all "total_splits" of our reads with row-group
-            # boundaries. Use metadata to directly calculate
-            # "skip_rows" and "n_rows" for the current read.
-            total_rows = sum(row_group_num_rows)
-            n_rows = total_rows // total_splits
-            skip_rows = n_rows * split_index
-
-        # Last split should always read to end of file
-        if split_index == (total_splits - 1):
-            n_rows = -1
+        bounds = _split_scan_bounds(row_group_num_rows, split_index, total_splits)
 
         # Perform the partial read
         with nvtx_annotate_cudf_polars(
@@ -555,8 +542,8 @@ class SplitScan(IR):
                 base_scan.reader_options,
                 paths,
                 base_scan.with_columns,
-                skip_rows,
-                n_rows,
+                bounds.skip_rows,
+                bounds.n_rows,
                 base_scan.row_index,
                 base_scan.include_file_paths,
                 base_scan.predicate,
@@ -717,10 +704,7 @@ class ParquetScanTask(IR):
         """Return row groups and row slice when this task is row-group aligned."""
         return self._row_groups_and_slice(
             self.base_task,
-            _cached_parquet_info_for_paths(
-                self.base_task.paths,
-                self.base_task.base_scan.cached_parquet_info,
-            ),
+            _cached_parquet_info_for_scan(self.base_task),
         )
 
     @staticmethod
@@ -765,9 +749,7 @@ class ParquetScanTask(IR):
         base_scan = base_task.base_scan
         paths = base_task.paths
         parquet_options = base_task.parquet_options
-        cached_parquet_info = _cached_parquet_info_for_paths(
-            base_task.paths, base_task.base_scan.cached_parquet_info
-        )
+        cached_parquet_info = _cached_parquet_info_for_scan(base_task)
         row_group_info = cls._row_groups_and_slice(base_task, cached_parquet_info)
 
         if row_group_info is not None:

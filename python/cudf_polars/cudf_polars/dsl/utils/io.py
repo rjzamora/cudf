@@ -19,7 +19,6 @@ from cudf_polars.streaming.io import (
     ParquetSourceInfo,
     Scan,
     StreamingScan,
-    _set_scan_cached_parquet_info,
 )
 
 if TYPE_CHECKING:
@@ -257,9 +256,10 @@ def attach_cached_parquet_metadata(
     """
     for node in traversal([root]):
         if isinstance(node, StreamingScan) and node.base_scan.typ == "parquet":
-            if not all(
-                path in cached_parquet_info_map for path in node.base_scan.paths
-            ):
+            base_scan = node.base_scan
+            if not all(path in cached_parquet_info_map for path in base_scan.paths):
                 continue
-            cached = [cached_parquet_info_map[path] for path in node.base_scan.paths]
-            _set_scan_cached_parquet_info(node.base_scan, cached)
+            cached = [cached_parquet_info_map[path] for path in base_scan.paths]
+            Scan._validate_cached_parquet_info(base_scan.paths, cached)
+            base_scan.cached_parquet_info = cached
+            base_scan._non_child_args = (*base_scan._non_child_args[:-1], cached)
