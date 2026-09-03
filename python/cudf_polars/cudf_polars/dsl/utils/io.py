@@ -16,10 +16,10 @@ import pylibcudf as plc
 from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.streaming.io import (
-    ParquetScanTask,
     ParquetSourceInfo,
     Scan,
     StreamingScan,
+    _set_scan_cached_parquet_info,
 )
 
 if TYPE_CHECKING:
@@ -244,7 +244,7 @@ def attach_cached_parquet_metadata(
     cached_parquet_info_map: dict[str, CachedParquetInfo],
 ) -> None:
     """
-    Attach prefetched metadata to parquet scan tasks.
+    Attach prefetched metadata to parquet scan nodes.
 
     This is an optimization only and does not affect IR identity.
 
@@ -257,11 +257,9 @@ def attach_cached_parquet_metadata(
     """
     for node in traversal([root]):
         if isinstance(node, StreamingScan) and node.base_scan.typ == "parquet":
-            for scan in node.scans:
-                if not isinstance(scan, ParquetScanTask) or not all(
-                    path in cached_parquet_info_map for path in scan.paths
-                ):
-                    continue
-
-                cached = [cached_parquet_info_map[path] for path in scan.paths]
-                scan.attach_cached_parquet_info(cached)
+            if not all(
+                path in cached_parquet_info_map for path in node.base_scan.paths
+            ):
+                continue
+            cached = [cached_parquet_info_map[path] for path in node.base_scan.paths]
+            _set_scan_cached_parquet_info(node.base_scan, cached)
