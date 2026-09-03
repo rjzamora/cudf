@@ -32,8 +32,8 @@ from cudf_polars.streaming.base import (
     StatsCollector,
 )
 from cudf_polars.streaming.io import (
+    AlignedParquetScan,
     FusedScan,
-    ParquetScanTask,
     SplitScan,
     StreamingScan,
     expand_scan_for_rank,
@@ -523,7 +523,7 @@ def test_attach_cached_parquet_metadata_creates_parquet_scan_tasks(
     attach_cached_parquet_metadata(streaming_scan, cached)
 
     parquet_tasks = [
-        scan for scan in streaming_scan.scans if isinstance(scan, ParquetScanTask)
+        scan for scan in streaming_scan.scans if isinstance(scan, AlignedParquetScan)
     ]
     assert len(parquet_tasks) == len(streaming_scan.scans)
     assert [scan.row_groups for scan in parquet_tasks] == [[[0]], [[1]]]

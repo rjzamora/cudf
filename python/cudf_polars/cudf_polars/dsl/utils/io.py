@@ -16,7 +16,7 @@ import pylibcudf as plc
 from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.streaming.io import (
-    ParquetScanTask,
+    AlignedParquetScan,
     ParquetSourceInfo,
     Scan,
     StreamingScan,
@@ -248,7 +248,7 @@ def attach_cached_parquet_metadata(
 
     This is an optimization only and does not affect IR identity. When cached
     metadata is available, row-group-aligned parquet scan tasks are converted to
-    ``ParquetScanTask`` so downstream parquet-specific code can use the resolved
+    ``AlignedParquetScan`` so downstream parquet-specific code can use the resolved
     path and row-group assignment directly.
 
     Parameters
@@ -263,7 +263,7 @@ def attach_cached_parquet_metadata(
             scans = list(node.scans)
             converted = False
             for i, scan in enumerate(scans):
-                if isinstance(scan, ParquetScanTask) or not all(
+                if isinstance(scan, AlignedParquetScan) or not all(
                     path in cached_parquet_info_map for path in scan.paths
                 ):
                     continue
@@ -273,7 +273,7 @@ def attach_cached_parquet_metadata(
                 scan.cached_parquet_info = cached
                 scan._non_child_args = (*scan._non_child_args[:-1], cached)
 
-                if (parquet_scan := ParquetScanTask.from_scan(scan)) is not None:
+                if (parquet_scan := AlignedParquetScan.from_scan(scan)) is not None:
                     scans[i] = parquet_scan
                     converted = True
 

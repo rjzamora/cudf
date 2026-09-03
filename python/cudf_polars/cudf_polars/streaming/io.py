@@ -668,8 +668,8 @@ class FusedScan(IR):
             )
 
 
-class ParquetScanTask(IR):
-    """Parquet scan task that reads complete row groups."""
+class AlignedParquetScan(IR):
+    """Parquet scan task aligned to complete row groups."""
 
     __slots__ = (
         "base_scan",
@@ -718,7 +718,7 @@ class ParquetScanTask(IR):
         cached_parquet_info: list[CachedParquetInfo],
     ):
         if base_scan.typ != "parquet":  # pragma: no cover
-            raise ValueError(f"Expected a parquet scan task, got: {base_scan.typ}")
+            raise ValueError(f"Expected a parquet scan, got: {base_scan.typ}")
         if len(paths) != len(row_groups):  # pragma: no cover
             raise ValueError("Expected one row-group list for each input path.")
         if (
@@ -753,7 +753,7 @@ class ParquetScanTask(IR):
 
     @classmethod
     def from_scan(cls, scan: FusedScan | SplitScan) -> Self | None:
-        """Create a parquet row-group task for scans that are fully row-group based."""
+        """Create an aligned parquet scan from a row-group-aligned scan task."""
         cached_parquet_info = scan.cached_parquet_info
         base_scan = scan.base_scan
         if base_scan.typ != "parquet" or cached_parquet_info is None:
@@ -813,7 +813,7 @@ class ParquetScanTask(IR):
         *,
         context: IRExecutionContext,
     ) -> DataFrame:
-        """Evaluate a parquet row-group task."""
+        """Evaluate a row-group-aligned parquet scan."""
         # Hybrid scan reads through the prefetched, shared file metadata, so
         # it is only used when footer prefetching is enabled.
         # TODO: Investigate re-enabling for some of the excluded paths
@@ -871,7 +871,7 @@ class ParquetScanTask(IR):
             )
 
 
-StreamingScanTask: TypeAlias = SplitScan | FusedScan | ParquetScanTask
+StreamingScanTask: TypeAlias = SplitScan | FusedScan | AlignedParquetScan
 
 
 @lower_ir_node.register(Empty)
