@@ -180,7 +180,7 @@ def test_prefetch_skips_paths_cached_by_stats_collection(
     )
 
     scan = _make_parquet_scan(paths)
-    fused = FusedScan(scan.schema, scan, paths, scan.parquet_options, None)
+    fused = FusedScan(scan, paths, scan.parquet_options)
     streaming_scan = StreamingScan([fused], scan, "fused")
 
     result = prefetch_parquet_file_metadata_for_ir(
@@ -196,7 +196,7 @@ def test_prefetch_parquet_file_metadata_remote_only(tmp_path, df) -> None:
     local_path = str(next(tmp_path.glob("*.parquet")))
 
     scan = _make_parquet_scan([local_path])
-    fused = FusedScan(scan.schema, scan, scan.paths, scan.parquet_options, [])
+    fused = FusedScan(scan, scan.paths, scan.parquet_options)
     streaming_scan = StreamingScan([fused], scan, "fused")
 
     # Local paths are skipped entirely when remote_only=True.
@@ -595,7 +595,7 @@ def test_attach_cached_parquet_metadata_leaves_sliced_fused_scan_unaligned(
 def test_streaming_scan_raises() -> None:
     # This isn't reachable by normal cudf-polars usage.
     scan = _make_parquet_scan(["file.parquet"])
-    fused = FusedScan(scan.schema, scan, scan.paths, scan.parquet_options, [])
+    fused = FusedScan(scan, scan.paths, scan.parquet_options)
     ctx = IRExecutionContext()
     with pytest.raises(NotImplementedError, match=r"StreamingScan.do_evaluate"):
         StreamingScan.do_evaluate([fused], scan, context=ctx)
@@ -672,7 +672,7 @@ def test_streaming_scan_missing_prefetch_metadata_raises() -> None:
     scan = _make_parquet_scan(
         ["file.parquet"], parquet_options=ParquetOptions(prefetch_file_metadata=True)
     )
-    fused = FusedScan(scan.schema, scan, scan.paths, scan.parquet_options, [])
+    fused = FusedScan(scan, scan.paths, scan.parquet_options)
 
     ctx = IRExecutionContext()
     with pytest.raises(NotImplementedError, match=r"StreamingScan.do_evaluate"):
@@ -683,28 +683,19 @@ def test_split_scan_do_evaluate_missing_prefetch_metadata() -> None:
     paths = ["/some/missing/file.parquet"]
     parquet_options = ParquetOptions(prefetch_file_metadata=True)
     context = IRExecutionContext()
-    schema = {"x": DataType(pl.Int64())}
 
     with pytest.raises(
         AssertionError,
         match=(r"Paths do not match cached parquet info."),
     ):
         SplitScan.do_evaluate(
+            _make_parquet_scan(paths, parquet_options),
+            paths,
             0,
             4,
-            schema,
-            "parquet",
-            {},
-            paths,
-            None,
-            0,
-            -1,
-            None,
-            None,
-            None,
             parquet_options,
-            [],
             context=context,
+            cached_parquet_info=[],
         )
 
 
@@ -766,11 +757,10 @@ def test_prefetch_file_metadata_with_cached_scan_parent_nodes(
 def test_fused_scan_identity_equality() -> None:
     base = _make_parquet_scan(["a.parquet", "b.parquet"])
     paths = ["a.parquet"]
-    info = _make_cached_parquet_info(paths)
 
-    a = FusedScan(base.schema, base, paths, base.parquet_options, info)
-    b = FusedScan(base.schema, base, paths, base.parquet_options, info.copy())
-    c = FusedScan(base.schema, base, ["b.parquet"], base.parquet_options, info)
+    a = FusedScan(base, paths, base.parquet_options)
+    b = FusedScan(base, paths, base.parquet_options)
+    c = FusedScan(base, ["b.parquet"], base.parquet_options)
 
     assert a == b
     assert hash(a) == hash(b)
@@ -779,13 +769,10 @@ def test_fused_scan_identity_equality() -> None:
 
 def test_split_scan_identity_equality() -> None:
     base = _make_parquet_scan(["a.parquet"])
-    info = _make_cached_parquet_info(base.paths)
 
-    a = SplitScan(base.schema, base, base.paths, 0, 4, base.parquet_options, info)
-    b = SplitScan(
-        base.schema, base, base.paths, 0, 4, base.parquet_options, info.copy()
-    )
-    c = SplitScan(base.schema, base, base.paths, 1, 4, base.parquet_options, info)
+    a = SplitScan(base, base.paths, 0, 4, base.parquet_options)
+    b = SplitScan(base, base.paths, 0, 4, base.parquet_options)
+    c = SplitScan(base, base.paths, 1, 4, base.parquet_options)
 
     assert a == b
     assert hash(a) == hash(b)
@@ -795,31 +782,25 @@ def test_split_scan_identity_equality() -> None:
 def test_streaming_scan_identity_equality() -> None:
     base = _make_parquet_scan(["a.parquet"])
     split = SplitScan(
-        base.schema,
         base,
         base.paths,
         0,
         2,
         base.parquet_options,
-        _make_cached_parquet_info(base.paths, size=10),
     )
     split_same = SplitScan(
-        base.schema,
         base,
         base.paths,
         0,
         2,
         base.parquet_options,
-        _make_cached_parquet_info(base.paths, size=11),
     )
     split_diff = SplitScan(
-        base.schema,
         base,
         base.paths,
         1,
         2,
         base.parquet_options,
-        _make_cached_parquet_info(base.paths, size=10),
     )
 
     a = StreamingScan([split], base, "split")
@@ -853,20 +834,6 @@ def test_cached_parquet_info_excluded_from_identity() -> None:
     )
     assert scan_without == scan_with
     assert hash(scan_without) == hash(scan_with)
-
-    split_without = SplitScan(
-        base.schema, base, base.paths, 0, 4, base.parquet_options, None
-    )
-    split_with = SplitScan(
-        base.schema, base, base.paths, 0, 4, base.parquet_options, info
-    )
-    assert split_without == split_with
-    assert hash(split_without) == hash(split_with)
-
-    fused_without = FusedScan(base.schema, base, base.paths, base.parquet_options, None)
-    fused_with = FusedScan(base.schema, base, base.paths, base.parquet_options, info)
-    assert fused_without == fused_with
-    assert hash(fused_without) == hash(fused_with)
 
 
 class FooSource(DataSourceInfo):
