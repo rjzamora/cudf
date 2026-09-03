@@ -238,16 +238,6 @@ def prefetch_parquet_file_metadata_for_ir(
     return cached_parquet_info
 
 
-def _set_scan_cached_parquet_info(
-    scan: Scan,
-    cached_parquet_info: list[CachedParquetInfo],
-) -> None:
-    """Attach cached parquet metadata to a scan without changing its identity."""
-    Scan._validate_cached_parquet_info(scan.paths, cached_parquet_info)
-    scan.cached_parquet_info = cached_parquet_info
-    scan._non_child_args = (*scan._non_child_args[:-1], cached_parquet_info)
-
-
 def attach_cached_parquet_metadata(
     root: IR,
     cached_parquet_info_map: dict[str, CachedParquetInfo],
@@ -270,4 +260,6 @@ def attach_cached_parquet_metadata(
             if not all(path in cached_parquet_info_map for path in base_scan.paths):
                 continue
             cached = [cached_parquet_info_map[path] for path in base_scan.paths]
-            _set_scan_cached_parquet_info(base_scan, cached)
+            Scan._validate_cached_parquet_info(base_scan.paths, cached)
+            base_scan.cached_parquet_info = cached
+            base_scan._non_child_args = (*base_scan._non_child_args[:-1], cached)
