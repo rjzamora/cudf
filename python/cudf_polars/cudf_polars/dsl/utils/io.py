@@ -245,20 +245,7 @@ def _set_scan_cached_parquet_info(
     """Attach cached parquet metadata to a scan without changing its identity."""
     Scan._validate_cached_parquet_info(scan.paths, cached_parquet_info)
     scan.cached_parquet_info = cached_parquet_info
-    scan._non_child_args = (
-        scan.schema,
-        scan.typ,
-        scan.reader_options,
-        scan.paths,
-        scan.with_columns,
-        scan.skip_rows,
-        scan.n_rows,
-        scan.row_index,
-        scan.include_file_paths,
-        scan.predicate,
-        scan.parquet_options,
-        cached_parquet_info,
-    )
+    scan._non_child_args = (*scan._non_child_args[:-1], cached_parquet_info)
 
 
 def attach_cached_parquet_metadata(
