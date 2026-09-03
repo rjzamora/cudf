@@ -527,9 +527,9 @@ def test_attach_cached_parquet_metadata_resolves_row_groups(
     row_groups = []
     for scan in streaming_scan.tasks:
         assert isinstance(scan, ParquetScanTask)
-        info = scan.row_groups_and_slice()
-        assert info is not None
-        row_groups.append(info[0])
+        bounds = scan.task_bounds()
+        assert bounds is not None
+        row_groups.append(bounds.row_groups)
     assert row_groups == [[[0]], [[1]]]
 
 
@@ -555,7 +555,9 @@ def test_attach_cached_parquet_metadata_leaves_sub_row_group_split_unaligned(
     for scan in streaming_scan.tasks:
         assert isinstance(scan, ParquetScanTask)
         assert isinstance(scan.base_task, SplitScan)
-        assert scan.row_groups_and_slice() is None
+        bounds = scan.task_bounds()
+        assert bounds is not None
+        assert bounds.row_groups == []
 
 
 @pytest.mark.parametrize(
@@ -589,7 +591,9 @@ def test_attach_cached_parquet_metadata_leaves_sliced_fused_scan_unaligned(
     for scan in streaming_scan.tasks:
         assert isinstance(scan, ParquetScanTask)
         assert isinstance(scan.base_task, FusedScan)
-        assert scan.row_groups_and_slice() is None
+        bounds = scan.task_bounds()
+        assert bounds is not None
+        assert bounds.row_groups == []
 
 
 def test_streaming_scan_raises() -> None:
