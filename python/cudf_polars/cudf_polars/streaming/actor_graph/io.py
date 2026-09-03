@@ -39,6 +39,7 @@ from cudf_polars.streaming.actor_graph.utils import (
     send_metadata,
 )
 from cudf_polars.streaming.io import (
+    ParquetScanTask,
     StreamingScan,
     StreamingSink,
     _prepare_sink_directory,
@@ -569,14 +570,15 @@ async def read_chunk(
             br=context.br(),
         )
     stop = time.monotonic_ns()
+    trace_scan = scan.base_task if isinstance(scan, ParquetScanTask) else scan
     log(
         "IO Task",
         scope=Scope.IO_TASK.value,
         start=start,
         admitted=admitted,
         stop=stop,
-        ir_id=scan.get_stable_id(),
-        ir_type=type(scan).__name__,
+        ir_id=trace_scan.get_stable_id(),
+        ir_type=type(trace_scan).__name__,
         sequence_number=seq_num,
         estimated_output_bytes=estimated_chunk_bytes,
         reservation_bytes=reservation_bytes,

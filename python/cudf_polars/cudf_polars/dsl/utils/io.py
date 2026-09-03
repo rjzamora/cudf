@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import inspect
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -20,6 +21,10 @@ from cudf_polars.streaming.io import (
     Scan,
     StreamingScan,
 )
+
+_CACHED_PARQUET_INFO_ARG_INDEX = tuple(
+    inspect.signature(Scan.do_evaluate).parameters
+).index("cached_parquet_info")
 
 if TYPE_CHECKING:
     from cudf_polars.dsl.ir import IR
@@ -262,4 +267,6 @@ def attach_cached_parquet_metadata(
             cached = [cached_parquet_info_map[path] for path in base_scan.paths]
             Scan._validate_cached_parquet_info(base_scan.paths, cached)
             base_scan.cached_parquet_info = cached
-            base_scan._non_child_args = (*base_scan._non_child_args[:-1], cached)
+            args = list(base_scan._non_child_args)
+            args[_CACHED_PARQUET_INFO_ARG_INDEX] = cached
+            base_scan._non_child_args = tuple(args)
