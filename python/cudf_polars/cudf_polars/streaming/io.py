@@ -388,15 +388,6 @@ def _cached_parquet_info_for_paths(
     return [cached_by_path[path] for path in paths]
 
 
-def _cached_parquet_info_for_task(
-    scan: SplitScan | FusedScan,
-) -> list[CachedParquetInfo] | None:
-    """Return path-aligned cached parquet metadata for ``scan``."""
-    return _cached_parquet_info_for_paths(
-        scan.paths, scan.base_scan.cached_parquet_info
-    )
-
-
 def _set_scan_cached_parquet_info(
     scan: Scan,
     cached_parquet_info: list[CachedParquetInfo],
@@ -726,7 +717,10 @@ class ParquetScanTask(IR):
         """Return row groups and row slice when this task is row-group aligned."""
         return self._row_groups_and_slice(
             self.base_task,
-            _cached_parquet_info_for_task(self.base_task),
+            _cached_parquet_info_for_paths(
+                self.base_task.paths,
+                self.base_task.base_scan.cached_parquet_info,
+            ),
         )
 
     @staticmethod
@@ -771,7 +765,9 @@ class ParquetScanTask(IR):
         base_scan = base_task.base_scan
         paths = base_task.paths
         parquet_options = base_task.parquet_options
-        cached_parquet_info = _cached_parquet_info_for_task(base_task)
+        cached_parquet_info = _cached_parquet_info_for_paths(
+            base_task.paths, base_task.base_scan.cached_parquet_info
+        )
         row_group_info = cls._row_groups_and_slice(base_task, cached_parquet_info)
 
         if row_group_info is not None:
