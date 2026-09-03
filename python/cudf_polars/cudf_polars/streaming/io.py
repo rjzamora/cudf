@@ -343,32 +343,10 @@ def _read_with_hybrid_scan(
         return DataFrame(columns, stream=stream).select(list(schema.keys()))
 
 
-def _split_scan_row_groups_and_slice(
-    scan: SplitScan,
-    cached_parquet_info: list[CachedParquetInfo],
-) -> tuple[list[list[int]], int, int] | None:
-    """Return the row groups and row slice for a row-group-aligned split."""
-    if len(cached_parquet_info) != 1:
-        return None
-
-    row_group_num_rows = cached_parquet_info[0].file_metadata.row_group_num_rows
-    total_row_groups = len(row_group_num_rows)
-    if scan.total_splits > total_row_groups:
-        return None
-
-    bounds = _split_scan_bounds(row_group_num_rows, scan.split_index, scan.total_splits)
-    row_groups = list(range(bounds.row_group_start, bounds.row_group_stop))
-    if not row_groups:
-        return None
-
-    return [row_groups], bounds.skip_rows, bounds.n_rows
-
-
-class _SplitScanBounds(NamedTuple):
+class SplitScanBounds(NamedTuple):
     """Row and row-group bounds for a split scan."""
 
-    row_group_start: int
-    row_group_stop: int
+    row_groups: list[list[int]]
     skip_rows: int
     n_rows: int
 
@@ -377,7 +355,7 @@ def _split_scan_bounds(
     row_group_num_rows: Sequence[int],
     split_index: int,
     total_splits: int,
-) -> _SplitScanBounds:
+) -> SplitScanBounds:
     """Return row and row-group bounds for a file split."""
     total_row_groups = len(row_group_num_rows)
     if total_splits <= total_row_groups:
@@ -390,16 +368,16 @@ def _split_scan_bounds(
         )
         skip_rows = sum(row_group_num_rows[:row_group_start])
         n_rows = sum(row_group_num_rows[row_group_start:row_group_stop])
+        row_groups = [list(range(row_group_start, row_group_stop))]
     else:
-        row_group_start = 0
-        row_group_stop = 0
+        row_groups = []
         total_rows = sum(row_group_num_rows)
         n_rows = total_rows // total_splits
         skip_rows = n_rows * split_index
 
     if split_index == total_splits - 1:
         n_rows = -1
-    return _SplitScanBounds(row_group_start, row_group_stop, skip_rows, n_rows)
+    return SplitScanBounds(row_groups, skip_rows, n_rows)
 
 
 def _cached_parquet_info_for_paths(
@@ -720,7 +698,22 @@ class ParquetScanTask(IR):
             return None
 
         if isinstance(base_task, SplitScan):
-            return _split_scan_row_groups_and_slice(base_task, cached_parquet_info)
+            if len(cached_parquet_info) != 1:
+                return None
+
+            row_group_num_rows = cached_parquet_info[0].file_metadata.row_group_num_rows
+            if base_task.total_splits > len(row_group_num_rows):
+                return None
+
+            bounds = _split_scan_bounds(
+                row_group_num_rows,
+                base_task.split_index,
+                base_task.total_splits,
+            )
+            if not bounds.row_groups:
+                return None
+
+            return bounds.row_groups, bounds.skip_rows, bounds.n_rows
 
         row_groups = [
             list(range(len(info.file_metadata.row_group_num_rows)))
