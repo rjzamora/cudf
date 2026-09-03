@@ -16,7 +16,7 @@ import pylibcudf as plc
 from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.streaming.io import (
-    AlignedParquetScan,
+    ParquetScanTask,
     ParquetSourceInfo,
     Scan,
     StreamingScan,
@@ -244,12 +244,9 @@ def attach_cached_parquet_metadata(
     cached_parquet_info_map: dict[str, CachedParquetInfo],
 ) -> None:
     """
-    Attach prefetched metadata to scan nodes and specialize parquet scan tasks.
+    Attach prefetched metadata to parquet scan tasks.
 
-    This is an optimization only and does not affect IR identity. When cached
-    metadata is available, row-group-aligned parquet scan tasks are converted to
-    ``AlignedParquetScan`` so downstream parquet-specific code can use the resolved
-    path and row-group assignment directly.
+    This is an optimization only and does not affect IR identity.
 
     Parameters
     ----------
@@ -260,23 +257,11 @@ def attach_cached_parquet_metadata(
     """
     for node in traversal([root]):
         if isinstance(node, StreamingScan) and node.base_scan.typ == "parquet":
-            scans = list(node.scans)
-            converted = False
-            for i, scan in enumerate(scans):
-                if isinstance(scan, AlignedParquetScan) or not all(
+            for scan in node.scans:
+                if not isinstance(scan, ParquetScanTask) or not all(
                     path in cached_parquet_info_map for path in scan.paths
                 ):
                     continue
 
                 cached = [cached_parquet_info_map[path] for path in scan.paths]
-                Scan._validate_cached_parquet_info(scan.paths, cached)
-                scan.cached_parquet_info = cached
-                scan._non_child_args = (*scan._non_child_args[:-1], cached)
-
-                if (parquet_scan := AlignedParquetScan.from_scan(scan)) is not None:
-                    scans[i] = parquet_scan
-                    converted = True
-
-            if converted:
-                node.scans = scans
-                node._non_child_args = (node.scans, node.base_scan, node.scan_type)
+                scan.attach_cached_parquet_info(cached)

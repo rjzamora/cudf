@@ -32,8 +32,8 @@ from cudf_polars.streaming.base import (
     StatsCollector,
 )
 from cudf_polars.streaming.io import (
-    AlignedParquetScan,
     FusedScan,
+    ParquetScanTask,
     SplitScan,
     StreamingScan,
     expand_scan_for_rank,
@@ -467,7 +467,8 @@ def test_expand_scan_for_rank_fused_and_single_read(
     for scan, expected_paths in zip(
         streaming_scan.scans, expected_path_groups, strict=True
     ):
-        assert isinstance(scan, FusedScan)
+        assert isinstance(scan, ParquetScanTask)
+        assert isinstance(scan.base_task, FusedScan)
         assert scan.paths == expected_paths
 
 
@@ -497,13 +498,14 @@ def test_expand_scan_for_rank_split_files(
     for scan, (split_index, total_splits) in zip(
         streaming_scan.scans, expected_splits, strict=True
     ):
-        assert isinstance(scan, SplitScan)
-        assert scan.split_index == split_index
-        assert scan.total_splits == total_splits
+        assert isinstance(scan, ParquetScanTask)
+        assert isinstance(scan.base_task, SplitScan)
+        assert scan.base_task.split_index == split_index
+        assert scan.base_task.total_splits == total_splits
         assert scan.paths == ["file.parquet"]
 
 
-def test_attach_cached_parquet_metadata_creates_parquet_scan_tasks(
+def test_attach_cached_parquet_metadata_resolves_row_groups(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "data.parquet"
@@ -522,14 +524,16 @@ def test_attach_cached_parquet_metadata_creates_parquet_scan_tasks(
     cached = prefetch_parquet_file_metadata_for_ir(streaming_scan, None)
     attach_cached_parquet_metadata(streaming_scan, cached)
 
-    parquet_tasks = [
-        scan for scan in streaming_scan.scans if isinstance(scan, AlignedParquetScan)
-    ]
-    assert len(parquet_tasks) == len(streaming_scan.scans)
-    assert [scan.row_groups for scan in parquet_tasks] == [[[0]], [[1]]]
+    row_groups = []
+    for scan in streaming_scan.scans:
+        assert isinstance(scan, ParquetScanTask)
+        info = scan.row_groups_and_slice()
+        assert info is not None
+        row_groups.append(info[0])
+    assert row_groups == [[[0]], [[1]]]
 
 
-def test_attach_cached_parquet_metadata_keeps_sub_row_group_split_scan(
+def test_attach_cached_parquet_metadata_leaves_sub_row_group_split_unaligned(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "data.parquet"
@@ -548,14 +552,17 @@ def test_attach_cached_parquet_metadata_keeps_sub_row_group_split_scan(
     cached = prefetch_parquet_file_metadata_for_ir(streaming_scan, None)
     attach_cached_parquet_metadata(streaming_scan, cached)
 
-    assert all(isinstance(scan, SplitScan) for scan in streaming_scan.scans)
+    for scan in streaming_scan.scans:
+        assert isinstance(scan, ParquetScanTask)
+        assert isinstance(scan.base_task, SplitScan)
+        assert scan.row_groups_and_slice() is None
 
 
 @pytest.mark.parametrize(
     "skip_rows,n_rows,row_index",
     [(1, -1, None), (0, 2, None), (0, -1, ("index", 0))],
 )
-def test_attach_cached_parquet_metadata_keeps_sliced_fused_scan(
+def test_attach_cached_parquet_metadata_leaves_sliced_fused_scan_unaligned(
     tmp_path: Path,
     skip_rows: int,
     n_rows: int,
@@ -579,7 +586,10 @@ def test_attach_cached_parquet_metadata_keeps_sliced_fused_scan(
     cached = prefetch_parquet_file_metadata_for_ir(streaming_scan, None)
     attach_cached_parquet_metadata(streaming_scan, cached)
 
-    assert all(isinstance(scan, FusedScan) for scan in streaming_scan.scans)
+    for scan in streaming_scan.scans:
+        assert isinstance(scan, ParquetScanTask)
+        assert isinstance(scan.base_task, FusedScan)
+        assert scan.row_groups_and_slice() is None
 
 
 def test_streaming_scan_raises() -> None:

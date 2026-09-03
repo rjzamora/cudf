@@ -345,10 +345,10 @@ def _read_with_hybrid_scan(
 
 def _split_scan_row_groups_and_slice(
     scan: SplitScan,
+    cached_parquet_info: list[CachedParquetInfo],
 ) -> tuple[list[list[int]], int, int] | None:
     """Return the row groups and row slice for a row-group-aligned split."""
-    cached_parquet_info = scan.cached_parquet_info
-    if cached_parquet_info is None or len(cached_parquet_info) != 1:
+    if len(cached_parquet_info) != 1:
         return None
 
     row_group_num_rows = cached_parquet_info[0].file_metadata.row_group_num_rows
@@ -668,95 +668,130 @@ class FusedScan(IR):
             )
 
 
-class AlignedParquetScan(IR):
-    """Parquet scan task aligned to complete row groups."""
+def _evaluate_scan_task(
+    scan: SplitScan | FusedScan,
+    cached_parquet_info: list[CachedParquetInfo] | None,
+    *,
+    context: IRExecutionContext,
+) -> DataFrame:
+    """Evaluate a generic streaming scan task with optional parquet metadata."""
+    base_scan = scan.base_scan
+    if isinstance(scan, SplitScan):
+        return SplitScan.do_evaluate(
+            scan.split_index,
+            scan.total_splits,
+            base_scan.schema,
+            base_scan.typ,
+            base_scan.reader_options,
+            scan.paths,
+            base_scan.with_columns,
+            base_scan.skip_rows,
+            base_scan.n_rows,
+            base_scan.row_index,
+            base_scan.include_file_paths,
+            base_scan.predicate,
+            scan.parquet_options,
+            cached_parquet_info,
+            context=context,
+        )
+    return FusedScan.do_evaluate(
+        base_scan.schema,
+        base_scan.typ,
+        base_scan.reader_options,
+        scan.paths,
+        base_scan.with_columns,
+        base_scan.skip_rows,
+        base_scan.n_rows,
+        base_scan.row_index,
+        base_scan.include_file_paths,
+        base_scan.predicate,
+        scan.parquet_options,
+        cached_parquet_info,
+        context=context,
+    )
+
+
+def _set_scan_task_cached_parquet_info(
+    scan: SplitScan | FusedScan,
+    cached_parquet_info: list[CachedParquetInfo],
+) -> None:
+    """Attach cached parquet metadata to a generic streaming scan task."""
+    scan.cached_parquet_info = cached_parquet_info
+    scan._non_child_args = (*scan._non_child_args[:-1], cached_parquet_info)
+
+
+class ParquetScanTask(IR):
+    """Parquet scan task wrapping a generic streaming scan task."""
 
     __slots__ = (
         "base_scan",
+        "base_task",
         "cached_parquet_info",
-        "n_rows",
         "parquet_options",
         "paths",
-        "row_groups",
         "schema",
-        "skip_rows",
     )
-    _non_child = (
-        "base_scan",
-        "paths",
-        "row_groups",
-        "skip_rows",
-        "n_rows",
-        "parquet_options",
-        "cached_parquet_info",
-    )
-    _n_non_child_args = 7
+    _non_child = ("base_task",)
+    _n_non_child_args = 2
 
+    base_task: SplitScan | FusedScan
+    """Generic streaming scan task being specialized for parquet."""
     base_scan: Scan
     """Scan operation this task is based on."""
     paths: list[str]
     """File paths assigned to this task."""
-    row_groups: list[list[int]]
-    """Row-group indices to read from each input path."""
-    skip_rows: int
-    """Number of rows to skip for the fallback parquet read."""
-    n_rows: int
-    """Number of rows to read for the fallback parquet read."""
     parquet_options: ParquetOptions
     """Parquet-specific options."""
-    cached_parquet_info: list[CachedParquetInfo]
+    cached_parquet_info: list[CachedParquetInfo] | None
     """Cached parquet metadata."""
 
     def __init__(
         self,
-        base_scan: Scan,
-        paths: list[str],
-        row_groups: list[list[int]],
-        skip_rows: int,
-        n_rows: int,
-        parquet_options: ParquetOptions,
-        cached_parquet_info: list[CachedParquetInfo],
+        base_task: SplitScan | FusedScan,
+        cached_parquet_info: list[CachedParquetInfo] | None = None,
     ):
+        base_scan = base_task.base_scan
         if base_scan.typ != "parquet":  # pragma: no cover
             raise ValueError(f"Expected a parquet scan, got: {base_scan.typ}")
-        if len(paths) != len(row_groups):  # pragma: no cover
-            raise ValueError("Expected one row-group list for each input path.")
-        if (
-            base_scan.skip_rows != 0
-            or base_scan.n_rows != -1
-            or base_scan.row_index is not None
-        ):  # pragma: no cover
-            raise ValueError(
-                "Parquet row-group tasks cannot be combined with row slicing "
-                "or row indexes."
-            )
-
-        Scan._validate_cached_parquet_info(paths, cached_parquet_info)
+        if cached_parquet_info is None:
+            cached_parquet_info = base_task.cached_parquet_info
+        if cached_parquet_info == [] and base_task.paths:
+            cached_parquet_info = None
+        Scan._validate_cached_parquet_info(base_task.paths, cached_parquet_info)
+        self.base_task = base_task
         self.base_scan = base_scan
-        self.paths = paths
-        self.row_groups = row_groups
-        self.skip_rows = skip_rows
-        self.n_rows = n_rows
-        self.parquet_options = parquet_options
+        self.paths = base_task.paths
+        self.parquet_options = base_task.parquet_options
         self.cached_parquet_info = cached_parquet_info
         self.schema = base_scan.schema
         self._non_child_args = (
-            base_scan,
-            paths,
-            row_groups,
-            skip_rows,
-            n_rows,
-            parquet_options,
+            base_task,
             cached_parquet_info,
         )
         self.children = ()
+        if cached_parquet_info is not None:
+            _set_scan_task_cached_parquet_info(base_task, cached_parquet_info)
 
-    @classmethod
-    def from_scan(cls, scan: FusedScan | SplitScan) -> Self | None:
-        """Create an aligned parquet scan from a row-group-aligned scan task."""
-        cached_parquet_info = scan.cached_parquet_info
-        base_scan = scan.base_scan
-        if base_scan.typ != "parquet" or cached_parquet_info is None:
+    def attach_cached_parquet_info(
+        self, cached_parquet_info: list[CachedParquetInfo]
+    ) -> None:
+        """Attach cached metadata to this parquet scan task."""
+        Scan._validate_cached_parquet_info(self.paths, cached_parquet_info)
+        self.cached_parquet_info = cached_parquet_info
+        _set_scan_task_cached_parquet_info(self.base_task, cached_parquet_info)
+        self._non_child_args = (self.base_task, cached_parquet_info)
+
+    def row_groups_and_slice(self) -> tuple[list[list[int]], int, int] | None:
+        """Return row groups and row slice when this task is row-group aligned."""
+        return self._row_groups_and_slice(self.base_task, self.cached_parquet_info)
+
+    @staticmethod
+    def _row_groups_and_slice(
+        base_task: SplitScan | FusedScan,
+        cached_parquet_info: list[CachedParquetInfo] | None,
+    ) -> tuple[list[list[int]], int, int] | None:
+        base_scan = base_task.base_scan
+        if cached_parquet_info is None:
             return None
         if (
             base_scan.skip_rows != 0
@@ -765,113 +800,111 @@ class AlignedParquetScan(IR):
         ):
             return None
 
-        if isinstance(scan, SplitScan):
-            result = _split_scan_row_groups_and_slice(scan)
-            if result is None:
-                return None
-            row_groups, skip_rows, n_rows = result
-        else:
-            row_groups = [
-                list(range(len(info.file_metadata.row_group_num_rows)))
-                for info in cached_parquet_info
-            ]
-            skip_rows = 0
-            n_rows = -1
+        if isinstance(base_task, SplitScan):
+            return _split_scan_row_groups_and_slice(base_task, cached_parquet_info)
 
-        return cls(
-            base_scan,
-            scan.paths,
-            row_groups,
-            skip_rows,
-            n_rows,
-            scan.parquet_options,
-            cached_parquet_info,
-        )
+        row_groups = [
+            list(range(len(info.file_metadata.row_group_num_rows)))
+            for info in cached_parquet_info
+        ]
+        return row_groups, 0, -1
 
     def get_hashable(self) -> Hashable:
         """Hashable representation of the node."""
         return (
             type(self),
-            self.base_scan.get_hashable(),
-            tuple(self.paths),
-            self.parquet_options,
-            tuple(tuple(row_groups) for row_groups in self.row_groups),
-            self.skip_rows,
-            self.n_rows,
+            self.base_task.get_hashable(),
         )
 
     @classmethod
     def do_evaluate(
         cls,
-        base_scan: Scan,
-        paths: list[str],
-        row_groups: list[list[int]],
-        skip_rows: int,
-        n_rows: int,
-        parquet_options: ParquetOptions,
-        cached_parquet_info: list[CachedParquetInfo],
+        base_task: SplitScan | FusedScan,
+        cached_parquet_info: list[CachedParquetInfo] | None,
         *,
         context: IRExecutionContext,
     ) -> DataFrame:
-        """Evaluate a row-group-aligned parquet scan."""
-        # Hybrid scan reads through the prefetched, shared file metadata, so
-        # it is only used when footer prefetching is enabled.
-        # TODO: Investigate re-enabling for some of the excluded paths
-        # (row_index / include_file_paths). Needs performance investigation.
-        if (
-            len(paths) == 1
-            and len(row_groups) == 1
-            and hybrid_scan_eligible(
-                parquet_options,
-                cached_parquet_info=cached_parquet_info,
-                row_index=base_scan.row_index,
-                include_file_paths=base_scan.include_file_paths,
-                predicate=base_scan.predicate,
-            )
-        ):
-            assert base_scan.predicate is not None
-            assert cached_parquet_info is not None
-            stream = context.get_cuda_stream()
-            plc_filter, residual = to_parquet_filter(
-                _prepare_parquet_predicate(
-                    base_scan.predicate.value,
-                    paths,
+        """Evaluate a parquet scan task."""
+        base_scan = base_task.base_scan
+        paths = base_task.paths
+        parquet_options = base_task.parquet_options
+        row_group_info = cls._row_groups_and_slice(base_task, cached_parquet_info)
+
+        if row_group_info is not None:
+            row_groups, skip_rows, n_rows = row_group_info
+            # Hybrid scan reads through the prefetched, shared file metadata, so
+            # it is only used when footer prefetching is enabled.
+            # TODO: Investigate re-enabling for some of the excluded paths
+            # (row_index / include_file_paths). Needs performance investigation.
+            if (
+                len(paths) == 1
+                and len(row_groups) == 1
+                and hybrid_scan_eligible(
+                    parquet_options,
+                    cached_parquet_info=cached_parquet_info,
+                    row_index=base_scan.row_index,
+                    include_file_paths=base_scan.include_file_paths,
+                    predicate=base_scan.predicate,
+                )
+            ):
+                assert base_scan.predicate is not None
+                assert cached_parquet_info is not None
+                stream = context.get_cuda_stream()
+                plc_filter, residual = to_parquet_filter(
+                    _prepare_parquet_predicate(
+                        base_scan.predicate.value,
+                        paths,
+                        base_scan.schema,
+                        base_scan.with_columns,
+                    ),
+                    stream=stream,
+                )
+                if plc_filter is not None and residual is None:
+                    return _read_with_hybrid_scan(
+                        base_scan.schema,
+                        paths,
+                        base_scan.with_columns,
+                        plc_filter,
+                        row_groups[0],
+                        stream,
+                        cached_parquet_info[0],
+                        stats_pruning=parquet_options._hybrid_scan_stats_pruning,
+                    )
+
+            with nvtx_annotate_cudf_polars(message=f"ParquetScan: {', '.join(paths)}"):
+                return Scan.do_evaluate(
                     base_scan.schema,
-                    base_scan.with_columns,
-                ),
-                stream=stream,
-            )
-            if plc_filter is not None and residual is None:
-                return _read_with_hybrid_scan(
-                    base_scan.schema,
+                    base_scan.typ,
+                    base_scan.reader_options,
                     paths,
                     base_scan.with_columns,
-                    plc_filter,
-                    row_groups[0],
-                    stream,
-                    cached_parquet_info[0],
-                    stats_pruning=parquet_options._hybrid_scan_stats_pruning,
+                    skip_rows,
+                    n_rows,
+                    base_scan.row_index,
+                    base_scan.include_file_paths,
+                    base_scan.predicate,
+                    parquet_options,
+                    cached_parquet_info,
+                    context=context,
                 )
 
-        with nvtx_annotate_cudf_polars(message=f"ParquetScan: {', '.join(paths)}"):
-            return Scan.do_evaluate(
-                base_scan.schema,
-                base_scan.typ,
-                base_scan.reader_options,
-                paths,
-                base_scan.with_columns,
-                skip_rows,
-                n_rows,
-                base_scan.row_index,
-                base_scan.include_file_paths,
-                base_scan.predicate,
-                parquet_options,
-                cached_parquet_info,
-                context=context,
-            )
+        return _evaluate_scan_task(
+            base_task,
+            cached_parquet_info,
+            context=context,
+        )
 
 
-StreamingScanTask: TypeAlias = SplitScan | FusedScan | AlignedParquetScan
+StreamingScanTask: TypeAlias = SplitScan | FusedScan | ParquetScanTask
+
+
+def _streaming_scan_task(scan: StreamingScanTask) -> StreamingScanTask:
+    """Wrap parquet scans in a parquet-specific streaming task."""
+    if isinstance(scan, ParquetScanTask):
+        return scan
+    if scan.base_scan.typ == "parquet":
+        return ParquetScanTask(scan)
+    return scan
 
 
 @lower_ir_node.register(Empty)
@@ -962,6 +995,8 @@ class StreamingScan(IR):
         base_scan: Scan,
         scan_type: Literal["split", "fused"],
     ):
+        if base_scan.typ == "parquet":
+            scans = [_streaming_scan_task(scan) for scan in scans]
         self.scans = scans
         self.base_scan = base_scan
         self.schema = base_scan.schema
