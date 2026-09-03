@@ -189,8 +189,8 @@ def prefetch_parquet_file_metadata_for_ir(
 
     for node in traversal([root]):
         if isinstance(node, StreamingScan) and node.base_scan.typ == "parquet":
-            for scan in node.scans:
-                for path in scan.paths:
+            for task in node.tasks:
+                for path in task.paths:
                     all_paths.add(path)
         elif isinstance(node, Scan) and node.typ == "parquet":  # pragma: no cover
             raise RuntimeError("Unexpected parquet 'Scan' node in lowered IR graph.")

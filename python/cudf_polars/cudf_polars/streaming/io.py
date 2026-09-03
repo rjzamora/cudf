@@ -402,12 +402,12 @@ def _split_scan_bounds(
     return _SplitScanBounds(row_group_start, row_group_stop, skip_rows, n_rows)
 
 
-def _cached_parquet_info_for_scan(
-    scan: SplitScan | FusedScan,
+def _cached_parquet_info_for_paths(
+    base_scan: Scan,
+    paths: list[str],
 ) -> list[CachedParquetInfo] | None:
-    """Return cached parquet metadata matching a scan task."""
-    paths = scan.paths
-    cached_parquet_info = scan.base_scan.cached_parquet_info
+    """Return cached parquet metadata matching a scan task's paths."""
+    cached_parquet_info = base_scan.cached_parquet_info
     if cached_parquet_info is None or cached_parquet_info == []:
         return None
     if paths == [info.path for info in cached_parquet_info]:
@@ -505,7 +505,6 @@ class SplitScan(IR):
         parquet_options: ParquetOptions,
         *,
         context: IRExecutionContext,
-        cached_parquet_info: list[CachedParquetInfo] | None = None,
     ) -> DataFrame:
         """Evaluate and return a dataframe."""
         if base_scan.typ not in ("parquet",):  # pragma: no cover
@@ -516,6 +515,7 @@ class SplitScan(IR):
         if len(paths) > 1:  # pragma: no cover
             raise ValueError(f"Expected a single path, got: {paths}")
 
+        cached_parquet_info = _cached_parquet_info_for_paths(base_scan, paths)
         if cached_parquet_info is not None:
             parquet_metadatas = [info.file_metadata for info in cached_parquet_info]
             row_group_num_rows = [
@@ -615,9 +615,9 @@ class FusedScan(IR):
         parquet_options: ParquetOptions,
         *,
         context: IRExecutionContext,
-        cached_parquet_info: list[CachedParquetInfo] | None = None,
     ) -> DataFrame:
         """Evaluate and return a dataframe."""
+        cached_parquet_info = _cached_parquet_info_for_paths(base_scan, paths)
         with nvtx_annotate_cudf_polars(message=f"FusedScan: {', '.join(paths)}"):
             return Scan.do_evaluate(
                 base_scan.schema,
@@ -638,11 +638,10 @@ class FusedScan(IR):
 
 def _evaluate_scan_task(
     scan: SplitScan | FusedScan,
-    cached_parquet_info: list[CachedParquetInfo] | None,
     *,
     context: IRExecutionContext,
 ) -> DataFrame:
-    """Evaluate a generic streaming scan task with optional parquet metadata."""
+    """Evaluate a generic streaming scan task."""
     base_scan = scan.base_scan
     if isinstance(scan, SplitScan):
         return SplitScan.do_evaluate(
@@ -652,14 +651,12 @@ def _evaluate_scan_task(
             scan.total_splits,
             scan.parquet_options,
             context=context,
-            cached_parquet_info=cached_parquet_info,
         )
     return FusedScan.do_evaluate(
         base_scan,
         scan.paths,
         scan.parquet_options,
         context=context,
-        cached_parquet_info=cached_parquet_info,
     )
 
 
@@ -704,7 +701,7 @@ class ParquetScanTask(IR):
         """Return row groups and row slice when this task is row-group aligned."""
         return self._row_groups_and_slice(
             self.base_task,
-            _cached_parquet_info_for_scan(self.base_task),
+            _cached_parquet_info_for_paths(self.base_scan, self.paths),
         )
 
     @staticmethod
@@ -749,7 +746,7 @@ class ParquetScanTask(IR):
         base_scan = base_task.base_scan
         paths = base_task.paths
         parquet_options = base_task.parquet_options
-        cached_parquet_info = _cached_parquet_info_for_scan(base_task)
+        cached_parquet_info = _cached_parquet_info_for_paths(base_scan, paths)
         row_group_info = cls._row_groups_and_slice(base_task, cached_parquet_info)
 
         if row_group_info is not None:
@@ -812,23 +809,11 @@ class ParquetScanTask(IR):
 
         return _evaluate_scan_task(
             base_task,
-            cached_parquet_info,
             context=context,
         )
 
 
 StreamingScanTask: TypeAlias = SplitScan | FusedScan | ParquetScanTask
-
-
-def _streaming_scan_task(
-    scan: StreamingScanTask,
-) -> StreamingScanTask:
-    """Wrap parquet scans in a parquet-specific streaming task."""
-    if isinstance(scan, ParquetScanTask):
-        return scan
-    if scan.base_scan.typ == "parquet":
-        return ParquetScanTask(scan)
-    return scan
 
 
 @lower_ir_node.register(Empty)
@@ -900,32 +885,31 @@ class StreamingScan(IR):
 
     __slots__ = (
         "base_scan",
-        "scan_type",
-        "scans",
         "schema",
+        "tasks",
     )
     _non_child = (
-        "scans",
+        "tasks",
         "base_scan",
-        "scan_type",
     )
-    _n_non_child_args = 3
-    scans: Sequence[StreamingScanTask]
+    _n_non_child_args = 2
     base_scan: Scan
+    tasks: Sequence[StreamingScanTask]
 
     def __init__(
         self,
-        scans: Sequence[StreamingScanTask],
+        tasks: Sequence[StreamingScanTask],
         base_scan: Scan,
-        scan_type: Literal["split", "fused"],
     ):
         if base_scan.typ == "parquet":
-            scans = [_streaming_scan_task(scan) for scan in scans]
-        self.scans = scans
+            tasks = [
+                task if isinstance(task, ParquetScanTask) else ParquetScanTask(task)
+                for task in tasks
+            ]
         self.base_scan = base_scan
         self.schema = base_scan.schema
-        self.scan_type = scan_type
-        self._non_child_args = (scans, base_scan, scan_type)
+        self.tasks = tasks
+        self._non_child_args = (tasks, base_scan)
         self.children = ()
 
     @classmethod
@@ -945,11 +929,11 @@ class StreamingScan(IR):
         path_end = math.ceil((local_offset + local_count) / plan.factor)
         local_paths = base_scan.paths[path_offset:path_end]
         sindex = local_offset % plan.factor
-        scans: list[SplitScan] = []
+        tasks: list[SplitScan] = []
         splits_created = 0
         for path in local_paths:
             while sindex < plan.factor and splits_created < local_count:
-                scans.append(
+                tasks.append(
                     SplitScan(
                         base_scan,
                         [path],
@@ -961,7 +945,7 @@ class StreamingScan(IR):
                 sindex += 1
                 splits_created += 1
             sindex = 0
-        return cls(scans, base_scan, "split")
+        return cls(tasks, base_scan)
 
     @classmethod
     def for_fused_files(
@@ -978,7 +962,7 @@ class StreamingScan(IR):
         local_offset, local_count = _rank_slice(partition_count, rank, nranks)
         paths_start = local_offset * plan.factor
         paths_end = paths_start + plan.factor * local_count
-        scans = [
+        tasks = [
             FusedScan(
                 base_scan,
                 base_scan.paths[offset : offset + plan.factor],
@@ -987,24 +971,24 @@ class StreamingScan(IR):
             for offset in range(paths_start, paths_end, plan.factor)
             if base_scan.paths[offset : offset + plan.factor]
         ]
-        return cls(scans, base_scan, "fused")
+        return cls(tasks, base_scan)
 
     def get_hashable(self) -> Hashable:
         """Hashable representation of the node."""
-        # We don't need to include base_scan / schema, since it's in all the scan nodes.
-        return (type(self), *tuple(x.get_hashable() for x in self.scans))
+        # We don't need to include base_scan / schema, since it's in all the scan tasks.
+        return (type(self), *tuple(task.get_hashable() for task in self.tasks))
 
     @classmethod
     def do_evaluate(
         cls,
-        scans: Sequence[StreamingScanTask],
+        tasks: Sequence[StreamingScanTask],
         base_scan: Scan,
         *,
         context: IRExecutionContext,
     ) -> DataFrame:
         """Raises NotImplementedError for StreamingScan nodes."""
         raise NotImplementedError(
-            "StreamingScan.do_evaluate should not be called directly. Call Scan.do_evaluate on each scan node instead."
+            "StreamingScan.do_evaluate should not be called directly. Call Scan.do_evaluate on each scan task instead."
         )
 
 

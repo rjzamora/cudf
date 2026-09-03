@@ -181,7 +181,7 @@ def test_prefetch_skips_paths_cached_by_stats_collection(
 
     scan = _make_parquet_scan(paths)
     fused = FusedScan(scan, paths, scan.parquet_options)
-    streaming_scan = StreamingScan([fused], scan, "fused")
+    streaming_scan = StreamingScan([fused], scan)
 
     result = prefetch_parquet_file_metadata_for_ir(
         streaming_scan, py_executor=None, stats=stats
@@ -197,7 +197,7 @@ def test_prefetch_parquet_file_metadata_remote_only(tmp_path, df) -> None:
 
     scan = _make_parquet_scan([local_path])
     fused = FusedScan(scan, scan.paths, scan.parquet_options)
-    streaming_scan = StreamingScan([fused], scan, "fused")
+    streaming_scan = StreamingScan([fused], scan)
 
     # Local paths are skipped entirely when remote_only=True.
     result = prefetch_parquet_file_metadata_for_ir(
@@ -465,7 +465,7 @@ def test_expand_scan_for_rank_fused_and_single_read(
         parquet_options=ParquetOptions(),
     )
     for scan, expected_paths in zip(
-        streaming_scan.scans, expected_path_groups, strict=True
+        streaming_scan.tasks, expected_path_groups, strict=True
     ):
         assert isinstance(scan, ParquetScanTask)
         assert isinstance(scan.base_task, FusedScan)
@@ -494,9 +494,9 @@ def test_expand_scan_for_rank_split_files(
         nranks=2,
         parquet_options=ParquetOptions(),
     )
-    assert len(streaming_scan.scans) == len(expected_splits)
+    assert len(streaming_scan.tasks) == len(expected_splits)
     for scan, (split_index, total_splits) in zip(
-        streaming_scan.scans, expected_splits, strict=True
+        streaming_scan.tasks, expected_splits, strict=True
     ):
         assert isinstance(scan, ParquetScanTask)
         assert isinstance(scan.base_task, SplitScan)
@@ -525,7 +525,7 @@ def test_attach_cached_parquet_metadata_resolves_row_groups(
     attach_cached_parquet_metadata(streaming_scan, cached)
 
     row_groups = []
-    for scan in streaming_scan.scans:
+    for scan in streaming_scan.tasks:
         assert isinstance(scan, ParquetScanTask)
         info = scan.row_groups_and_slice()
         assert info is not None
@@ -552,7 +552,7 @@ def test_attach_cached_parquet_metadata_leaves_sub_row_group_split_unaligned(
     cached = prefetch_parquet_file_metadata_for_ir(streaming_scan, None)
     attach_cached_parquet_metadata(streaming_scan, cached)
 
-    for scan in streaming_scan.scans:
+    for scan in streaming_scan.tasks:
         assert isinstance(scan, ParquetScanTask)
         assert isinstance(scan.base_task, SplitScan)
         assert scan.row_groups_and_slice() is None
@@ -586,7 +586,7 @@ def test_attach_cached_parquet_metadata_leaves_sliced_fused_scan_unaligned(
     cached = prefetch_parquet_file_metadata_for_ir(streaming_scan, None)
     attach_cached_parquet_metadata(streaming_scan, cached)
 
-    for scan in streaming_scan.scans:
+    for scan in streaming_scan.tasks:
         assert isinstance(scan, ParquetScanTask)
         assert isinstance(scan.base_task, FusedScan)
         assert scan.row_groups_and_slice() is None
@@ -677,26 +677,6 @@ def test_streaming_scan_missing_prefetch_metadata_raises() -> None:
     ctx = IRExecutionContext()
     with pytest.raises(NotImplementedError, match=r"StreamingScan.do_evaluate"):
         StreamingScan.do_evaluate([fused], scan, context=ctx)
-
-
-def test_split_scan_do_evaluate_missing_prefetch_metadata() -> None:
-    paths = ["/some/missing/file.parquet"]
-    parquet_options = ParquetOptions(prefetch_file_metadata=True)
-    context = IRExecutionContext()
-
-    with pytest.raises(
-        AssertionError,
-        match=(r"Paths do not match cached parquet info."),
-    ):
-        SplitScan.do_evaluate(
-            _make_parquet_scan(paths, parquet_options),
-            paths,
-            0,
-            4,
-            parquet_options,
-            context=context,
-            cached_parquet_info=[],
-        )
 
 
 def test_prefetch_file_metadata_join(
@@ -803,9 +783,9 @@ def test_streaming_scan_identity_equality() -> None:
         base.parquet_options,
     )
 
-    a = StreamingScan([split], base, "split")
-    b = StreamingScan([split_same], base, "split")
-    c = StreamingScan([split_diff], base, "split")
+    a = StreamingScan([split], base)
+    b = StreamingScan([split_same], base)
+    c = StreamingScan([split_diff], base)
 
     assert a == b
     assert hash(a) == hash(b)
