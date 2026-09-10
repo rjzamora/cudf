@@ -91,6 +91,36 @@ std::unique_ptr<column> rolling_window(column_view const& input,
                                        cuda::stream_ref stream,
                                        rmm::device_async_resource_ref mr);
 
+/**
+ * @brief Applies a rolling aggregation over precomputed absolute row bounds.
+ *
+ * This internal entry point decouples window-bound generation from window
+ * aggregation. Each output row `i` aggregates the half-open input interval
+ * `[window_starts[i], window_ends[i])`.
+ *
+ * @note Callers must ensure all windows satisfy
+ * `0 <= window_starts[i] <= window_ends[i] <= input.size()`.
+ *
+ * @param input The input column
+ * @param default_outputs A column of per-output defaults. Currently must be empty.
+ * @param window_starts A non-nullable INT32 column of inclusive window starts
+ * @param window_ends A non-nullable INT32 column of exclusive window ends
+ * @param min_periods Minimum number of valid observations required for a valid output
+ * @param agg The rolling window aggregation type
+ * @param stream CUDA stream to use for device memory operations
+ * @param mr Device memory resource used to allocate the output column
+ *
+ * @return A nullable output column with one row per window bound
+ */
+std::unique_ptr<column> rolling_window(column_view const& input,
+                                       column_view const& default_outputs,
+                                       column_view const& window_starts,
+                                       column_view const& window_ends,
+                                       size_type min_periods,
+                                       rolling_aggregation const& agg,
+                                       cuda::stream_ref stream,
+                                       rmm::device_async_resource_ref mr);
+
 bool is_valid_rolling_aggregation(data_type input_type, aggregation::Kind kind);
 
 /**

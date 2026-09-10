@@ -321,6 +321,70 @@ struct rolling_postprocessor {
   }
 };
 
+[[nodiscard]] inline bool is_supported_absolute_bounds_aggregation(aggregation::Kind kind)
+{
+  switch (kind) {
+    case aggregation::SUM:
+    case aggregation::MIN:
+    case aggregation::MAX:
+    case aggregation::COUNT_VALID:
+    case aggregation::COUNT_ALL:
+    case aggregation::MEAN:
+    case aggregation::VARIANCE:
+    case aggregation::STD: return true;
+    default: return false;
+  }
+}
+
+/**
+ * @brief Functor for rolling-window postprocessing when windows are provided
+ * as absolute `[start, end)` bounds.
+ *
+ * Row-relative postprocessing operations such as LEAD/LAG, NTH_ELEMENT, and
+ * COLLECT_LIST are intentionally excluded from the absolute-bounds entry point
+ * for now. They either depend on the current input row or need specialized list
+ * construction over arbitrary output cardinality.
+ */
+struct rolling_absolute_bounds_postprocessor {
+  column_view const& input;
+  data_type result_type;
+  cuda::stream_ref stream;
+  rmm::device_async_resource_ref mr;
+
+  template <aggregation::Kind k>
+  std::unique_ptr<column> operator()(aggregation const&,
+                                     std::unique_ptr<column>& intermediate) const
+  {
+    return std::move(intermediate);
+  }
+
+  template <aggregation::Kind k>
+    requires(k == aggregation::MIN || k == aggregation::MAX)
+  std::unique_ptr<column> operator()(aggregation const&,
+                                     std::unique_ptr<column>& intermediate) const
+  {
+    if (cudf::is_compound(result_type)) {
+      auto output_table = detail::gather(table_view{{input}},
+                                         intermediate->view(),
+                                         cudf::out_of_bounds_policy::NULLIFY,
+                                         negative_index_policy::NOT_ALLOWED,
+                                         stream,
+                                         mr);
+      return std::make_unique<cudf::column>(std::move(output_table->get_column(0)));
+    } else {
+      return std::move(intermediate);
+    }
+  }
+
+  template <aggregation::Kind k>
+    requires(k == aggregation::STD)
+  std::unique_ptr<column> operator()(aggregation const&,
+                                     std::unique_ptr<column>& intermediate) const
+  {
+    return detail::unary_operation(intermediate->view(), unary_operator::SQRT, stream, mr);
+  }
+};
+
 /**
  * @brief Computes the rolling window function
  *
@@ -398,6 +462,58 @@ __launch_bounds__(block_size) CUDF_KERNEL
   }
 
   // sum the valid counts across the whole block
+  size_type block_valid_count =
+    cudf::detail::single_lane_block_sum_reduce<block_size, 0>(warp_valid_count);
+
+  if (threadIdx.x == 0) { atomicAdd(output_valid_count, block_valid_count); }
+}
+
+/**
+ * @brief Computes rolling aggregations for precomputed absolute row bounds.
+ *
+ * Each output row `i` aggregates input rows in `[window_start_begin[i],
+ * window_end_begin[i])`.
+ */
+template <typename OutputType,
+          int block_size,
+          typename DeviceRollingOperator,
+          typename WindowStartIterator,
+          typename WindowEndIterator>
+__launch_bounds__(block_size) CUDF_KERNEL
+  void gpu_rolling_absolute_bounds(column_device_view input,
+                                   bool has_nulls,
+                                   column_device_view default_outputs,
+                                   mutable_column_device_view output,
+                                   size_type* __restrict__ output_valid_count,
+                                   DeviceRollingOperator device_operator,
+                                   WindowStartIterator window_start_begin,
+                                   WindowEndIterator window_end_begin)
+{
+  thread_index_type i            = blockIdx.x * block_size + threadIdx.x;
+  thread_index_type const stride = block_size * gridDim.x;
+
+  size_type warp_valid_count{0};
+
+  auto const num_rows = output.size();
+  auto active_threads = __ballot_sync(0xffff'ffffu, i < num_rows);
+  while (i < num_rows) {
+    auto const start = window_start_begin[i];
+    auto const end   = window_end_begin[i];
+
+    bool const output_is_valid = device_operator.template operator()<OutputType>(
+      input, has_nulls, default_outputs, output, start, end, i);
+
+    cudf::bitmask_type const result_mask{__ballot_sync(active_threads, output_is_valid)};
+
+    if (0 == threadIdx.x % cudf::detail::warp_size) {
+      output.set_mask_word(cudf::word_index(i), result_mask);
+      warp_valid_count += __popc(result_mask);
+    }
+
+    i += stride;
+    active_threads = __ballot_sync(active_threads, i < num_rows);
+  }
+
   size_type block_valid_count =
     cudf::detail::single_lane_block_sum_reduce<block_size, 0>(warp_valid_count);
 
@@ -495,6 +611,92 @@ struct rolling_window_launcher {
 };
 
 /**
+ * @brief Type/aggregation dispatched functor for launching the absolute-bounds
+ *        rolling window kernel.
+ */
+template <typename InputType>
+struct rolling_window_absolute_bounds_launcher {
+  template <aggregation::Kind op, typename WindowStartIterator, typename WindowEndIterator>
+  std::unique_ptr<column> operator()(column_view const& input,
+                                     column_view const& default_outputs,
+                                     size_type output_size,
+                                     WindowStartIterator window_start_begin,
+                                     WindowEndIterator window_end_begin,
+                                     int min_periods,
+                                     [[maybe_unused]] rolling_aggregation const& agg,
+                                     cuda::stream_ref stream,
+                                     rmm::device_async_resource_ref mr)
+    requires(corresponding_rolling_operator<InputType, op>::type::is_supported())
+  {
+    auto const do_rolling = [&](auto const& device_op) {
+      auto out_type = cudf::is_dictionary(input.type()) ? data_type{type_to_id<size_type>()}
+                                                        : target_type(input.type(), op);
+      using OutType =
+        typename std::conditional_t<cudf::is_dictionary<InputType>(),
+                                    size_type,
+                                    device_storage_type_t<target_type_t<InputType, op>>>;
+
+      auto output =
+        make_fixed_width_column(out_type, output_size, mask_state::UNINITIALIZED, stream, mr);
+
+      auto const d_inp_ptr         = column_device_view::create(input, stream);
+      auto const d_default_out_ptr = column_device_view::create(default_outputs, stream);
+      auto const d_out_ptr = mutable_column_device_view::create(output->mutable_view(), stream);
+      auto d_valid_count =
+        cudf::detail::device_scalar<size_type>{0, stream, cudf::get_current_device_resource_ref()};
+
+      auto constexpr block_size = 256;
+      auto const grid           = cudf::detail::grid_1d(output_size, block_size);
+
+      gpu_rolling_absolute_bounds<OutType, block_size>
+        <<<grid.num_blocks, block_size, 0, stream.get()>>>(*d_inp_ptr,
+                                                           input.has_nulls(),
+                                                           *d_default_out_ptr,
+                                                           *d_out_ptr,
+                                                           d_valid_count.data(),
+                                                           device_op,
+                                                           window_start_begin,
+                                                           window_end_begin);
+      CUDF_CUDA_TRY(cudaGetLastError());
+
+      auto const valid_count = d_valid_count.value(stream);
+      output->set_null_count(output->size() - valid_count);
+
+      return output;
+    };
+
+    auto constexpr is_arg_minmax =
+      op == aggregation::Kind::ARGMIN || op == aggregation::Kind::ARGMAX;
+
+    if constexpr (is_arg_minmax && std::is_same_v<InputType, cudf::struct_view>) {
+      auto const comp_generator =
+        cudf::reduction::detail::arg_minmax_binop_generator::create<op>(input, stream);
+      auto const device_op =
+        create_rolling_operator<InputType, op>{}(min_periods, comp_generator.binop());
+      return do_rolling(device_op);
+    } else {
+      auto const device_op = create_rolling_operator<InputType, op>{}(min_periods, agg);
+      return do_rolling(device_op);
+    }
+  }
+
+  template <aggregation::Kind op, typename WindowStartIterator, typename WindowEndIterator>
+  std::unique_ptr<column> operator()(column_view const&,
+                                     column_view const&,
+                                     size_type,
+                                     WindowStartIterator,
+                                     WindowEndIterator,
+                                     int,
+                                     rolling_aggregation const&,
+                                     cuda::stream_ref,
+                                     rmm::device_async_resource_ref)
+    requires(!corresponding_rolling_operator<InputType, op>::type::is_supported())
+  {
+    CUDF_FAIL("Invalid aggregation type/pair");
+  }
+};
+
+/**
  * @brief Functor for performing the high level rolling logic.
  *
  * This does 3 basic things:
@@ -550,6 +752,46 @@ struct dispatch_rolling {
 };
 
 /**
+ * @brief Functor for performing high level rolling logic over absolute bounds.
+ */
+struct dispatch_rolling_absolute_bounds {
+  template <typename InputType, typename WindowStartIterator, typename WindowEndIterator>
+  std::unique_ptr<column> operator()(column_view const& input,
+                                     column_view const& default_outputs,
+                                     size_type output_size,
+                                     WindowStartIterator window_start_begin,
+                                     WindowEndIterator window_end_begin,
+                                     size_type min_periods,
+                                     rolling_aggregation const& agg,
+                                     cuda::stream_ref stream,
+                                     rmm::device_async_resource_ref mr)
+  {
+    auto preprocessed_aggs =
+      cudf::detail::aggregation_dispatcher(agg.kind, rolling_preprocessor{}, input.type(), agg);
+    CUDF_EXPECTS(preprocessed_aggs.size() <= 1,
+                 "Encountered a non-trivial rolling aggregation result");
+
+    auto intermediate =
+      aggregation_dispatcher(dynamic_cast<rolling_aggregation const&>(*preprocessed_aggs[0]).kind,
+                             rolling_window_absolute_bounds_launcher<InputType>{},
+                             input,
+                             default_outputs,
+                             output_size,
+                             window_start_begin,
+                             window_end_begin,
+                             min_periods,
+                             dynamic_cast<rolling_aggregation const&>(*preprocessed_aggs[0]),
+                             stream,
+                             mr);
+
+    auto const result_type = target_type(input.type(), agg.kind);
+    auto const postprocessor =
+      rolling_absolute_bounds_postprocessor{input, result_type, stream, mr};
+    return cudf::detail::aggregation_dispatcher(agg.kind, postprocessor, agg, intermediate);
+  }
+};
+
+/**
  * @copydoc cudf::rolling_window(column_view const& input,
  *                               PrecedingWindowIterator preceding_window_begin,
  *                               FollowingWindowIterator following_window_begin,
@@ -595,6 +837,46 @@ std::unique_ptr<column> rolling_window(column_view const& input,
                                default_outputs,
                                preceding_window_begin,
                                following_window_begin,
+                               min_periods,
+                               agg,
+                               stream,
+                               mr);
+}
+
+/**
+ * @brief Apply a rolling aggregation using precomputed absolute row bounds.
+ *
+ * `output_size` is the number of windows to aggregate and may differ from
+ * `input.size()`.
+ */
+template <typename WindowStartIterator, typename WindowEndIterator>
+std::unique_ptr<column> rolling_window(column_view const& input,
+                                       column_view const& default_outputs,
+                                       size_type output_size,
+                                       WindowStartIterator window_start_begin,
+                                       WindowEndIterator window_end_begin,
+                                       size_type min_periods,
+                                       rolling_aggregation const& agg,
+                                       cuda::stream_ref stream,
+                                       rmm::device_async_resource_ref mr)
+{
+  static_assert(warp_size == cudf::detail::size_in_bits<cudf::bitmask_type>(),
+                "bitmask_type size does not match CUDA warp size");
+
+  CUDF_EXPECTS(is_supported_absolute_bounds_aggregation(agg.kind),
+               "Unsupported absolute-bounds rolling aggregation");
+
+  if (output_size == 0) { return cudf::detail::empty_output_for_rolling_aggregation(input, agg); }
+
+  min_periods = std::max(min_periods, 0);
+
+  return cudf::type_dispatcher(input.type(),
+                               dispatch_rolling_absolute_bounds{},
+                               input,
+                               default_outputs,
+                               output_size,
+                               window_start_begin,
+                               window_end_begin,
                                min_periods,
                                agg,
                                stream,

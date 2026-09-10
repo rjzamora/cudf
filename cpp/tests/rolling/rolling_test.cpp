@@ -14,10 +14,13 @@
 #include <cudf_test/type_lists.hpp>
 
 #include <cudf/aggregation.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/detail/iterator.cuh>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/rolling.hpp>
 #include <cudf/utilities/bit.hpp>
+#include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <cuda/iterator>
@@ -616,6 +619,29 @@ class RollingtVarStdTestUntyped : public cudf::test::BaseFixture {};
 class RollingErrorTest : public cudf::test::BaseFixture {};
 
 class RollingSumEdgeCaseTest : public cudf::test::BaseFixture {};
+
+class RollingAbsoluteBoundsTest : public cudf::test::BaseFixture {};
+
+TEST_F(RollingAbsoluteBoundsTest, OutputCardinalityCanDifferFromInput)
+{
+  cudf::test::fixed_width_column_wrapper<int64_t> input({1, 2, 3, 4, 5});
+  cudf::test::fixed_width_column_wrapper<cudf::size_type> window_starts({0, 2, 1});
+  cudf::test::fixed_width_column_wrapper<cudf::size_type> window_ends({2, 5, 4});
+  cudf::test::fixed_width_column_wrapper<int64_t> expected({3, 12, 9});
+  auto default_outputs = cudf::empty_like(input);
+
+  auto result =
+    cudf::detail::rolling_window(input,
+                                 default_outputs->view(),
+                                 window_starts,
+                                 window_ends,
+                                 1,
+                                 *cudf::make_sum_aggregation<cudf::rolling_aggregation>(),
+                                 cudf::get_default_stream(),
+                                 cudf::get_current_device_resource_ref());
+
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
+}
 
 // negative sizes
 TEST_F(RollingErrorTest, NegativeMinPeriods)
