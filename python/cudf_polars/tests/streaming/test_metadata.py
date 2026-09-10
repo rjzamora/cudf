@@ -25,6 +25,7 @@ from cudf_streaming.table_chunk import TableChunk
 from cudf_polars import Translator
 from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.dsl import expr
+from cudf_polars.dsl.expressions.dynamic import DynamicWindowLabel
 from cudf_polars.dsl.ir import (
     DataFrameScan,
     GroupBy,
@@ -974,6 +975,89 @@ def test_remap_partitioning_order_scheme_adds_truncated_ordering(
         boundaries.stream,
     ).to_polars()
     assert boundary_df["ts_bucket"].to_list() == expected
+
+
+def test_remap_partitioning_order_scheme_adds_dynamic_window_ordering(spmd_engine):
+    engine = pl.GPUEngine(executor="in-memory", raise_on_fail=True)
+    q = pl.LazyFrame({"idx": [1]})
+    child = Translator(q._ldf.visit(), engine).translate_ir()
+    dtype = child.schema["idx"]
+    hstack = HStack(
+        {**child.schema, "idx_bucket": dtype},
+        (
+            expr.NamedExpr(
+                "idx_bucket",
+                DynamicWindowLabel(
+                    dtype,
+                    1000,
+                    0,
+                    False,  # noqa: FBT003
+                    expr.Col(dtype, "idx"),
+                ),
+            ),
+        ),
+        should_broadcast=True,
+        df=child,
+    )
+    part = Partitioning(
+        inter_rank=_make_order_scheme(
+            spmd_engine.context,
+            key_indices=(0,),
+            values=(1_234, 2_345),
+            strict=True,
+        ),
+        local="inherit",
+    )
+
+    result = maybe_remap_partitioning(hstack, part, context=spmd_engine.context)
+
+    assert result is not None
+    assert isinstance(result.inter_rank, OrderScheme)
+    orderings = result.inter_rank.orderings
+    assert [o.keys[0].column_index for o in orderings] == [0, 1]
+    assert [o.strict_boundaries for o in orderings] == [True, False]
+
+    boundaries = orderings[1].get_boundaries(spmd_engine.context.br())
+    boundary_df = DataFrame.from_table(
+        boundaries.table_view(),
+        ["idx_bucket"],
+        [hstack.schema["idx_bucket"]],
+        boundaries.stream,
+    ).to_polars()
+    assert boundary_df["idx_bucket"].to_list() == [1000, 2000]
+
+
+def test_remap_partitioning_groupby_preserves_renamed_key_ordering(spmd_engine):
+    engine = pl.GPUEngine(executor="in-memory", raise_on_fail=True)
+    child = Translator(
+        pl.LazyFrame({"idx": [1], "idx_bucket": [0]})._ldf.visit(),
+        engine,
+    ).translate_ir()
+    dtype = child.schema["idx_bucket"]
+    gb = GroupBy(
+        {"idx": dtype},
+        (expr.NamedExpr("idx", expr.Col(dtype, "idx_bucket")),),
+        (),
+        False,  # noqa: FBT003
+        None,
+        child,
+    )
+    part = Partitioning(
+        inter_rank=_make_order_scheme(
+            spmd_engine.context,
+            key_indices=(1,),
+            strict=False,
+        ),
+        local="inherit",
+    )
+
+    result = maybe_remap_partitioning(gb, part, context=spmd_engine.context)
+
+    assert result is not None
+    assert isinstance(result.inter_rank, OrderScheme)
+    ordering = result.inter_rank.orderings[0]
+    assert ordering.keys[0].column_index == 0
+    assert ordering.strict_boundaries is False
 
 
 def test_remap_partitioning_order_scheme_truncates_prefix_key(spmd_engine):
