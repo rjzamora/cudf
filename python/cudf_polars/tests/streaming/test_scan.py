@@ -570,7 +570,6 @@ def test_attach_cached_parquet_metadata_resolves_row_groups(
     for scan in streaming_scan.tasks:
         assert isinstance(scan, ParquetScanTask)
         bounds = scan.get_task_bounds()
-        assert bounds is not None
         row_groups.append(bounds.row_groups)
     assert row_groups == [[[0]], [[1]]]
 
@@ -600,7 +599,6 @@ def test_attach_cached_parquet_metadata_uses_rank_local_tasks(
     for scan in streaming_scan.tasks:
         assert isinstance(scan, ParquetScanTask)
         bounds = scan.get_task_bounds()
-        assert bounds is not None
         assert bounds.row_groups == [[0, 1]]
 
 
@@ -627,7 +625,6 @@ def test_attach_cached_parquet_metadata_leaves_sub_row_group_split_unaligned(
         assert isinstance(scan, ParquetScanTask)
         assert scan.total_splits > 1
         bounds = scan.get_task_bounds()
-        assert bounds is not None
         assert bounds.row_groups is None
 
 
@@ -635,7 +632,7 @@ def test_attach_cached_parquet_metadata_leaves_sub_row_group_split_unaligned(
     "skip_rows,n_rows,row_index",
     [(1, -1, None), (0, 2, None), (0, -1, ("index", 0))],
 )
-def test_attach_cached_parquet_metadata_leaves_sliced_fused_scan_unaligned(
+def test_attach_cached_parquet_metadata_leaves_sliced_single_read_unaligned(
     tmp_path: Path,
     skip_rows: int,
     n_rows: int,
@@ -663,8 +660,9 @@ def test_attach_cached_parquet_metadata_leaves_sliced_fused_scan_unaligned(
         assert isinstance(scan, ParquetScanTask)
         assert scan.total_splits == 1
         bounds = scan.get_task_bounds()
-        assert bounds is not None
         assert bounds.row_groups is None
+        assert bounds.skip_rows == skip_rows
+        assert bounds.n_rows == n_rows
 
 
 def test_streaming_scan_raises() -> None:
