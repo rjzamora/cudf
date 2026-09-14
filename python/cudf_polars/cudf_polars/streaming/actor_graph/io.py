@@ -598,7 +598,6 @@ async def read_chunk(
             br=context.br(),
         )
     stop = time.monotonic_ns()
-    ir_type = type(task).__name__
     log(
         "IO Task",
         scope=Scope.IO_TASK.value,
@@ -606,7 +605,7 @@ async def read_chunk(
         admitted=admitted,
         stop=stop,
         ir_id=task.get_stable_id(),
-        ir_type=ir_type,
+        ir_type=type(task).__name__,
         sequence_number=seq_num,
         estimated_output_bytes=estimated_chunk_bytes,
         reservation_bytes=reservation_bytes,
