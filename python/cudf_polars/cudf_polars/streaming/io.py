@@ -250,7 +250,7 @@ def _read_with_hybrid_scan(
     stats_pruning: bool = True,
 ) -> DataFrame:
     """Two-pass parquet read via HybridScanReader for a row-group-aligned task."""
-    assert len(paths) == 1, "hybrid scan only supports one physical file"
+    assert len(paths) == 1, "hybrid scan only supports tasks with one physical file"
     with nvtx_annotate_cudf_polars(
         message="HybridScan", payload=(split_index + 1, total_splits)
     ):
@@ -424,11 +424,6 @@ class ScanTask(IR):
         )
         self.children = ()
 
-    @property
-    def is_split(self) -> bool:
-        """Whether this task is one of multiple splits of a single file."""
-        return self.total_splits > 1
-
     def get_hashable(self) -> Hashable:
         """Hashable representation of the node."""
         return (
@@ -591,7 +586,7 @@ class ParquetScanTask(ScanTask):
         self,
         cached_parquet_info: list[CachedParquetInfo] | None,
     ) -> ParquetScanTaskBounds | None:
-        if self.is_split:
+        if self.total_splits > 1:
             return (
                 None
                 if cached_parquet_info is None
@@ -644,7 +639,7 @@ class ParquetScanTask(ScanTask):
             # but hybrid scan needs FileMetaData.
             cached_parquet_info = task._fetch_parquet_info()
         bounds = task._task_bounds_from_cached(cached_parquet_info)
-        if bounds is None and task.is_split:
+        if bounds is None and task.total_splits > 1:
             bounds = task._split_task_bounds_from_row_group_metadata()
 
         assert bounds is not None
@@ -684,10 +679,10 @@ class ParquetScanTask(ScanTask):
                     stats_pruning=parquet_options._hybrid_scan_stats_pruning,
                 )
 
-        if task.is_split:
-            nvtx_message = f"SplitScan: {paths[0]} [{split_index + 1}/{total_splits}]"
-        else:
-            nvtx_message = f"ParquetScanTask: {', '.join(paths)}"
+        nvtx_message = (
+            f"{type(task).__name__}: {', '.join(paths)} "
+            f"[{split_index + 1}/{total_splits}]"
+        )
         with nvtx_annotate_cudf_polars(message=nvtx_message):
             return Scan.do_evaluate(
                 base_scan.schema,

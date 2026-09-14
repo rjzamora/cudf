@@ -625,7 +625,7 @@ def test_attach_cached_parquet_metadata_leaves_sub_row_group_split_unaligned(
 
     for scan in streaming_scan.tasks:
         assert isinstance(scan, ParquetScanTask)
-        assert scan.is_split
+        assert scan.total_splits > 1
         bounds = scan.get_task_bounds()
         assert bounds is not None
         assert bounds.row_groups is None
@@ -661,7 +661,7 @@ def test_attach_cached_parquet_metadata_leaves_sliced_fused_scan_unaligned(
 
     for scan in streaming_scan.tasks:
         assert isinstance(scan, ParquetScanTask)
-        assert not scan.is_split
+        assert scan.total_splits == 1
         bounds = scan.get_task_bounds()
         assert bounds is not None
         assert bounds.row_groups is None
