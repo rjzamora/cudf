@@ -362,7 +362,9 @@ class ParquetScanTaskBounds(NamedTuple):
     """
     Read bounds for a parquet scan task.
 
-    ``row_groups=None`` means the task is not row-group aligned.
+    ``row_groups=None`` means all row groups in the task paths are
+    available to the reader. ``skip_rows`` and ``n_rows`` may still
+    restrict the rows to read.
     """
 
     row_groups: list[list[int]] | None
@@ -511,11 +513,11 @@ class ParquetScanTask(ScanTask):
             self.parquet_options,
         )
 
-    def get_task_bounds(self) -> ParquetScanTaskBounds | None:
+    def get_task_bounds(self) -> ParquetScanTaskBounds:
         """Return parquet read bounds for this task."""
-        return self._task_bounds_from_cached(self._cached_parquet_info())
+        return self._get_task_bounds(self._get_cached_parquet_info())
 
-    def _cached_parquet_info(self) -> list[CachedParquetInfo] | None:
+    def _get_cached_parquet_info(self) -> list[CachedParquetInfo] | None:
         """Return cached parquet metadata matching this task's paths."""
         cached_parquet_info = self.base_scan.cached_parquet_info
         if cached_parquet_info is None or cached_parquet_info == []:
@@ -537,7 +539,7 @@ class ParquetScanTask(ScanTask):
             parse_hybrid_metadata=True,
         )
 
-    def _split_task_bounds_from_row_counts(
+    def _split_task_bounds_from_row_group_counts(
         self, row_group_num_rows: list[int]
     ) -> ParquetScanTaskBounds:
         """Return parquet read bounds for a split task."""
@@ -563,15 +565,6 @@ class ParquetScanTask(ScanTask):
             n_rows = -1
         return ParquetScanTaskBounds(row_groups, skip_rows, n_rows)
 
-    def _split_task_bounds(
-        self,
-        cached_parquet_info: list[CachedParquetInfo],
-    ) -> ParquetScanTaskBounds:
-        """Return parquet read bounds for a split task."""
-        return self._split_task_bounds_from_row_counts(
-            cached_parquet_info[0].file_metadata.row_group_num_rows
-        )
-
     def _split_task_bounds_from_row_group_metadata(self) -> ParquetScanTaskBounds:
         """Return split bounds using parquet row-group metadata."""
         row_group_num_rows = [
@@ -580,20 +573,24 @@ class ParquetScanTask(ScanTask):
                 plc.io.SourceInfo(self.paths)
             ).rowgroup_metadata()
         ]
-        return self._split_task_bounds_from_row_counts(row_group_num_rows)
+        return self._split_task_bounds_from_row_group_counts(row_group_num_rows)
 
-    def _task_bounds_from_cached(
+    def _get_task_bounds(
         self,
         cached_parquet_info: list[CachedParquetInfo] | None,
-    ) -> ParquetScanTaskBounds | None:
+    ) -> ParquetScanTaskBounds:
+        """Return bounds using cached metadata when available."""
+        base_scan = self.base_scan
         if self.total_splits > 1:
-            return (
-                None
-                if cached_parquet_info is None
-                else self._split_task_bounds(cached_parquet_info)
+            # Logical scan slicing currently lowers to SINGLE_READ
+            assert base_scan.skip_rows == 0, "Unexpected skip_rows in split-file task."
+            assert base_scan.n_rows == -1, "Unexpected n_rows in split-file task."
+            if cached_parquet_info is None:
+                return self._split_task_bounds_from_row_group_metadata()
+            return self._split_task_bounds_from_row_group_counts(
+                cached_parquet_info[0].file_metadata.row_group_num_rows
             )
 
-        base_scan = self.base_scan
         row_groups: list[list[int]] | None = None
         if (
             cached_parquet_info is not None
@@ -622,7 +619,7 @@ class ParquetScanTask(ScanTask):
         task = cls(base_scan, paths, split_index, total_splits, parquet_options)
         base_scan = task.base_scan
         paths = task.paths
-        cached_parquet_info = task._cached_parquet_info()
+        cached_parquet_info = task._get_cached_parquet_info()
         should_try_hybrid_scan = (
             len(paths) == 1
             and base_scan.skip_rows == 0
@@ -638,11 +635,7 @@ class ParquetScanTask(ScanTask):
             # read_parquet_metadata is faster (for now),
             # but hybrid scan needs FileMetaData.
             cached_parquet_info = task._fetch_parquet_info()
-        bounds = task._task_bounds_from_cached(cached_parquet_info)
-        if bounds is None and task.total_splits > 1:
-            bounds = task._split_task_bounds_from_row_group_metadata()
-
-        assert bounds is not None
+        bounds = task._get_task_bounds(cached_parquet_info)
         # Hybrid scan reads through cached parquet metadata, so it is only used
         # when the metadata is available to this task.
         # TODO: Investigate re-enabling for some of the excluded paths
