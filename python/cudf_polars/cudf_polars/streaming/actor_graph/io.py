@@ -46,7 +46,6 @@ from cudf_polars.streaming.actor_graph.utils import (
     send_metadata,
 )
 from cudf_polars.streaming.io import (
-    ScanTask,
     StreamingScan,
     StreamingSink,
     _prepare_sink_directory,
@@ -68,6 +67,7 @@ if TYPE_CHECKING:
         IOPartitionPlan,
         PartitionInfo,
     )
+    from cudf_polars.streaming.io import ScanTask
     from cudf_polars.utils.config import MaxConcurrentIOTasks
 
 
@@ -598,9 +598,7 @@ async def read_chunk(
             br=context.br(),
         )
     stop = time.monotonic_ns()
-    ir_type = (
-        task.trace_ir_type() if isinstance(task, ScanTask) else type(task).__name__
-    )
+    ir_type = type(task).__name__
     log(
         "IO Task",
         scope=Scope.IO_TASK.value,

@@ -440,10 +440,6 @@ class ScanTask(IR):
             self.total_splits,
         )
 
-    def trace_ir_type(self) -> str:
-        """Return the task type to use for IO-task tracing."""
-        return "SplitScan" if self.is_split else type(self).__name__
-
     @classmethod
     def do_evaluate(
         cls,
