@@ -537,15 +537,13 @@ class ParquetScanTask(ScanTask):
             return None
         return [cached_by_path[path] for path in self.paths]
 
-    def _fetch_parquet_info(
-        self, *, parse_hybrid_metadata: bool = False
-    ) -> list[CachedParquetInfo]:
-        """Fetch parquet metadata for this task's paths."""
+    def _fetch_parquet_info(self) -> list[CachedParquetInfo]:
+        """Fetch parquet metadata for hybrid scan."""
         from cudf_polars.dsl.utils.io import _prefetch_parquet_footers_for_paths
 
         return _prefetch_parquet_footers_for_paths(
             self.paths,
-            parse_hybrid_metadata=parse_hybrid_metadata,
+            parse_hybrid_metadata=True,
         )
 
     def _split_task_bounds_from_row_counts(
@@ -646,9 +644,9 @@ class ParquetScanTask(ScanTask):
             )
         )
         if cached_parquet_info is None and should_try_hybrid_scan:
-            cached_parquet_info = task._fetch_parquet_info(
-                parse_hybrid_metadata=should_try_hybrid_scan
-            )
+            # read_parquet_metadata is faster (for now),
+            # but hybrid scan needs FileMetaData.
+            cached_parquet_info = task._fetch_parquet_info()
         bounds = task._task_bounds_from_cached(cached_parquet_info)
         if bounds is None and task.is_split:
             bounds = task._split_task_bounds_from_row_group_metadata()
