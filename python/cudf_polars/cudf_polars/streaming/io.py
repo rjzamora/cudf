@@ -548,12 +548,10 @@ class ParquetScanTask(ScanTask):
             parse_hybrid_metadata=parse_hybrid_metadata,
         )
 
-    def _split_task_bounds(
-        self,
-        cached_parquet_info: list[CachedParquetInfo],
+    def _split_task_bounds_from_row_counts(
+        self, row_group_num_rows: list[int]
     ) -> ParquetScanTaskBounds:
         """Return parquet read bounds for a split task."""
-        row_group_num_rows = cached_parquet_info[0].file_metadata.row_group_num_rows
         total_row_groups = len(row_group_num_rows)
         if self.total_splits <= total_row_groups:
             row_group_stride = total_row_groups // self.total_splits
@@ -575,6 +573,25 @@ class ParquetScanTask(ScanTask):
         if self.split_index == self.total_splits - 1:
             n_rows = -1
         return ParquetScanTaskBounds(row_groups, skip_rows, n_rows)
+
+    def _split_task_bounds(
+        self,
+        cached_parquet_info: list[CachedParquetInfo],
+    ) -> ParquetScanTaskBounds:
+        """Return parquet read bounds for a split task."""
+        return self._split_task_bounds_from_row_counts(
+            cached_parquet_info[0].file_metadata.row_group_num_rows
+        )
+
+    def _split_task_bounds_from_row_group_metadata(self) -> ParquetScanTaskBounds:
+        """Return split bounds using parquet row-group metadata."""
+        row_group_num_rows = [
+            rg["num_rows"]
+            for rg in plc.io.parquet_metadata.read_parquet_metadata(
+                plc.io.SourceInfo(self.paths)
+            ).rowgroup_metadata()
+        ]
+        return self._split_task_bounds_from_row_counts(row_group_num_rows)
 
     def _task_bounds_from_cached(
         self,
@@ -628,11 +645,13 @@ class ParquetScanTask(ScanTask):
                 predicate=base_scan.predicate,
             )
         )
-        if cached_parquet_info is None and (task.is_split or should_try_hybrid_scan):
+        if cached_parquet_info is None and should_try_hybrid_scan:
             cached_parquet_info = task._fetch_parquet_info(
                 parse_hybrid_metadata=should_try_hybrid_scan
             )
         bounds = task._task_bounds_from_cached(cached_parquet_info)
+        if bounds is None and task.is_split:
+            bounds = task._split_task_bounds_from_row_group_metadata()
 
         assert bounds is not None
         # Hybrid scan reads through cached parquet metadata, so it is only used
