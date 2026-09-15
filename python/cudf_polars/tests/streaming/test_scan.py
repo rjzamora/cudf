@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -25,10 +27,14 @@ from cudf_polars.dsl.utils.io import (
 )
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.streaming.actor_graph.io import resolve_max_concurrent_io_tasks
+from cudf_polars.streaming.actor_graph.scan_ordering import (
+    parquet_ordering_partitioning,
+)
 from cudf_polars.streaming.base import (
     DataSourceInfo,
     IOPartitionFlavor,
     IOPartitionPlan,
+    PartitionInfo,
     StatsCollector,
 )
 from cudf_polars.streaming.io import (
@@ -39,6 +45,10 @@ from cudf_polars.streaming.io import (
     scan_partition_plan,
 )
 from cudf_polars.streaming.parallel import lower_ir_graph
+from cudf_polars.streaming.partitioning_requests import (
+    NamedOrderKey,
+    OrderPartitioningRequest,
+)
 from cudf_polars.streaming.statistics import collect_statistics
 from cudf_polars.testing.asserts import assert_gpu_result_equal
 from cudf_polars.testing.engine_utils import SMALL_MAX_ROWS_PER_PARTITION
@@ -410,13 +420,14 @@ def _make_parquet_scan(
     paths: list[str],
     parquet_options: ParquetOptions | None = None,
     *,
+    schema: dict[str, DataType] | None = None,
     skip_rows: int = 0,
     n_rows: int = -1,
     row_index: tuple[str, int] | None = None,
 ) -> Scan:
     parquet_options = parquet_options or ParquetOptions()
     return Scan(
-        {"x": DataType(pl.Int64())},
+        schema or {"x": DataType(pl.Int64())},
         "parquet",
         {},
         None,
@@ -921,6 +932,81 @@ def test_cached_parquet_info_excluded_from_identity() -> None:
     )
     assert scan_without == scan_with
     assert hash(scan_without) == hash(scan_with)
+
+
+def test_parquet_scan_ordering_partitioning_from_footer_metadata(
+    tmp_path: Path, spmd_engine
+) -> None:
+    import pylibcudf as plc
+    from cudf_streaming.channel_metadata import OrderScheme
+
+    paths = []
+    for i in range(2):
+        path = tmp_path / f"part-{i}.parquet"
+        pl.DataFrame(
+            {
+                "x": [i] * 6,
+                "y": range(i * 6, (i + 1) * 6),
+            }
+        ).write_parquet(path, row_group_size=3)
+        paths.append(str(path))
+
+    scan = _make_parquet_scan(
+        paths,
+        schema={
+            "x": DataType(pl.Int64()),
+            "y": DataType(pl.Int64()),
+        },
+    )
+    streaming_scan = StreamingScan(
+        [ParquetScanTask(scan, [path], 0, 1, scan.parquet_options) for path in paths],
+        scan,
+    )
+    request = OrderPartitioningRequest(
+        (
+            NamedOrderKey(
+                "x",
+                plc.types.Order.ASCENDING,
+                plc.types.NullOrder.AFTER,
+            ),
+            NamedOrderKey(
+                "y",
+                plc.types.Order.ASCENDING,
+                plc.types.NullOrder.AFTER,
+            ),
+        )
+    )
+    partition_info = PartitionInfo(
+        len(paths), io_plan=IOPartitionPlan(1, IOPartitionFlavor.SINGLE_FILE)
+    )
+
+    async def _run():
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            ir_context = IRExecutionContext(
+                executor,
+                get_cuda_stream=spmd_engine.context.br().stream_pool.get_stream,
+            )
+            return await parquet_ordering_partitioning(
+                spmd_engine.context,
+                spmd_engine.comm,
+                streaming_scan,
+                partition_info,
+                (request,),
+                ir_context,
+                collective_id=None,
+            )
+
+    partitioning = asyncio.run(_run())
+
+    assert partitioning is not None
+    assert partitioning.local == "inherit"
+    assert isinstance(partitioning.inter_rank, OrderScheme)
+    (ordering,) = partitioning.inter_rank.orderings
+    assert len(ordering.keys) == 2
+    assert ordering.strict_boundaries is True
+    assert ordering.locally_ordered is False
+    assert ordering.boundaries.table_view().num_columns() == 2
+    assert ordering.boundaries.table_view().num_rows() == 1
 
 
 class FooSource(DataSourceInfo):

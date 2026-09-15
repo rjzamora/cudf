@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, cast
 import polars as pl
 
 import pylibcudf as plc
-from cudf_streaming.channel_metadata import ChannelMetadata
+from cudf_streaming.channel_metadata import ChannelMetadata, OrderScheme
 from cudf_streaming.table_chunk import (
     TableChunk,
     make_table_chunks_available_or_wait,
@@ -32,6 +32,9 @@ from cudf_polars.streaming.actor_graph.dispatch import (
     ir_context_for_node,
 )
 from cudf_polars.streaming.actor_graph.nodes import define_actor, shutdown_on_error
+from cudf_polars.streaming.actor_graph.scan_ordering import (
+    parquet_ordering_partitioning,
+)
 from cudf_polars.streaming.actor_graph.tracing import (
     send_chunk,
     trace_channel,
@@ -68,6 +71,7 @@ if TYPE_CHECKING:
         PartitionInfo,
     )
     from cudf_polars.streaming.io import ScanTask
+    from cudf_polars.streaming.partitioning_requests import PartitioningRequest
     from cudf_polars.utils.config import MaxConcurrentIOTasks
 
 
@@ -616,10 +620,14 @@ async def read_chunk(
 @define_actor()
 async def scan_node(
     context: Context,
+    comm: Communicator,
     ir: StreamingScan,
     ir_context: IRExecutionContext,
     ch_out: Channel[TableChunk],
     *,
+    partition_info: PartitionInfo,
+    partitioning_requests: tuple[PartitioningRequest, ...],
+    collective_id: int | None,
     num_producers: int,
     estimated_chunk_bytes: int,
 ) -> None:
@@ -630,12 +638,20 @@ async def scan_node(
     ----------
     context
         The rapidsmpf context.
+    comm
+        The communicator.
     ir
         The Scan node.
     ir_context
         The execution context for the IR node.
     ch_out
         The output Channel[TableChunk].
+    partition_info
+        Partitioning information for this scan node.
+    partitioning_requests
+        Downstream partitioning requests for this scan node.
+    collective_id
+        Collective ID used to allgather parquet scan endpoint metadata.
     num_producers
         The number of producers to use for the scan node.
     estimated_chunk_bytes
@@ -648,12 +664,30 @@ async def scan_node(
         context, ch_out, trace_ir=ir, ir_context=ir_context
     ) as tracer:
         ch_out = trace_channel(ch_out, tracer)
-        # Send basic metadata
+        # Send metadata before producing chunks.
         ir_context = dataclasses.replace(ir_context, tracer=tracer)
+        partitioning = await parquet_ordering_partitioning(
+            context,
+            comm,
+            ir,
+            partition_info,
+            partitioning_requests,
+            ir_context,
+            collective_id,
+        )
+        if partitioning is not None:
+            assert isinstance(partitioning.inter_rank, OrderScheme)
+            ordering = partitioning.inter_rank.orderings[0]
+            if tracer is not None:
+                tracer.decision = (
+                    "parquet_ordering_strict"
+                    if ordering.strict_boundaries
+                    else "parquet_ordering_non_strict"
+                )
         await send_metadata(
             ch_out,
             context,
-            ChannelMetadata(local_count=len(tasks)),
+            ChannelMetadata(local_count=len(tasks), partitioning=partitioning),
         )
 
         # If there is nothing to scan, drain the channel and return
@@ -737,9 +771,13 @@ def _(
     nodes[ir] = [
         scan_node(
             rec.state["context"],
+            rec.state["comm"],
             ir,
             ir_context,
             ch_out,
+            partition_info=partition_info,
+            partitioning_requests=rec.state["partitioning_requests"].get(ir, ()),
+            collective_id=next(iter(rec.state["collective_id_map"].get(ir, ())), None),
             num_producers=num_producers,
             estimated_chunk_bytes=(
                 plan.estimated_chunk_bytes or executor.target_partition_size
