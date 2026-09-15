@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from rapidsmpf.streaming.core.context import Context
     from rmm.pylibrmm.stream import Stream
 
-    from cudf_polars.dsl.ir import CachedParquetInfo, IRExecutionContext, Scan
+    from cudf_polars.dsl.ir import CachedParquetInfo, IRExecutionContext
     from cudf_polars.streaming.io import StreamingScan
     from cudf_polars.streaming.partitioning_requests import PartitioningRequest
 
@@ -50,17 +50,16 @@ def _null_boundary_column(
 
 
 async def _get_parquet_info(
-    base_scan: Scan,
     tasks: Sequence[ParquetScanTask],
     ir_context: IRExecutionContext,
 ) -> dict[str, CachedParquetInfo]:
     """Return cached or freshly fetched footer metadata for rank-local paths."""
     paths = list(dict.fromkeys(path for task in tasks for path in task.paths))
-    cached_by_path = {
-        info.path: info
-        for info in (base_scan.cached_parquet_info or ())
-        if info.path in paths
-    }
+    cached_by_path: dict[str, CachedParquetInfo] = {}
+    for task in tasks:
+        if (task_info := task._get_cached_parquet_info()) is not None:
+            cached_by_path.update({info.path: info for info in task_info})
+
     if set(cached_by_path) != set(paths):
         from cudf_polars.dsl.utils.io import _prefetch_parquet_footers_for_paths
 
@@ -95,6 +94,127 @@ def _get_ordering_candidates(
     return candidates
 
 
+def _selected_row_group_indices(
+    cached_info: list[CachedParquetInfo],
+    column: str,
+    row_groups: list[list[int]] | None,
+) -> list[int] | None:
+    """Return selected row-group indices if footer stats are usable."""
+    if row_groups is None:
+        return None
+    assert len(row_groups) == len(cached_info), (
+        "Task row-group bounds must match task parquet metadata."
+    )
+
+    indices: list[int] = []
+    offset = 0
+    for groups, info in zip(row_groups, cached_info, strict=True):
+        row_group_count = len(info.file_metadata.row_group_num_rows)
+        for group in groups:
+            assert 0 <= group < row_group_count, (
+                f"Invalid row-group index {group} for file with "
+                f"{row_group_count} row groups."
+            )
+            chunk = next(
+                (
+                    chunk
+                    for chunk in info.file_metadata.row_groups[group].columns
+                    if ".".join(chunk.meta_data.path_in_schema) == column
+                ),
+                None,
+            )
+            if chunk is None:
+                return None
+            statistics = chunk.meta_data.statistics
+            if (
+                statistics is None
+                or statistics.null_count is None
+                or statistics.null_count != 0
+            ):
+                return None
+            indices.append(offset + group)
+        offset += row_group_count
+    return indices or None
+
+
+def _task_boundaries(
+    task: ParquetScanTask,
+    cached_info: list[CachedParquetInfo],
+    column: str,
+    order: plc.types.Order,
+    null_order: plc.types.NullOrder,
+    stream: Stream,
+) -> plc.Column | None:
+    """Return first/last task boundaries for a provably ordered column."""
+    row_group_indices = _selected_row_group_indices(
+        cached_info, column, task._get_task_bounds(cached_info).row_groups
+    )
+    if row_group_indices is None:
+        return None
+
+    try:
+        column_bounds = plc.io.parquet_metadata.read_parquet_column_chunk_bounds(
+            [info.file_metadata for info in cached_info],
+            columns=[column],
+            stream=stream,
+        )
+    except (TypeError, ValueError, RuntimeError):
+        return None
+
+    min_max_columns = column_bounds.columns()[2:]
+    assert len(min_max_columns) == 2, (
+        "Single-column parquet bounds must contain min and max columns."
+    )
+    min_column, max_column = min_max_columns
+    assert min_column.size() == max_column.size(), (
+        "Parquet min/max bound columns must have matching row counts."
+    )
+    if min_column.null_count() or max_column.null_count():
+        return None
+
+    start_column, end_column = (
+        (max_column, min_column)
+        if order == plc.types.Order.DESCENDING
+        else (min_column, max_column)
+    )
+    row_group_count = min_column.size()
+    assert all(0 <= index < row_group_count for index in row_group_indices), (
+        "Selected row-group indices must reference decoded parquet bounds."
+    )
+    row_group_boundaries = plc.copying.gather(
+        plc.concatenate.concatenate(
+            [plc.Table([start_column]), plc.Table([end_column])],
+            stream=stream,
+        ),
+        plc.Column.from_iterable_of_py(
+            [
+                index
+                for group in row_group_indices
+                for index in (group, row_group_count + group)
+            ],
+            plc.DataType(plc.TypeId.INT32),
+            stream=stream,
+        ),
+        plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+        stream=stream,
+    )
+    if not plc.sorting.is_sorted(
+        row_group_boundaries, [order], [null_order], stream=stream
+    ):
+        return None
+
+    return plc.copying.gather(
+        row_group_boundaries,
+        plc.Column.from_iterable_of_py(
+            [0, row_group_boundaries.num_rows() - 1],
+            plc.DataType(plc.TypeId.INT32),
+            stream=stream,
+        ),
+        plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+        stream=stream,
+    ).columns()[0]
+
+
 def _get_local_boundaries(
     ir: StreamingScan,
     parquet_tasks: Sequence[ParquetScanTask],
@@ -117,7 +237,8 @@ def _get_local_boundaries(
         task_boundaries: list[plc.Table] = []
         for task in parquet_tasks:
             task_info = [parquet_info[path] for path in task.paths]
-            boundary_column = task.get_ordered_boundaries(
+            boundary_column = _task_boundaries(
+                task,
                 task_info,
                 column_name,
                 order_key.order,
@@ -158,7 +279,7 @@ async def parquet_ordering_partitioning(
 
     assert all(isinstance(task, ParquetScanTask) for task in ir.tasks)
     parquet_tasks = cast("Sequence[ParquetScanTask]", ir.tasks)
-    parquet_info = await _get_parquet_info(ir.base_scan, parquet_tasks, ir_context)
+    parquet_info = await _get_parquet_info(parquet_tasks, ir_context)
 
     stream = ir_context.get_cuda_stream()
     boundary_rows = _get_local_boundaries(
