@@ -952,7 +952,7 @@ def _run_parquet_ordering_partitioning(
                 global_chunk_count,
                 requests,
                 ir_context,
-                collective_id=None,
+                collective_id=0,
             )
 
     return asyncio.run(_run())

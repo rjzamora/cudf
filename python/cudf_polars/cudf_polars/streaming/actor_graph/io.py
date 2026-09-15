@@ -632,7 +632,7 @@ async def scan_node(
     *,
     global_chunk_count: int,
     partitioning_requests: tuple[PartitioningRequest, ...],
-    collective_id: int | None,
+    collective_id: int,
     num_producers: int,
     estimated_chunk_bytes: int,
 ) -> None:
@@ -656,7 +656,7 @@ async def scan_node(
     partitioning_requests
         Downstream partitioning requests for this scan node.
     collective_id
-        Collective ID used to allgather parquet scan endpoint metadata.
+        Collective ID used to allgather parquet scan boundary metadata.
     num_producers
         The number of producers to use for the scan node.
     estimated_chunk_bytes

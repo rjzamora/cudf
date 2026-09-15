@@ -578,7 +578,7 @@ class ParquetScanTask(ScanTask):
 
     def _get_task_bounds(
         self,
-        cached_parquet_info: list[CachedParquetInfo] | None,
+        cached_parquet_info: Sequence[CachedParquetInfo] | None,
     ) -> ParquetScanTaskBounds:
         """Return bounds using cached metadata when available."""
         base_scan = self.base_scan
@@ -726,7 +726,7 @@ class ParquetScanTask(ScanTask):
 
     def get_ordered_boundaries(
         self,
-        cached_info: list[CachedParquetInfo],
+        cached_info: Sequence[CachedParquetInfo],
         column: str,
         order: plc.types.Order,
         null_order: plc.types.NullOrder,
