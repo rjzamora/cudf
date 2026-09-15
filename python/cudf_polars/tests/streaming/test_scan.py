@@ -34,7 +34,6 @@ from cudf_polars.streaming.base import (
     DataSourceInfo,
     IOPartitionFlavor,
     IOPartitionPlan,
-    PartitionInfo,
     StatsCollector,
 )
 from cudf_polars.streaming.io import (
@@ -976,9 +975,6 @@ def test_parquet_scan_ordering_partitioning_from_footer_metadata(
             ),
         )
     )
-    partition_info = PartitionInfo(
-        len(paths), io_plan=IOPartitionPlan(1, IOPartitionFlavor.SINGLE_FILE)
-    )
 
     async def _run():
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -990,7 +986,7 @@ def test_parquet_scan_ordering_partitioning_from_footer_metadata(
                 spmd_engine.context,
                 spmd_engine.comm,
                 streaming_scan,
-                partition_info,
+                len(paths),
                 (request,),
                 ir_context,
                 collective_id=None,

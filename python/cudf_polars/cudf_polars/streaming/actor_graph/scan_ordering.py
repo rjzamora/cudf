@@ -32,19 +32,8 @@ if TYPE_CHECKING:
     from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.dsl.ir import CachedParquetInfo, IRExecutionContext
-    from cudf_polars.streaming.base import PartitionInfo
     from cudf_polars.streaming.io import StreamingScan
     from cudf_polars.streaming.partitioning_requests import PartitioningRequest
-
-
-def _scan_order_request(
-    requests: tuple[PartitioningRequest, ...],
-) -> OrderPartitioningRequest | None:
-    """Return the first ordering request, if one exists."""
-    for request in requests:
-        if isinstance(request, OrderPartitioningRequest):
-            return request
-    return None
 
 
 def _empty_endpoint_table(
@@ -192,10 +181,9 @@ async def _local_parquet_endpoint_rows_from_request(
     if not request.keys or ir.base_scan.typ != "parquet":
         return None
 
-    tasks = list(ir.tasks)
-    if not all(isinstance(task, ParquetScanTask) for task in tasks):
+    parquet_tasks = [task for task in ir.tasks if isinstance(task, ParquetScanTask)]
+    if len(parquet_tasks) != len(ir.tasks):
         return None
-    parquet_tasks = [task for task in tasks if isinstance(task, ParquetScanTask)]
 
     try:
         column_indices = names_to_indices(
@@ -209,12 +197,17 @@ async def _local_parquet_endpoint_rows_from_request(
     ]
 
     if not await _ensure_cached_parquet_info(parquet_tasks, ir_context):
+        # Return empty endpoints instead of None so every rank still participates
+        # in the allgather. The global endpoint-count check rejects the request
+        # if this rank was expected to contribute endpoints.
         return order_keys, _empty_endpoint_table(ir, request, stream)
 
     endpoint_rows: list[plc.Table] = []
     for task in parquet_tasks:
         endpoints = _parquet_task_endpoint_rows(task, request, order_keys, stream)
         if endpoints is None:
+            # See the comment above: a failed rank-local proof must not skip a
+            # collective that other ranks may enter.
             return order_keys, _empty_endpoint_table(ir, request, stream)
         endpoint_rows.append(endpoints)
 
@@ -230,14 +223,21 @@ async def parquet_ordering_partitioning(
     context: Context,
     comm: Communicator,
     ir: StreamingScan,
-    partition_info: PartitionInfo,
+    partition_count: int,
     requests: tuple[PartitioningRequest, ...],
     ir_context: IRExecutionContext,
     collective_id: int | None,
 ) -> Partitioning | None:
     """Extract parquet scan ordering from footer metadata, when safe."""
-    request = _scan_order_request(requests)
-    if request is None or partition_info.io_plan is None:
+    if partition_count == 0:
+        return None
+
+    request = None
+    for candidate in requests:
+        if isinstance(candidate, OrderPartitioningRequest):
+            request = candidate
+            break
+    if request is None:
         return None
 
     stream = ir_context.get_cuda_stream()
@@ -264,7 +264,7 @@ async def parquet_ordering_partitioning(
             stream, ordered=True, ir_context=ir_context
         )
 
-    if endpoint_rows.num_rows() != 2 * partition_info.count:
+    if endpoint_rows.num_rows() != 2 * partition_count:
         return None
 
     column_order = [key.order for key in order_keys]
@@ -274,7 +274,7 @@ async def parquet_ordering_partitioning(
     ):
         return None
 
-    num_partitions = partition_info.count
+    num_partitions = partition_count
     if num_partitions == 0:
         return None
     if num_partitions < 2:
