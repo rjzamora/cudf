@@ -12,6 +12,8 @@ import pytest
 
 import polars as pl
 
+import pylibcudf as plc
+
 from cudf_polars import Translator
 from cudf_polars.containers import DataType
 from cudf_polars.dsl.ir import (
@@ -63,8 +65,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
     from typing import Any, Literal
-
-    import pylibcudf as plc
 
     import cudf_polars.engine.core
     from cudf_polars.engine.core import StreamingEngine
@@ -933,10 +933,46 @@ def test_cached_parquet_info_excluded_from_identity() -> None:
     assert hash(scan_without) == hash(scan_with)
 
 
+def _run_parquet_ordering_partitioning(
+    streaming_scan: StreamingScan,
+    requests: tuple[OrderPartitioningRequest, ...],
+    spmd_engine,
+    global_chunk_count: int,
+):
+    async def _run():
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            ir_context = IRExecutionContext(
+                executor,
+                get_cuda_stream=spmd_engine.context.br().stream_pool.get_stream,
+            )
+            return await parquet_ordering_partitioning(
+                spmd_engine.context,
+                spmd_engine.comm,
+                streaming_scan,
+                global_chunk_count,
+                requests,
+                ir_context,
+                collective_id=None,
+            )
+
+    return asyncio.run(_run())
+
+
+def _order_request(name: str) -> OrderPartitioningRequest:
+    return OrderPartitioningRequest(
+        (
+            NamedOrderKey(
+                name,
+                plc.types.Order.ASCENDING,
+                plc.types.NullOrder.AFTER,
+            ),
+        )
+    )
+
+
 def test_parquet_scan_ordering_partitioning_from_footer_metadata(
     tmp_path: Path, spmd_engine
 ) -> None:
-    import pylibcudf as plc
     from cudf_streaming.channel_metadata import OrderScheme
 
     paths = []
@@ -970,33 +1006,12 @@ def test_parquet_scan_ordering_partitioning_from_footer_metadata(
             ),
         )
     )
-    proven_request = OrderPartitioningRequest(
-        (
-            NamedOrderKey(
-                "x",
-                plc.types.Order.ASCENDING,
-                plc.types.NullOrder.AFTER,
-            ),
-        )
+    partitioning = _run_parquet_ordering_partitioning(
+        streaming_scan,
+        (unproven_request, _order_request("x")),
+        spmd_engine,
+        len(paths),
     )
-
-    async def _run():
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            ir_context = IRExecutionContext(
-                executor,
-                get_cuda_stream=spmd_engine.context.br().stream_pool.get_stream,
-            )
-            return await parquet_ordering_partitioning(
-                spmd_engine.context,
-                spmd_engine.comm,
-                streaming_scan,
-                len(paths),
-                (unproven_request, proven_request),
-                ir_context,
-                collective_id=None,
-            )
-
-    partitioning = asyncio.run(_run())
 
     assert partitioning is not None
     assert partitioning.local == "inherit"
@@ -1008,6 +1023,86 @@ def test_parquet_scan_ordering_partitioning_from_footer_metadata(
     boundaries = ordering.get_boundaries(spmd_engine.context.br())
     assert boundaries.table_view().num_columns() == 1
     assert boundaries.table_view().num_rows() == 1
+
+
+def test_parquet_scan_ordering_partitioning_rejects_null_chunks(
+    tmp_path: Path, spmd_engine
+) -> None:
+    paths = []
+    for i, values in enumerate(([1, None], [2, 3])):
+        path = tmp_path / f"part-{i}.parquet"
+        pl.DataFrame({"x": values}).write_parquet(path, row_group_size=2)
+        paths.append(str(path))
+
+    scan = _make_parquet_scan(paths)
+    streaming_scan = StreamingScan(
+        [ParquetScanTask(scan, [path], 0, 1, scan.parquet_options) for path in paths],
+        scan,
+    )
+
+    assert (
+        _run_parquet_ordering_partitioning(
+            streaming_scan, (_order_request("x"),), spmd_engine, len(paths)
+        )
+        is None
+    )
+
+
+def test_parquet_scan_ordering_partitioning_uses_row_group_splits(
+    tmp_path: Path, spmd_engine
+) -> None:
+    from cudf_streaming.channel_metadata import OrderScheme
+
+    path = tmp_path / "data.parquet"
+    pl.DataFrame({"x": range(8)}).write_parquet(path, row_group_size=2)
+    scan = _make_parquet_scan([str(path)])
+    split_count = 4
+    streaming_scan = StreamingScan(
+        [
+            ParquetScanTask(scan, [str(path)], i, split_count, scan.parquet_options)
+            for i in range(split_count)
+        ],
+        scan,
+    )
+
+    partitioning = _run_parquet_ordering_partitioning(
+        streaming_scan, (_order_request("x"),), spmd_engine, split_count
+    )
+
+    assert partitioning is not None
+    assert isinstance(partitioning.inter_rank, OrderScheme)
+    (ordering,) = partitioning.inter_rank.orderings
+    assert ordering.strict_boundaries is True
+    boundaries = ordering.get_boundaries(spmd_engine.context.br())
+    assert boundaries.table_view().num_rows() == split_count - 1
+
+
+def test_parquet_scan_ordering_partitioning_skips_synthetic_columns(
+    tmp_path: Path, spmd_engine
+) -> None:
+    path = tmp_path / "data.parquet"
+    pl.DataFrame({"x": range(4)}).write_parquet(path, row_group_size=2)
+    scan = _make_parquet_scan(
+        [str(path)],
+        schema={
+            "x": DataType(pl.Int64()),
+            "path": DataType(pl.String()),
+        },
+    )
+    streaming_scan = StreamingScan(
+        [ParquetScanTask(scan, [str(path)], 0, 1, scan.parquet_options)],
+        scan,
+    )
+
+    partitioning = _run_parquet_ordering_partitioning(
+        streaming_scan,
+        (_order_request("path"), _order_request("x")),
+        spmd_engine,
+        global_chunk_count=1,
+    )
+
+    assert partitioning is not None
+    assert partitioning.inter_rank is not None
 
 
 class FooSource(DataSourceInfo):
