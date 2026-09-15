@@ -1005,8 +1005,9 @@ def test_parquet_scan_ordering_partitioning_from_footer_metadata(
     assert len(ordering.keys) == 2
     assert ordering.strict_boundaries is True
     assert ordering.locally_ordered is False
-    assert ordering.boundaries.table_view().num_columns() == 2
-    assert ordering.boundaries.table_view().num_rows() == 1
+    boundaries = ordering.get_boundaries(spmd_engine.context.br())
+    assert boundaries.table_view().num_columns() == 2
+    assert boundaries.table_view().num_rows() == 1
 
 
 class FooSource(DataSourceInfo):
