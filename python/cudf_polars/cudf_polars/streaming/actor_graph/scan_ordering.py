@@ -36,13 +36,24 @@ if TYPE_CHECKING:
     from cudf_polars.streaming.partitioning_requests import PartitioningRequest
 
 
-def _empty_endpoint_table(
+def _empty_endpoint_column(
     ir: StreamingScan, request: OrderPartitioningRequest, stream: Stream
-) -> plc.Table:
-    """Return an empty endpoint table for the requested ordering keys."""
-    return plc.Table(
-        [make_empty_column(ir.schema[key.name], stream) for key in request.keys]
-    )
+) -> plc.Column:
+    """Return an empty endpoint column for a single-column ordering request."""
+    return make_empty_column(ir.schema[request.keys[0].name], stream)
+
+
+def _null_endpoint_column(
+    ir: StreamingScan,
+    request: OrderPartitioningRequest,
+    size: int,
+    stream: Stream,
+) -> plc.Column:
+    """Return a null endpoint column to invalidate one ordering candidate."""
+    empty = _empty_endpoint_column(ir, request, stream)
+    if size == 0:
+        return empty
+    return plc.Column.all_null_like(empty, size, stream=stream)
 
 
 async def _ensure_cached_parquet_info(
@@ -93,13 +104,12 @@ def _flat_row_group_indices(
     return flat_indices
 
 
-def _parquet_task_endpoint_rows(
+def _parquet_task_column_bounds(
     task: ParquetScanTask,
-    request: OrderPartitioningRequest,
-    order_keys: Sequence[OrderKey],
+    columns: Sequence[str],
     stream: Stream,
-) -> plc.Table | None:
-    """Extract one start/end endpoint pair for a parquet scan task."""
+) -> tuple[plc.Table, list[int]] | None:
+    """Read requested column bounds for one row-group-aligned parquet task."""
     bounds = task.get_task_bounds()
     if bounds.row_groups is None or bounds.skip_rows != 0 or bounds.n_rows != -1:
         return None
@@ -114,18 +124,31 @@ def _parquet_task_endpoint_rows(
 
     column_bounds = plc.io.parquet_metadata.read_parquet_column_chunk_bounds(
         [info.file_metadata for info in cached_info],
-        columns=[key.name for key in request.keys],
+        columns=columns,
         stream=stream,
     )
-    bound_columns = column_bounds.columns()[2:]
-    if len(bound_columns) != 2 * len(request.keys):
+    if len(column_bounds.columns()[2:]) != 2 * len(columns):
         return None
+    return column_bounds, flat_indices
+
+
+def _candidate_endpoint_rows(
+    column_bounds: plc.Table,
+    flat_indices: list[int],
+    request: OrderPartitioningRequest,
+    order_keys: Sequence[OrderKey],
+    column_positions: dict[str, int],
+    stream: Stream,
+) -> plc.Table | None:
+    """Extract one start/end endpoint pair for a candidate ordering."""
+    bound_columns = column_bounds.columns()[2:]
 
     start_columns = []
     end_columns = []
-    for key, min_column, max_column in zip(
-        request.keys, bound_columns[::2], bound_columns[1::2], strict=True
-    ):
+    for key in request.keys:
+        position = column_positions[key.name]
+        min_column = bound_columns[2 * position]
+        max_column = bound_columns[2 * position + 1]
         if min_column.null_count() or max_column.null_count():
             return None
         if key.order == plc.types.Order.DESCENDING:
@@ -171,52 +194,106 @@ def _parquet_task_endpoint_rows(
     )
 
 
-async def _local_parquet_endpoint_rows_from_request(
+async def _local_parquet_endpoint_rows_from_requests(
     ir: StreamingScan,
-    request: OrderPartitioningRequest,
+    requests: tuple[PartitioningRequest, ...],
     ir_context: IRExecutionContext,
     stream: Stream,
-) -> tuple[list[OrderKey], plc.Table] | None:
-    """Build rank-local ordered endpoint rows from parquet row-group statistics."""
-    if not request.keys or ir.base_scan.typ != "parquet":
+) -> tuple[list[list[OrderKey]], plc.Table] | None:
+    """Build rank-local endpoint rows for candidate scan orderings."""
+    if ir.base_scan.typ != "parquet":
         return None
 
     parquet_tasks = [task for task in ir.tasks if isinstance(task, ParquetScanTask)]
     if len(parquet_tasks) != len(ir.tasks):
         return None
 
-    try:
-        column_indices = names_to_indices(
-            tuple(key.name for key in request.keys), ir.schema
+    candidates: list[tuple[OrderPartitioningRequest, list[OrderKey]]] = []
+    columns: list[str] = []
+    for request in requests:
+        # Parquet footer min/max statistics can prove single-column ordering,
+        # but not arbitrary lexicographic multi-column ordering.
+        if not isinstance(request, OrderPartitioningRequest) or len(request.keys) != 1:
+            continue
+        try:
+            column_indices = names_to_indices(
+                tuple(key.name for key in request.keys), ir.schema
+            )
+        except ValueError:
+            continue
+        candidates.append(
+            (
+                request,
+                [
+                    OrderKey(column_index, key.order, key.null_order)
+                    for column_index, key in zip(
+                        column_indices, request.keys, strict=True
+                    )
+                ],
+            )
         )
-    except ValueError:
+        columns.extend(key.name for key in request.keys)
+
+    if not candidates:
         return None
-    order_keys = [
-        OrderKey(column_index, key.order, key.null_order)
-        for column_index, key in zip(column_indices, request.keys, strict=True)
-    ]
+
+    candidate_order_keys = [order_keys for _, order_keys in candidates]
+    local_endpoint_count = 2 * len(parquet_tasks)
 
     if not await _ensure_cached_parquet_info(parquet_tasks, ir_context):
-        # Return empty endpoints instead of None so every rank still participates
-        # in the allgather. The global endpoint-count check rejects the request
-        # if this rank was expected to contribute endpoints.
-        return order_keys, _empty_endpoint_table(ir, request, stream)
+        # Return null endpoints instead of None so every rank still participates
+        # in the allgather. Candidate evaluation rejects any column containing
+        # nulls after the allgather.
+        return candidate_order_keys, plc.Table(
+            [
+                _null_endpoint_column(ir, request, local_endpoint_count, stream)
+                for request, _ in candidates
+            ]
+        )
 
-    endpoint_rows: list[plc.Table] = []
+    columns = list(dict.fromkeys(columns))
+    column_positions = {name: i for i, name in enumerate(columns)}
+    task_bounds: list[tuple[plc.Table, list[int]]] = []
     for task in parquet_tasks:
-        endpoints = _parquet_task_endpoint_rows(task, request, order_keys, stream)
-        if endpoints is None:
-            # See the comment above: a failed rank-local proof must not skip a
-            # collective that other ranks may enter.
-            return order_keys, _empty_endpoint_table(ir, request, stream)
-        endpoint_rows.append(endpoints)
+        bounds = _parquet_task_column_bounds(task, columns, stream)
+        if bounds is None:
+            return candidate_order_keys, plc.Table(
+                [
+                    _null_endpoint_column(ir, request, local_endpoint_count, stream)
+                    for request, _ in candidates
+                ]
+            )
+        task_bounds.append(bounds)
 
-    return (
-        order_keys,
-        plc.concatenate.concatenate(endpoint_rows, stream=stream)
-        if endpoint_rows
-        else _empty_endpoint_table(ir, request, stream),
-    )
+    endpoint_columns: list[plc.Column] = []
+    for request, order_keys in candidates:
+        endpoint_rows: list[plc.Table] = []
+        failed = False
+        for column_bounds, flat_indices in task_bounds:
+            endpoints = _candidate_endpoint_rows(
+                column_bounds,
+                flat_indices,
+                request,
+                order_keys,
+                column_positions,
+                stream,
+            )
+            if endpoints is None:
+                failed = True
+                break
+            endpoint_rows.append(endpoints)
+        if failed:
+            endpoint_columns.append(
+                _null_endpoint_column(ir, request, local_endpoint_count, stream)
+            )
+        elif endpoint_rows:
+            endpoint_columns.append(
+                plc.concatenate.concatenate(endpoint_rows, stream=stream).columns()[0]
+            )
+        else:
+            endpoint_columns.append(_empty_endpoint_column(ir, request, stream))
+
+    return candidate_order_keys, plc.Table(endpoint_columns)
 
 
 async def parquet_ordering_partitioning(
@@ -232,25 +309,17 @@ async def parquet_ordering_partitioning(
     if global_chunk_count == 0:
         return None
 
-    request = None
-    for candidate in requests:
-        if isinstance(candidate, OrderPartitioningRequest):
-            request = candidate
-            break
-    if request is None:
-        return None
-
     stream = ir_context.get_cuda_stream()
-    result = await _local_parquet_endpoint_rows_from_request(
+    local_results = await _local_parquet_endpoint_rows_from_requests(
         ir,
-        request,
+        requests,
         ir_context,
         stream,
     )
-    if result is None:
+    if local_results is None:
         return None
 
-    order_keys, endpoint_rows = result
+    candidate_order_keys, endpoint_rows = local_results
     if comm.nranks > 1:
         if collective_id is None:
             return None
@@ -267,44 +336,47 @@ async def parquet_ordering_partitioning(
     if endpoint_rows.num_rows() != 2 * global_chunk_count:
         return None
 
-    column_order = [key.order for key in order_keys]
-    null_order = [key.null_order for key in order_keys]
-    if not plc.sorting.is_sorted(
-        endpoint_rows, column_order, null_order, stream=stream
-    ):
-        return None
+    for i, order_keys in enumerate(candidate_order_keys):
+        endpoint_column = endpoint_rows.columns()[i]
+        if endpoint_column.null_count():
+            continue
+        endpoint_column_rows = plc.Table([endpoint_column])
+        column_order = [key.order for key in order_keys]
+        null_order = [key.null_order for key in order_keys]
+        if not plc.sorting.is_sorted(
+            endpoint_column_rows, column_order, null_order, stream=stream
+        ):
+            continue
 
-    num_partitions = global_chunk_count
-    if num_partitions == 0:
-        return None
-    if num_partitions < 2:
-        boundaries = plc.Table(
-            [
-                plc.Column.from_iterable_of_py([], column.type(), stream=stream)
-                for column in endpoint_rows.columns()
-            ]
+        if global_chunk_count < 2:
+            boundaries = plc.Table(
+                [
+                    plc.Column.from_iterable_of_py([], column.type(), stream=stream)
+                    for column in endpoint_column_rows.columns()
+                ]
+            )
+            strict = True
+        else:
+            boundaries, strict = _extract_boundaries_from_endpoint_rows(
+                endpoint_column_rows, global_chunk_count, stream
+            )
+        boundaries_chunk = TableChunk.from_pylibcudf_table(
+            boundaries,
+            stream,
+            exclusive_view=True,
+            br=context.br(),
         )
-        strict = True
-    else:
-        boundaries, strict = _extract_boundaries_from_endpoint_rows(
-            endpoint_rows, num_partitions, stream
+        return Partitioning(
+            inter_rank=OrderScheme(
+                [
+                    Ordering(
+                        order_keys,
+                        boundaries_chunk,
+                        strict_boundaries=strict,
+                        locally_ordered=False,
+                    )
+                ]
+            ),
+            local="inherit",
         )
-    boundaries_chunk = TableChunk.from_pylibcudf_table(
-        boundaries,
-        stream,
-        exclusive_view=True,
-        br=context.br(),
-    )
-    return Partitioning(
-        inter_rank=OrderScheme(
-            [
-                Ordering(
-                    order_keys,
-                    boundaries_chunk,
-                    strict_boundaries=strict,
-                    locally_ordered=False,
-                )
-            ]
-        ),
-        local="inherit",
-    )
+    return None

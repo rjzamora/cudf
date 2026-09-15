@@ -961,15 +961,19 @@ def test_parquet_scan_ordering_partitioning_from_footer_metadata(
         [ParquetScanTask(scan, [path], 0, 1, scan.parquet_options) for path in paths],
         scan,
     )
-    request = OrderPartitioningRequest(
+    unproven_request = OrderPartitioningRequest(
         (
             NamedOrderKey(
                 "x",
-                plc.types.Order.ASCENDING,
+                plc.types.Order.DESCENDING,
                 plc.types.NullOrder.AFTER,
             ),
+        )
+    )
+    proven_request = OrderPartitioningRequest(
+        (
             NamedOrderKey(
-                "y",
+                "x",
                 plc.types.Order.ASCENDING,
                 plc.types.NullOrder.AFTER,
             ),
@@ -987,7 +991,7 @@ def test_parquet_scan_ordering_partitioning_from_footer_metadata(
                 spmd_engine.comm,
                 streaming_scan,
                 len(paths),
-                (request,),
+                (unproven_request, proven_request),
                 ir_context,
                 collective_id=None,
             )
@@ -998,11 +1002,11 @@ def test_parquet_scan_ordering_partitioning_from_footer_metadata(
     assert partitioning.local == "inherit"
     assert isinstance(partitioning.inter_rank, OrderScheme)
     (ordering,) = partitioning.inter_rank.orderings
-    assert len(ordering.keys) == 2
+    assert len(ordering.keys) == 1
     assert ordering.strict_boundaries is True
     assert ordering.locally_ordered is False
     boundaries = ordering.get_boundaries(spmd_engine.context.br())
-    assert boundaries.table_view().num_columns() == 2
+    assert boundaries.table_view().num_columns() == 1
     assert boundaries.table_view().num_rows() == 1
 
 
