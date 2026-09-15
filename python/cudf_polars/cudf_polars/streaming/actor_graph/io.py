@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, cast
 import polars as pl
 
 import pylibcudf as plc
-from cudf_streaming.channel_metadata import ChannelMetadata, OrderScheme
+from cudf_streaming.channel_metadata import ChannelMetadata
 from cudf_streaming.table_chunk import (
     TableChunk,
     make_table_chunks_available_or_wait,
@@ -675,15 +675,8 @@ async def scan_node(
             ir_context,
             collective_id,
         )
-        if partitioning is not None:
-            assert isinstance(partitioning.inter_rank, OrderScheme)
-            ordering = partitioning.inter_rank.orderings[0]
-            if tracer is not None:
-                tracer.decision = (
-                    "parquet_ordering_strict"
-                    if ordering.strict_boundaries
-                    else "parquet_ordering_non_strict"
-                )
+        if partitioning is not None and tracer is not None:
+            tracer.decision = "parquet_ordering"
         await send_metadata(
             ch_out,
             context,
@@ -777,7 +770,7 @@ def _(
             ch_out,
             partition_info=partition_info,
             partitioning_requests=rec.state["partitioning_requests"].get(ir, ()),
-            collective_id=next(iter(rec.state["collective_id_map"].get(ir, ())), None),
+            collective_id=rec.state["collective_id_map"][ir][0],
             num_producers=num_producers,
             estimated_chunk_bytes=(
                 plan.estimated_chunk_bytes or executor.target_partition_size
