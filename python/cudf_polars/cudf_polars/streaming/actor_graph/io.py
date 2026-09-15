@@ -625,7 +625,7 @@ async def scan_node(
     ir_context: IRExecutionContext,
     ch_out: Channel[TableChunk],
     *,
-    partition_count: int,
+    global_chunk_count: int,
     partitioning_requests: tuple[PartitioningRequest, ...],
     collective_id: int | None,
     num_producers: int,
@@ -646,8 +646,8 @@ async def scan_node(
         The execution context for the IR node.
     ch_out
         The output Channel[TableChunk].
-    partition_count
-        Global number of scan partitions.
+    global_chunk_count
+        Global number of scan chunks.
     partitioning_requests
         Downstream partitioning requests for this scan node.
     collective_id
@@ -670,7 +670,7 @@ async def scan_node(
             context,
             comm,
             ir,
-            partition_count,
+            global_chunk_count,
             partitioning_requests,
             ir_context,
             collective_id,
@@ -768,7 +768,7 @@ def _(
             ir,
             ir_context,
             ch_out,
-            partition_count=partition_info.count,
+            global_chunk_count=partition_info.count,
             partitioning_requests=rec.state["partitioning_requests"].get(ir, ()),
             collective_id=rec.state["collective_id_map"][ir][0],
             num_producers=num_producers,

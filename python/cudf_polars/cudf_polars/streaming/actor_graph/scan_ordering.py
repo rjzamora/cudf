@@ -223,13 +223,13 @@ async def parquet_ordering_partitioning(
     context: Context,
     comm: Communicator,
     ir: StreamingScan,
-    partition_count: int,
+    global_chunk_count: int,
     requests: tuple[PartitioningRequest, ...],
     ir_context: IRExecutionContext,
     collective_id: int | None,
 ) -> Partitioning | None:
     """Extract parquet scan ordering from footer metadata, when safe."""
-    if partition_count == 0:
+    if global_chunk_count == 0:
         return None
 
     request = None
@@ -264,7 +264,7 @@ async def parquet_ordering_partitioning(
             stream, ordered=True, ir_context=ir_context
         )
 
-    if endpoint_rows.num_rows() != 2 * partition_count:
+    if endpoint_rows.num_rows() != 2 * global_chunk_count:
         return None
 
     column_order = [key.order for key in order_keys]
@@ -274,7 +274,7 @@ async def parquet_ordering_partitioning(
     ):
         return None
 
-    num_partitions = partition_count
+    num_partitions = global_chunk_count
     if num_partitions == 0:
         return None
     if num_partitions < 2:
