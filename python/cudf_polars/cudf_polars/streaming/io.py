@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import itertools
 import math
 import statistics
 from collections import defaultdict
@@ -38,6 +37,10 @@ from cudf_polars.streaming.base import (
 from cudf_polars.streaming.dispatch import lower_ir_node
 from cudf_polars.utils.config import Cluster
 from cudf_polars.utils.cuda_stream import get_cuda_stream
+from cudf_polars.utils.parquet_metadata import (
+    ParquetMetadata,
+    _prefetch_parquet_footers_for_paths,
+)
 from cudf_polars.utils.versions import POLARS_VERSION_LT_137
 
 if TYPE_CHECKING:
@@ -48,7 +51,7 @@ if TYPE_CHECKING:
 
     from cudf_polars.containers import DataType
     from cudf_polars.dsl.expr import NamedExpr
-    from cudf_polars.dsl.ir import CachedParquetInfo, IRExecutionContext
+    from cudf_polars.dsl.ir import IRExecutionContext
     from cudf_polars.streaming.base import (
         DataSourceInfo,
         SerializedDataSourceInfo,
@@ -61,6 +64,7 @@ if TYPE_CHECKING:
         ParquetOptions,
         StreamingExecutor,
     )
+    from cudf_polars.utils.parquet_metadata import CachedParquetInfo
 
 
 @lower_ir_node.register(DataFrameScan)
@@ -531,15 +535,6 @@ class ParquetScanTask(ScanTask):
             return None
         return [cached_by_path[path] for path in self.paths]
 
-    def _fetch_parquet_info_for_hybrid_scan(self) -> list[CachedParquetInfo]:
-        """Fetch parquet metadata for hybrid scan."""
-        from cudf_polars.dsl.utils.io import _prefetch_parquet_footers_for_paths
-
-        return _prefetch_parquet_footers_for_paths(
-            self.paths,
-            parse_hybrid_metadata=True,
-        )
-
     def _split_task_bounds_from_row_group_counts(
         self, row_group_num_rows: list[int]
     ) -> ParquetScanTaskBounds:
@@ -635,7 +630,9 @@ class ParquetScanTask(ScanTask):
         if cached_parquet_info is None and should_try_hybrid_scan:
             # read_parquet_metadata is faster (for now),
             # but hybrid scan needs FileMetaData.
-            cached_parquet_info = task._fetch_parquet_info_for_hybrid_scan()
+            cached_parquet_info = _prefetch_parquet_footers_for_paths(
+                paths, parse_hybrid_metadata=True
+            )
         bounds = task._get_task_bounds(cached_parquet_info)
         # Hybrid scan reads through cached parquet metadata, so it is only used
         # when the metadata is available to this task.
@@ -969,134 +966,6 @@ def _sink_to_file(
         raise NotImplementedError(f"{kind} not yet supported in _sink_to_file")
 
     return True
-
-
-def _columnchunk_metadata_from_footers(
-    footers: list[plc.io.parquet_metadata.FileMetaData],
-) -> dict[str, list[int]]:
-    columnchunk_metadata: dict[str, list[int]] = {}
-    for fmd in footers:
-        for name, uncompressed_sizes in fmd.columnchunk_metadata.items():
-            columnchunk_metadata.setdefault(name, []).extend(uncompressed_sizes)
-    return columnchunk_metadata
-
-
-class ParquetMetadata:
-    """
-    Parquet metadata container.
-
-    Parameters
-    ----------
-    paths
-        Parquet-dataset paths.
-    max_footer_samples
-        Maximum number of file footers to sample metadata from.
-    parse_hybrid_metadata
-        Whether to eagerly parse ``HybridScanMetadata`` for sampled paths.
-        Only useful when ``ParquetOptions.use_hybrid_scan`` is enabled.
-    """
-
-    __slots__ = (
-        "cached_parquet_info",
-        "column_names",
-        "max_footer_samples",
-        "mean_size_per_file",
-        "num_row_groups_per_file",
-        "paths",
-        "row_count",
-        "sample_paths",
-        "sampled_file_count",
-        "total_file_count",
-    )
-
-    paths: tuple[str, ...]
-    """Parquet-dataset paths."""
-    max_footer_samples: int
-    """Maximum number of file footers to sample metadata from."""
-    row_count: int | None
-    """Total row-count estimate."""
-    num_row_groups_per_file: tuple[int, ...]
-    """Number of row groups in each sampled file."""
-    mean_size_per_file: dict[str, int]
-    """Average column storage size in a single file."""
-    column_names: tuple[str, ...]
-    """All column names found it the dataset."""
-    sample_paths: tuple[str, ...]
-    """Sampled file paths."""
-    cached_parquet_info: list[CachedParquetInfo] | None
-    """Cached parquet info for the sampled paths."""
-
-    @nvtx_annotate_cudf_polars(message="ParquetMetadata")
-    def __init__(
-        self,
-        paths: tuple[str, ...],
-        max_footer_samples: int,
-        *,
-        parse_hybrid_metadata: bool = False,
-    ):
-        from cudf_polars.dsl.utils.io import _prefetch_parquet_footers_for_paths
-
-        self.paths = paths
-        self.max_footer_samples = max_footer_samples
-        self.row_count = None
-        self.num_row_groups_per_file = ()
-        self.mean_size_per_file = {}
-        self.column_names = ()
-        self.cached_parquet_info = None
-        self.total_file_count = len(self.paths)
-        self.sampled_file_count = 0
-        if max_footer_samples <= 0:
-            self.sample_paths = ()
-            return
-
-        stride = max(1, int(len(paths) / max_footer_samples))
-        self.sample_paths = paths[: stride * max_footer_samples : stride]
-
-        if not self.sample_paths:
-            # No paths to sample from
-            # TODO: This requires row_count to be nullable. Why do we allow empty paths?
-            return
-
-        sampled_file_count = len(self.sample_paths)
-
-        sample_parquet_info = _prefetch_parquet_footers_for_paths(
-            list(self.sample_paths), parse_hybrid_metadata=parse_hybrid_metadata
-        )
-        sample_footers = [info.file_metadata for info in sample_parquet_info]
-
-        self.cached_parquet_info = sample_parquet_info
-        sampled_row_count = sum(fmd.num_rows for fmd in sample_footers)
-        if self.total_file_count == sampled_file_count:
-            row_count = sampled_row_count
-        else:
-            num_rows_per_sampled_file = int(sampled_row_count / sampled_file_count)
-            row_count = num_rows_per_sampled_file * self.total_file_count
-
-        num_row_groups_per_sampled_file = [
-            len(fmd.row_group_num_rows) for fmd in sample_footers
-        ]
-        rowgroup_offsets_per_file = list(
-            itertools.accumulate(num_row_groups_per_sampled_file, initial=0)
-        )
-
-        column_sizes_per_file = {
-            name: [
-                sum(uncompressed_sizes[start:end])
-                for (start, end) in itertools.pairwise(rowgroup_offsets_per_file)
-            ]
-            for name, uncompressed_sizes in _columnchunk_metadata_from_footers(
-                sample_footers
-            ).items()
-        }
-
-        self.column_names = tuple(column_sizes_per_file)
-        self.mean_size_per_file = {
-            name: int(statistics.mean(sizes))
-            for name, sizes in column_sizes_per_file.items()
-        }
-        self.num_row_groups_per_file = tuple(num_row_groups_per_sampled_file)
-        self.row_count = row_count
-        self.sampled_file_count = sampled_file_count
 
 
 @nvtx_annotate_cudf_polars(message="_sample_rg_sizes")

@@ -85,12 +85,12 @@ if TYPE_CHECKING:
     from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.containers.dataframe import NamedColumn
-    from cudf_polars.dsl.utils.io import CachedParquetInfo
     from cudf_polars.quent._context import QuentIRExecutionContext
     from cudf_polars.streaming.actor_graph.tracing import ActorTracer
     from cudf_polars.streaming.rank_aware_source import RankAwareSource
     from cudf_polars.typing import CSECache, ClosedInterval, Schema, Slice as Zlice
     from cudf_polars.utils.config import ParquetOptions
+    from cudf_polars.utils.parquet_metadata import CachedParquetInfo
     from cudf_polars.utils.timer import Timer
 
     P = ParamSpec("P")

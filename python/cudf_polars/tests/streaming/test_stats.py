@@ -26,7 +26,6 @@ from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.streaming.base import SerializedDataSourceInfo, StatsCollector
 from cudf_polars.streaming.io import (
     DataFrameSourceInfo,
-    ParquetMetadata,
     ParquetSourceInfo,
     _build_parquet_source,
     _clear_source_info_cache,
@@ -36,6 +35,7 @@ from cudf_polars.streaming.statistics import collect_statistics
 from cudf_polars.testing.asserts import assert_gpu_result_equal
 from cudf_polars.testing.io import make_lazy_frame, make_partitioned_source
 from cudf_polars.utils.config import ConfigOptions
+from cudf_polars.utils.parquet_metadata import ParquetMetadata
 
 if TYPE_CHECKING:
     import concurrent.futures

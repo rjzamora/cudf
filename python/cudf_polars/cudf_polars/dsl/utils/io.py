@@ -6,10 +6,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
-
-import kvikio
 
 import pylibcudf as plc
 
@@ -20,135 +17,12 @@ from cudf_polars.streaming.io import (
     Scan,
     StreamingScan,
 )
+from cudf_polars.utils.parquet_metadata import _prefetch_parquet_footers_for_paths
 
 if TYPE_CHECKING:
     from cudf_polars.dsl.ir import IR
     from cudf_polars.streaming.base import StatsCollector
-
-
-@dataclass(frozen=True)
-class CachedParquetInfo:
-    """
-    Metadata for a parquet file.
-
-    File metadata is only cached when the setting
-    ``ParquetOptions.prefetch_file_metadata`` is ``True``. Metadata is cached
-    for the duration of the query.
-
-    Parameters
-    ----------
-    path
-        The path of an individual parquet file. This is one element of a
-        ``paths`` tuple in a ``Scan`` node.
-    size
-        The size of the parquet file, in bytes. This is typically only set
-        for remote URLs, since it allows skipping subsequent HTTP HEAD requests
-        made by kvikio on operations involving that file.
-    file_metadata
-        The ``FileMetaData`` object for the parquet file returned from
-        ``read_parquet_footers``.
-    parse_hybrid_metadata
-        Whether to eagerly parse ``HybridScanMetadata`` for this file.
-        Otherwise it's parsed lazily, on first use.
-    """
-
-    path: str
-    size: int | None
-    file_metadata: plc.io.parquet_metadata.FileMetaData
-    parse_hybrid_metadata: bool = field(default=False, compare=False, repr=False)
-    # For splits of the same file, the metadata is parsed once and shared.
-    _hybrid_scan_metadata: plc.io.experimental.HybridScanMetadata | None = field(
-        default=None, init=False, compare=False, repr=False
-    )
-
-    def __post_init__(self) -> None:  # noqa: D105
-        if self.parse_hybrid_metadata:
-            object.__setattr__(
-                self,
-                "_hybrid_scan_metadata",
-                plc.io.experimental.HybridScanMetadata.from_parquet_metadata(
-                    self.file_metadata, self.default_reader_options()
-                ),
-            )
-
-    def hybrid_scan_reader(
-        self,
-        options: plc.io.parquet.ParquetReaderOptions,
-    ) -> plc.io.experimental.HybridScanReader:
-        """Return a fresh HybridScanReader backed by shared pre-parsed file metadata."""
-        metadata = self._hybrid_scan_metadata
-        if metadata is None:
-            metadata = plc.io.experimental.HybridScanMetadata.from_parquet_metadata(
-                self.file_metadata, options
-            )
-            object.__setattr__(self, "_hybrid_scan_metadata", metadata)
-        return plc.io.experimental.HybridScanReader.from_metadata(metadata)
-
-    def default_reader_options(self) -> plc.io.parquet.ParquetReaderOptions:
-        """Return baseline ``ParquetReaderOptions`` for this cached parquet file."""
-        return (
-            plc.io.parquet.ParquetReaderOptions.builder(
-                plc.io.SourceInfo([plc.io.types.FilepathSource(self.path, self.size)])
-            )
-            .decimal_width(plc.TypeId.DECIMAL128)
-            .build()
-        )
-
-
-@nvtx_annotate_cudf_polars(message="fetch_parquet_footers_for_paths")
-def _prefetch_parquet_footers_for_paths(
-    paths: list[str], *, parse_hybrid_metadata: bool = False
-) -> list[CachedParquetInfo]:
-    """
-    Prefetch parquet footers for a list of paths.
-
-    This is typically executed concurrently with prefetch operations for other
-    path groups for other parquet scan nodes.
-
-    Parameters
-    ----------
-    paths
-        The paths to prefetch.
-    parse_hybrid_metadata
-        Whether to eagerly parse ``HybridScanMetadata`` for each path.
-
-    Returns
-    -------
-    paths
-        The original input ``paths``.
-    metadata
-        The list of ``FileMetaData`` objects for the ``paths``.
-    """
-    # TODO: https://github.com/NVIDIA/cudf/issues/22734, use object metadata from polars
-    # For now, we'll just use kvikio to explicitly get the size.
-    sizes: list[int | None] = []
-
-    for path in paths:
-        if paths and plc.io.SourceInfo._is_remote_uri(path):
-            # We're OK to use `kvikio.RemoteFile.open` here. It does make an HTTP HEAD
-            # request for S3/HTTP endpoints, but that's the entire reason we're running
-            # this code. So long as it makes just *one* HTTP request, there's no advantage
-            # to inferring the endpoint type.
-            with kvikio.RemoteFile.open(path) as remote_file:  # pragma: no cover
-                sizes.append(remote_file.nbytes())
-        else:
-            sizes.append(None)
-
-    metadata = plc.io.parquet_metadata.read_parquet_footers(
-        plc.io.types.SourceInfo(
-            [
-                plc.io.types.FilepathSource(path, size)
-                for path, size in zip(paths, sizes, strict=True)
-            ]
-        )
-    )
-
-    return [
-        CachedParquetInfo(
-            path, size, file_metadata, parse_hybrid_metadata=parse_hybrid_metadata
-        )
-        for path, size, file_metadata in zip(paths, sizes, metadata, strict=True)
-    ]
+    from cudf_polars.utils.parquet_metadata import CachedParquetInfo
 
 
 @nvtx_annotate_cudf_polars(message="prefetch_parquet_file_metadata_for_ir")

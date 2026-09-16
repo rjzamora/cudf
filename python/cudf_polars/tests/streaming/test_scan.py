@@ -22,8 +22,6 @@ from cudf_polars.dsl.ir import (
     Scan,
 )
 from cudf_polars.dsl.utils.io import (
-    CachedParquetInfo,
-    _prefetch_parquet_footers_for_paths,
     attach_cached_parquet_metadata,
     prefetch_parquet_file_metadata_for_ir,
 )
@@ -58,6 +56,10 @@ from cudf_polars.utils.config import (
     ConfigOptions,
     MaxConcurrentIOTasks,
     ParquetOptions,
+)
+from cudf_polars.utils.parquet_metadata import (
+    CachedParquetInfo,
+    _prefetch_parquet_footers_for_paths,
 )
 
 if TYPE_CHECKING:

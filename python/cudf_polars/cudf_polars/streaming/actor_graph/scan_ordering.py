@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import pylibcudf as plc
 from cudf_streaming.channel_metadata import (
@@ -23,6 +23,7 @@ from cudf_polars.streaming.actor_graph.collectives.sort import (
 from cudf_polars.streaming.io import ParquetScanTask
 from cudf_polars.streaming.partitioning_requests import OrderPartitioningRequest
 from cudf_polars.utils.dtypes import make_empty_column
+from cudf_polars.utils.parquet_metadata import _prefetch_parquet_footers_for_paths
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -31,45 +32,46 @@ if TYPE_CHECKING:
     from rapidsmpf.streaming.core.context import Context
     from rmm.pylibrmm.stream import Stream
 
-    from cudf_polars.dsl.ir import CachedParquetInfo, IRExecutionContext
+    from cudf_polars.dsl.ir import IRExecutionContext, Scan
     from cudf_polars.streaming.io import StreamingScan
     from cudf_polars.streaming.partitioning_requests import PartitioningRequest
+    from cudf_polars.utils.parquet_metadata import CachedParquetInfo
 
 
-def _null_boundary_column(
+def _null_bounds_column(
     ir: StreamingScan,
     column_name: str,
     size: int,
     stream: Stream,
 ) -> plc.Column:
-    """Return a null boundary column to invalidate one candidate."""
+    """Return null chunk bounds to invalidate one candidate."""
     empty = make_empty_column(ir.schema[column_name], stream)
     if size == 0:
         return empty
     return plc.Column.all_null_like(empty, size, stream=stream)
 
 
-async def _get_parquet_info(
+async def _get_task_parquet_info(
+    base_scan: Scan,
     tasks: Sequence[ParquetScanTask],
     ir_context: IRExecutionContext,
-) -> dict[str, CachedParquetInfo]:
-    """Return cached or freshly fetched footer metadata for rank-local paths."""
+) -> list[list[CachedParquetInfo]]:
+    """Return cached or freshly fetched footer metadata for each task."""
     paths = list(dict.fromkeys(path for task in tasks for path in task.paths))
-    cached_by_path: dict[str, CachedParquetInfo] = {}
-    for task in tasks:
-        if (task_info := task._get_cached_parquet_info()) is not None:
-            cached_by_path.update({info.path: info for info in task_info})
+    info_by_path = {
+        info.path: info
+        for info in (base_scan.cached_parquet_info or ())
+        if info.path in paths
+    }
+    if set(info_by_path) == set(paths):
+        return [[info_by_path[path] for path in task.paths] for task in tasks]
 
-    if set(cached_by_path) != set(paths):
-        from cudf_polars.dsl.utils.io import _prefetch_parquet_footers_for_paths
-
-        fetched = await ir_context.to_thread(_prefetch_parquet_footers_for_paths, paths)
-        cached_by_path = {info.path: info for info in fetched}
-
-    assert all(path in cached_by_path for path in paths), (
+    fetched = await ir_context.to_thread(_prefetch_parquet_footers_for_paths, paths)
+    info_by_path = {info.path: info for info in fetched}
+    assert all(path in info_by_path for path in paths), (
         "Ordering footer metadata must contain all rank-local scan paths."
     )
-    return cached_by_path
+    return [[info_by_path[path] for path in task.paths] for task in tasks]
 
 
 def _get_ordering_candidates(
@@ -137,7 +139,7 @@ def _selected_row_group_indices(
     return indices or None
 
 
-def _task_boundaries(
+def _task_chunk_bounds(
     task: ParquetScanTask,
     cached_info: list[CachedParquetInfo],
     column: str,
@@ -145,7 +147,7 @@ def _task_boundaries(
     null_order: plc.types.NullOrder,
     stream: Stream,
 ) -> plc.Column | None:
-    """Return first/last task boundaries for a provably ordered column."""
+    """Return first/last task bounds for a provably ordered column."""
     row_group_indices = _selected_row_group_indices(
         cached_info, column, task._get_task_bounds(cached_info).row_groups
     )
@@ -181,7 +183,7 @@ def _task_boundaries(
     assert all(0 <= index < row_group_count for index in row_group_indices), (
         "Selected row-group indices must reference decoded parquet bounds."
     )
-    row_group_boundaries = plc.copying.gather(
+    row_group_bounds = plc.copying.gather(
         plc.concatenate.concatenate(
             [plc.Table([start_column]), plc.Table([end_column])],
             stream=stream,
@@ -199,14 +201,14 @@ def _task_boundaries(
         stream=stream,
     )
     if not plc.sorting.is_sorted(
-        row_group_boundaries, [order], [null_order], stream=stream
+        row_group_bounds, [order], [null_order], stream=stream
     ):
         return None
 
     return plc.copying.gather(
-        row_group_boundaries,
+        row_group_bounds,
         plc.Column.from_iterable_of_py(
-            [0, row_group_boundaries.num_rows() - 1],
+            [0, row_group_bounds.num_rows() - 1],
             plc.DataType(plc.TypeId.INT32),
             stream=stream,
         ),
@@ -215,29 +217,28 @@ def _task_boundaries(
     ).columns()[0]
 
 
-def _get_local_boundaries(
+def _get_local_chunk_bounds(
     ir: StreamingScan,
     parquet_tasks: Sequence[ParquetScanTask],
     candidates: list[tuple[str, OrderKey]],
-    parquet_info: dict[str, CachedParquetInfo],
+    task_infos: Sequence[list[CachedParquetInfo]],
     stream: Stream,
 ) -> plc.Table:
-    """Build rank-local chunk boundaries for each candidate."""
+    """Build rank-local first/last chunk bounds for each candidate."""
     if not parquet_tasks:
         return plc.Table(
             [
-                _null_boundary_column(ir, column_name, 0, stream)
+                _null_bounds_column(ir, column_name, 0, stream)
                 for column_name, _ in candidates
             ]
         )
 
-    local_boundary_count = 2 * len(parquet_tasks)
-    boundary_columns: list[plc.Column] = []
+    local_bound_count = 2 * len(parquet_tasks)
+    bound_columns: list[plc.Column] = []
     for column_name, order_key in candidates:
-        task_boundaries: list[plc.Table] = []
-        for task in parquet_tasks:
-            task_info = [parquet_info[path] for path in task.paths]
-            boundary_column = _task_boundaries(
+        task_bounds: list[plc.Table] = []
+        for task, task_info in zip(parquet_tasks, task_infos, strict=True):
+            bounds_column = _task_chunk_bounds(
                 task,
                 task_info,
                 column_name,
@@ -245,20 +246,20 @@ def _get_local_boundaries(
                 order_key.null_order,
                 stream,
             )
-            if boundary_column is None:
+            if bounds_column is None:
                 break
-            task_boundaries.append(plc.Table([boundary_column]))
+            task_bounds.append(plc.Table([bounds_column]))
 
-        if len(task_boundaries) == len(parquet_tasks):
-            boundary_columns.append(
-                plc.concatenate.concatenate(task_boundaries, stream=stream).columns()[0]
+        if len(task_bounds) == len(parquet_tasks):
+            bound_columns.append(
+                plc.concatenate.concatenate(task_bounds, stream=stream).columns()[0]
             )
         else:
-            boundary_columns.append(
-                _null_boundary_column(ir, column_name, local_boundary_count, stream)
+            bound_columns.append(
+                _null_bounds_column(ir, column_name, local_bound_count, stream)
             )
 
-    return plc.Table(boundary_columns)
+    return plc.Table(bound_columns)
 
 
 async def parquet_ordering_partitioning(
@@ -277,36 +278,38 @@ async def parquet_ordering_partitioning(
     if not (candidates := _get_ordering_candidates(ir, requests)):
         return None
 
-    assert all(isinstance(task, ParquetScanTask) for task in ir.tasks)
-    parquet_tasks = cast("Sequence[ParquetScanTask]", ir.tasks)
-    parquet_info = await _get_parquet_info(parquet_tasks, ir_context)
+    parquet_tasks: list[ParquetScanTask] = []
+    for task in ir.tasks:
+        assert isinstance(task, ParquetScanTask)
+        parquet_tasks.append(task)
+    task_infos = await _get_task_parquet_info(ir.base_scan, parquet_tasks, ir_context)
 
     stream = ir_context.get_cuda_stream()
-    boundary_rows = _get_local_boundaries(
-        ir, parquet_tasks, candidates, parquet_info, stream
+    chunk_bounds = _get_local_chunk_bounds(
+        ir, parquet_tasks, candidates, task_infos, stream
     )
     if comm.nranks > 1:
         local_chunk = TableChunk.from_pylibcudf_table(
-            boundary_rows, stream, exclusive_view=True, br=context.br()
+            chunk_bounds, stream, exclusive_view=True, br=context.br()
         )
         allgather = AllGatherManager(context, comm, collective_id)
         with allgather.inserting() as inserter:
             await inserter.insert(comm.rank, local_chunk)
-        boundary_rows = await allgather.extract_concatenated(
+        chunk_bounds = await allgather.extract_concatenated(
             stream, ordered=True, ir_context=ir_context
         )
 
-    assert boundary_rows.num_rows() == 2 * global_chunk_count, (
-        "Ordering boundary rows must contain first/last rows for every scan chunk."
+    assert chunk_bounds.num_rows() == 2 * global_chunk_count, (
+        "Ordering chunk bounds must contain first/last rows for every scan chunk."
     )
 
     for i, (_, order_key) in enumerate(candidates):
-        boundary_column = boundary_rows.columns()[i]
-        if boundary_column.null_count():
+        bounds_column = chunk_bounds.columns()[i]
+        if bounds_column.null_count():
             continue
-        candidate_boundaries = plc.Table([boundary_column])
+        candidate_bounds = plc.Table([bounds_column])
         if not plc.sorting.is_sorted(
-            candidate_boundaries,
+            candidate_bounds,
             [order_key.order],
             [order_key.null_order],
             stream=stream,
@@ -317,13 +320,13 @@ async def parquet_ordering_partitioning(
             ordering_boundaries = plc.Table(
                 [
                     plc.Column.from_iterable_of_py([], column.type(), stream=stream)
-                    for column in candidate_boundaries.columns()
+                    for column in candidate_bounds.columns()
                 ]
             )
             strict = True
         else:
             ordering_boundaries, strict = _extract_ordering_boundaries(
-                candidate_boundaries, global_chunk_count, stream
+                candidate_bounds, global_chunk_count, stream
             )
         boundaries_chunk = TableChunk.from_pylibcudf_table(
             ordering_boundaries,
