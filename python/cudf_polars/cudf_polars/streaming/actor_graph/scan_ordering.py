@@ -98,21 +98,21 @@ async def _get_rank_parquet_info_map(
 
 
 def _stats_are_safe(
-    rank_row_groups: Sequence[tuple[CachedParquetInfo, int]],
+    rank_row_group_metadata: Sequence[plc.io.parquet_metadata.RowGroup],
     name: str,
     indices: list[int],
 ) -> bool:
     for index in indices:
-        info, group = rank_row_groups[index]
-        chunk = next(
+        row_group = rank_row_group_metadata[index]
+        column_chunk = next(
             (
-                chunk
-                for chunk in info.file_metadata.row_groups[group].columns
-                if ".".join(chunk.meta_data.path_in_schema) == name
+                column_chunk
+                for column_chunk in row_group.columns
+                if ".".join(column_chunk.meta_data.path_in_schema) == name
             ),
             None,
         )
-        stats = None if chunk is None else chunk.meta_data.statistics
+        stats = None if column_chunk is None else column_chunk.meta_data.statistics
         if (
             stats is None
             or stats.null_count is None
@@ -126,8 +126,8 @@ def _stats_are_safe(
 
 def _candidate_bounds(
     file_metadata: list[plc.io.parquet_metadata.FileMetaData],
-    rank_row_groups: Sequence[tuple[CachedParquetInfo, int]],
-    task_row_groups: Sequence[list[int] | None],
+    rank_row_group_metadata: Sequence[plc.io.parquet_metadata.RowGroup],
+    task_row_group_indices: Sequence[list[int] | None],
     name: str,
     key: OrderKey,
     dtype: plc.DataType,
@@ -144,7 +144,7 @@ def _candidate_bounds(
     assert len(columns) == 2, "Single-column parquet bounds must have min/max columns."
     min_col, max_col = columns
     assert min_col.size() == max_col.size(), "Parquet min/max columns must align."
-    assert len(rank_row_groups) == min_col.size(), (
+    assert len(rank_row_group_metadata) == min_col.size(), (
         "Decoded parquet bounds must match footer row-group metadata."
     )
 
@@ -157,7 +157,9 @@ def _candidate_bounds(
 
     def invalidate() -> plc.Column | None:
         return to_scan_dtype(
-            plc.Column.all_null_like(min_col, 2 * len(task_row_groups), stream=stream)
+            plc.Column.all_null_like(
+                min_col, 2 * len(task_row_group_indices), stream=stream
+            )
         )
 
     if min_col.null_count() or max_col.null_count():
@@ -176,13 +178,19 @@ def _candidate_bounds(
     )
 
     chunk_bounds: list[plc.Table] = []
-    for indices in task_row_groups:
-        if indices is None or not _stats_are_safe(rank_row_groups, name, indices):
+    for row_group_indices in task_row_group_indices:
+        if row_group_indices is None or not _stats_are_safe(
+            rank_row_group_metadata, name, row_group_indices
+        ):
             return invalidate()
 
         selected = _gather_rows(
             row_group_bounds,
-            [i for group in indices for i in (group, len(rank_row_groups) + group)],
+            [
+                i
+                for group in row_group_indices
+                for i in (group, len(rank_row_group_metadata) + group)
+            ],
             stream,
         )
         if not plc.sorting.is_sorted(
@@ -232,14 +240,12 @@ async def parquet_metadata_ordering(
         ir.base_scan, paths, ir_context
     )
     rank_row_group_offset_map: dict[str, int] = {}
-    rank_row_groups: list[tuple[CachedParquetInfo, int]] = []
+    rank_row_group_metadata: list[plc.io.parquet_metadata.RowGroup] = []
     for path in paths:
         info = rank_parquet_info_map[path]
-        rank_row_group_offset_map[path] = len(rank_row_groups)
-        rank_row_groups.extend(
-            (info, i) for i in range(len(info.file_metadata.row_group_num_rows))
-        )
-    task_row_groups = [
+        rank_row_group_offset_map[path] = len(rank_row_group_metadata)
+        rank_row_group_metadata.extend(info.file_metadata.row_groups)
+    task_row_group_indices = [
         task.absolute_row_group_indices(
             rank_parquet_info_map, rank_row_group_offset_map
         )
@@ -248,20 +254,20 @@ async def parquet_metadata_ordering(
 
     stream = ir_context.get_cuda_stream()
     file_metadata = [rank_parquet_info_map[path].file_metadata for path in paths]
-    bound_count = 2 * len(task_row_groups)
+    bound_count = 2 * len(task_row_group_indices)
     columns: list[plc.Column] = []
     for name, key in candidates:
         column = (
             _candidate_bounds(
                 file_metadata,
-                rank_row_groups,
-                task_row_groups,
+                rank_row_group_metadata,
+                task_row_group_indices,
                 name,
                 key,
                 ir.schema[name].plc_type,
                 stream,
             )
-            if task_row_groups
+            if task_row_group_indices
             else None
         )
         if column is None:
