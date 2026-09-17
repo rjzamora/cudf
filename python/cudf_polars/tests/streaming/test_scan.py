@@ -1077,6 +1077,35 @@ def test_parquet_scan_ordering_partitioning_uses_row_group_splits(
     assert boundaries.table_view().num_rows() == split_count - 1
 
 
+def test_parquet_scan_ordering_partitioning_string_column(
+    tmp_path: Path, spmd_engine
+) -> None:
+    from cudf_streaming.channel_metadata import OrderScheme
+
+    paths = []
+    for i, values in enumerate((["a", "b"], ["c", "d"])):
+        path = tmp_path / f"part-{i}.parquet"
+        pl.DataFrame({"s": values}).write_parquet(path, row_group_size=2)
+        paths.append(str(path))
+
+    scan = _make_parquet_scan(paths, schema={"s": DataType(pl.String())})
+    streaming_scan = StreamingScan(
+        [ParquetScanTask(scan, [path], 0, 1, scan.parquet_options) for path in paths],
+        scan,
+    )
+
+    partitioning = _run_parquet_metadata_ordering(
+        streaming_scan, (_order_request("s"),), spmd_engine, len(paths)
+    )
+
+    assert partitioning is not None
+    assert isinstance(partitioning.inter_rank, OrderScheme)
+    (ordering,) = partitioning.inter_rank.orderings
+    assert ordering.strict_boundaries is True
+    boundaries = ordering.get_boundaries(spmd_engine.context.br())
+    assert boundaries.table_view().num_rows() == len(paths) - 1
+
+
 def test_parquet_scan_ordering_partitioning_skips_synthetic_columns(
     tmp_path: Path, spmd_engine
 ) -> None:

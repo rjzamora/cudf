@@ -148,10 +148,14 @@ def _candidate_bounds(
         "Decoded parquet bounds must match footer row-group metadata."
     )
 
-    def to_scan_dtype(column: plc.Column) -> plc.Column:
+    def to_scan_dtype(column: plc.Column) -> plc.Column | None:
+        if column.type() == dtype:
+            return column
+        if not plc.traits.is_fixed_width(dtype):
+            return None
         return plc.unary.cast(column, dtype, stream=stream)
 
-    def invalidate() -> plc.Column:
+    def invalidate() -> plc.Column | None:
         return to_scan_dtype(
             plc.Column.all_null_like(min_col, 2 * len(task_row_groups), stream=stream)
         )
