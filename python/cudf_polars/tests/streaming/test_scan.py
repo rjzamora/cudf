@@ -1109,6 +1109,8 @@ def test_parquet_scan_ordering_partitioning_string_column(
 def test_parquet_scan_ordering_partitioning_skips_synthetic_columns(
     tmp_path: Path, spmd_engine
 ) -> None:
+    from cudf_streaming.channel_metadata import OrderScheme
+
     path = tmp_path / "data.parquet"
     pl.DataFrame({"x": range(4)}).write_parquet(path, row_group_size=2)
     scan = _make_parquet_scan(
@@ -1131,7 +1133,10 @@ def test_parquet_scan_ordering_partitioning_skips_synthetic_columns(
     )
 
     assert partitioning is not None
-    assert partitioning.inter_rank is not None
+    assert isinstance(partitioning.inter_rank, OrderScheme)
+    (ordering,) = partitioning.inter_rank.orderings
+    (key,) = ordering.keys
+    assert list(scan.schema)[key.column_index] == "x"
 
 
 class FooSource(DataSourceInfo):
