@@ -741,8 +741,11 @@ class DynamicPlanningOptions:
         The maximum number of chunks to sample before making
         dynamic-planning decisions. Default is 2.
     infer_ordering
-        Whether scan actors may infer ordering from input metadata.
-        Default is True.
+        Whether scan actors may infer ordering from input metadata. For parquet
+        scans, this relies on footer statistics such as min/max bounds. For
+        floating-point columns, this assumes the writer does not emit usable
+        min/max statistics for row groups containing NaN values. Default is
+        True.
     """
 
     _env_prefix = "CUDF_POLARS__EXECUTOR__DYNAMIC_PLANNING"
