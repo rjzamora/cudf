@@ -633,6 +633,7 @@ async def scan_node(
     global_chunk_count: int,
     partitioning_requests: tuple[PartitioningRequest, ...],
     collective_id: int,
+    infer_ordering: bool,
     num_producers: int,
     estimated_chunk_bytes: int,
 ) -> None:
@@ -657,6 +658,8 @@ async def scan_node(
         Downstream partitioning requests for this scan node.
     collective_id
         Collective ID used to allgather parquet scan boundary metadata.
+    infer_ordering
+        Whether to infer scan ordering from input metadata when possible.
     num_producers
         The number of producers to use for the scan node.
     estimated_chunk_bytes
@@ -681,7 +684,7 @@ async def scan_node(
                 ir_context,
                 collective_id,
             )
-            if ir.base_scan.typ == "parquet"
+            if infer_ordering and ir.base_scan.typ == "parquet"
             else None
         )
         if partitioning is not None and tracer is not None:
@@ -766,6 +769,7 @@ def _(
 
     assert partition_info.io_plan is not None, "Scan node must have a partition plan"
     plan: IOPartitionPlan = partition_info.io_plan
+    dynamic_planning = executor.dynamic_planning
 
     ch_out = channels[ir].reserve_input_slot()
     nodes: dict[IR, list[Any]] = {}
@@ -780,6 +784,9 @@ def _(
             global_chunk_count=partition_info.count,
             partitioning_requests=rec.state["partitioning_requests"].get(ir, ()),
             collective_id=rec.state["collective_id_map"][ir][0],
+            infer_ordering=(
+                dynamic_planning is not None and dynamic_planning.infer_ordering
+            ),
             num_producers=num_producers,
             estimated_chunk_bytes=(
                 plan.estimated_chunk_bytes or executor.target_partition_size

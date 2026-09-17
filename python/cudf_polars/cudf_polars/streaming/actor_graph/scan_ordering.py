@@ -130,13 +130,14 @@ def _candidate_bounds(
     task_row_groups: Sequence[list[int] | None],
     name: str,
     key: OrderKey,
+    dtype: plc.DataType,
     stream: Stream,
 ) -> plc.Column | None:
     try:
         bounds = plc.io.parquet_metadata.read_parquet_column_chunk_bounds(
             file_metadata, columns=[name], stream=stream
         )
-    except (TypeError, ValueError, RuntimeError):
+    except ValueError:
         return None
 
     columns = bounds.columns()[2:]
@@ -147,9 +148,12 @@ def _candidate_bounds(
         "Decoded parquet bounds must match footer row-group metadata."
     )
 
+    def to_scan_dtype(column: plc.Column) -> plc.Column:
+        return plc.unary.cast(column, dtype, stream=stream)
+
     def invalidate() -> plc.Column:
-        return plc.Column.all_null_like(
-            min_col, 2 * len(task_row_groups), stream=stream
+        return to_scan_dtype(
+            plc.Column.all_null_like(min_col, 2 * len(task_row_groups), stream=stream)
         )
 
     if min_col.null_count() or max_col.null_count():
@@ -185,7 +189,9 @@ def _candidate_bounds(
             _gather_rows(selected, [0, selected.num_rows() - 1], stream)
         )
 
-    return plc.concatenate.concatenate(chunk_bounds, stream=stream).columns()[0]
+    return to_scan_dtype(
+        plc.concatenate.concatenate(chunk_bounds, stream=stream).columns()[0]
+    )
 
 
 async def parquet_metadata_ordering(
@@ -248,6 +254,7 @@ async def parquet_metadata_ordering(
                 task_row_groups,
                 name,
                 key,
+                ir.schema[name].plc_type,
                 stream,
             )
             if task_row_groups
