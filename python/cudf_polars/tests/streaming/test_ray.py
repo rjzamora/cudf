@@ -20,6 +20,7 @@ from cudf_polars.utils.config import RayContext
 
 ray = pytest.importorskip("ray")
 from ray.util.queue import Queue  # noqa: E402
+
 from cudf_polars.engine.ray import RayEngine  # noqa: E402
 
 if TYPE_CHECKING:
@@ -36,7 +37,7 @@ pytestmark = [
 
 def _signal_then_sleep(started: Queue, seconds: float) -> None:
     """Tell the driver this actor task is running, then keep its queue occupied."""
-    started.put(True)
+    started.put(item=True)
     time.sleep(seconds)
 
 
