@@ -657,7 +657,7 @@ async def scan_node(
     partitioning_requests
         Downstream partitioning requests for this scan node.
     collective_id
-        Collective ID used to allgather parquet scan boundary metadata.
+        Collective ID for the Parquet bounds all-gather.
     infer_ordering
         Whether to infer scan ordering from input metadata when possible.
     num_producers

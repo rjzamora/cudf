@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Extract ordering metadata from parquet scan tasks."""
+"""Infer ordering from Parquet scan-task metadata."""
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ def _get_ordering_candidates(
     ir: StreamingScan,
     requests: tuple[PartitioningRequest, ...],
 ) -> list[tuple[str, OrderKey]]:
-    """Return distinct leading-key ordering candidates requested downstream."""
+    """Return the distinct leading keys requested downstream."""
     candidates: list[tuple[str, OrderKey]] = []
     for request in requests:
         if not isinstance(request, OrderPartitioningRequest):
@@ -114,8 +114,9 @@ def _stats_are_safe(
             None,
         )
         stats = None if column_chunk is None else column_chunk.meta_data.statistics
-        # Min/max statistics do not encode where nulls occur, so they cannot
-        # prove that a row group containing nulls obeys the requested ordering.
+        # Nulls are safe when they all belong in the first or last task,
+        # depending on the requested null order. Bail for now to keep the
+        # inference logic simple.
         if (
             stats is None
             or stats.null_count is None
@@ -137,10 +138,10 @@ def _candidate_task_bounds(
     stream: Stream,
 ) -> plc.Column | None:
     """
-    Return alternating start/end bounds for each local task.
+    Return start and end bounds for each local task.
 
-    The result shape is ``[task0_start, task0_end, task1_start, task1_end, ...]``.
-    Parquet stores min/max statistics as encoded values; libcudf decodes them
+    Bounds alternate: ``[task0_start, task0_end, task1_start, task1_end, ...]``.
+    Parquet stores min/max statistics as encoded values. libcudf decodes them
     into typed device columns used by libcudf sorting operations.
     """
     try:
@@ -220,7 +221,7 @@ def _extract_local_task_bounds(
     rank_parquet_info_map: dict[str, CachedParquetInfo],
     stream: Stream,
 ) -> plc.Table:
-    """Return candidate endpoint columns with two rows per local scan task."""
+    """Return two endpoint rows per task for each candidate."""
     paths = list(dict.fromkeys(path for task in tasks for path in task.paths))
     rank_row_group_offset_map: dict[str, int] = {}
     rank_row_group_metadata: list[plc.io.parquet_metadata.RowGroup] = []
@@ -265,7 +266,7 @@ def _partitioning_from_task_bounds(
     global_task_count: int,
     stream: Stream,
 ) -> Partitioning | None:
-    """Infer global ordering from rank-ordered task endpoint rows."""
+    """Infer global partitioning from task bounds in rank order."""
     for i, (_, key) in enumerate(candidates):
         column = bounds.columns()[i]
         if column.null_count():
@@ -317,12 +318,12 @@ async def parquet_metadata_ordering(
     collective_id: int,
 ) -> Partitioning | None:
     """
-    Return ordering partitioning inferred from parquet footer metadata.
+    Return partitioning inferred from Parquet footer statistics.
 
-    Only the leading key of each requested ordering is inspected. An ordering
-    on the leading key is useful metadata even when a downstream request
-    contains additional keys. Inference succeeds when footer min/max statistics
-    prove that scan tasks have globally ordered bounds.
+    Only the leading key of each ordering request is inspected. For a request
+    on ``[a, b]``, this inspects ``a`` but not ``b``, because single-column
+    statistics cannot prove ordering on ``[a, b]``. Inference succeeds only
+    when task bounds are globally ordered.
     """
     assert ir.base_scan.typ == "parquet", (
         f"Expected parquet Scan, got {ir.base_scan.typ}."

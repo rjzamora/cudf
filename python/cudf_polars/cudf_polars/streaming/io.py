@@ -611,13 +611,11 @@ class ParquetScanTask(ScanTask):
         rank_row_group_offset_map: Mapping[str, int],
     ) -> list[int] | None:
         """
-        Return selected row groups in rank-local flattened scan order.
+        Return selected row-group indices in rank-local scan order.
 
-        ``ParquetScanTaskBounds.row_groups`` returns path-relative indices for
-        the parquet reader API. This method maps those per-path row groups into
-        absolute positions in the flattened row-group metadata table for the
-        rank-local ``StreamingScan``. Returns ``None`` when the task is not
-        row-group aligned.
+        Task bounds store row-group indices relative to each path. Convert them
+        to indices in the flattened rank-local metadata. Return ``None`` when
+        the task is not row-group aligned.
         """
         task_parquet_info = [rank_parquet_info_map[path] for path in self.paths]
         row_groups = self._get_task_bounds(task_parquet_info).row_groups
