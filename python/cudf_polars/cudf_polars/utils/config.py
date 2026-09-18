@@ -744,7 +744,9 @@ class DynamicPlanningOptions:
         Whether scan actors may infer ordering from input metadata. For parquet
         scans, this relies on footer statistics such as min/max bounds. For
         floating-point columns, this assumes the writer does not emit usable
-        min/max statistics for row groups containing NaN values. Default is
+        min/max statistics for row groups containing NaN values. Disable this
+        to avoid ordering-related footer decoding and collective communication,
+        or to isolate ordering inference in tests and benchmarks. Default is
         True.
     """
 

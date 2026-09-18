@@ -22,7 +22,7 @@ from cudf_polars.streaming.actor_graph.collectives.sort import (
 )
 from cudf_polars.streaming.io import ParquetScanTask
 from cudf_polars.streaming.partitioning_requests import OrderPartitioningRequest
-from cudf_polars.utils.dtypes import make_empty_column
+from cudf_polars.utils.dtypes import is_order_preserving_cast, make_empty_column
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -58,6 +58,7 @@ def _get_ordering_candidates(
     ir: StreamingScan,
     requests: tuple[PartitioningRequest, ...],
 ) -> list[tuple[str, OrderKey]]:
+    """Return distinct leading-key ordering candidates requested downstream."""
     candidates: list[tuple[str, OrderKey]] = []
     for request in requests:
         if not isinstance(request, OrderPartitioningRequest):
@@ -74,22 +75,22 @@ def _get_ordering_candidates(
     return candidates
 
 
-async def _get_rank_parquet_info_map(
+def _get_rank_parquet_info_map(
     base_scan: Scan,
     paths: list[str],
-    ir_context: IRExecutionContext,
 ) -> dict[str, CachedParquetInfo]:
+    path_set = set(paths)
     cached_parquet_info_map = {
         info.path: info
         for info in (base_scan.cached_parquet_info or ())
-        if info.path in paths
+        if info.path in path_set
     }
-    if set(cached_parquet_info_map) == set(paths):
+    if set(cached_parquet_info_map) == path_set:
         return cached_parquet_info_map
 
     from cudf_polars.dsl.utils.io import _prefetch_parquet_footers_for_paths
 
-    fetched = await ir_context.to_thread(_prefetch_parquet_footers_for_paths, paths)
+    fetched = _prefetch_parquet_footers_for_paths(paths)
     rank_parquet_info_map = {info.path: info for info in fetched}
     assert all(path in rank_parquet_info_map for path in paths), (
         "Ordering footer metadata must contain all rank-local scan paths."
@@ -113,18 +114,20 @@ def _stats_are_safe(
             None,
         )
         stats = None if column_chunk is None else column_chunk.meta_data.statistics
+        # Min/max statistics do not encode where nulls occur, so they cannot
+        # prove that a row group containing nulls obeys the requested ordering.
         if (
             stats is None
             or stats.null_count is None
             or stats.null_count != 0
-            or getattr(stats, "is_min_value_exact", True) is False
-            or getattr(stats, "is_max_value_exact", True) is False
+            or stats.is_min_value_exact is False
+            or stats.is_max_value_exact is False
         ):
             return False
     return True
 
 
-def _candidate_bounds(
+def _candidate_task_bounds(
     file_metadata: list[plc.io.parquet_metadata.FileMetaData],
     rank_row_group_metadata: Sequence[plc.io.parquet_metadata.RowGroup],
     task_row_group_indices: Sequence[list[int] | None],
@@ -133,6 +136,13 @@ def _candidate_bounds(
     dtype: plc.DataType,
     stream: Stream,
 ) -> plc.Column | None:
+    """
+    Return alternating start/end bounds for each local task.
+
+    The result shape is ``[task0_start, task0_end, task1_start, task1_end, ...]``.
+    Parquet stores min/max statistics as encoded values; libcudf decodes them
+    into typed device columns used by libcudf sorting operations.
+    """
     try:
         bounds = plc.io.parquet_metadata.read_parquet_column_chunk_bounds(
             file_metadata, columns=[name], stream=stream
@@ -144,22 +154,23 @@ def _candidate_bounds(
     assert len(columns) == 2, "Single-column parquet bounds must have min/max columns."
     min_col, max_col = columns
     assert min_col.size() == max_col.size(), "Parquet min/max columns must align."
+    bounds_type = min_col.type()
+    assert max_col.type() == bounds_type, (
+        "Parquet min/max columns must have matching types."
+    )
     assert len(rank_row_group_metadata) == min_col.size(), (
         "Decoded parquet bounds must match footer row-group metadata."
     )
 
-    def to_scan_dtype(column: plc.Column) -> plc.Column | None:
-        if column.type() == dtype:
-            return column
-        if not plc.traits.is_fixed_width(dtype):
+    if bounds_type != dtype:
+        if not is_order_preserving_cast(bounds_type, dtype):
             return None
-        return plc.unary.cast(column, dtype, stream=stream)
+        min_col = plc.unary.cast(min_col, dtype, stream=stream)
+        max_col = plc.unary.cast(max_col, dtype, stream=stream)
 
-    def invalidate() -> plc.Column | None:
-        return to_scan_dtype(
-            plc.Column.all_null_like(
-                min_col, 2 * len(task_row_group_indices), stream=stream
-            )
+    def invalidate() -> plc.Column:
+        return plc.Column.all_null_like(
+            min_col, 2 * len(task_row_group_indices), stream=stream
         )
 
     if min_col.null_count() or max_col.null_count():
@@ -177,7 +188,7 @@ def _candidate_bounds(
         [plc.Table([start]), plc.Table([end])], stream=stream
     )
 
-    chunk_bounds: list[plc.Table] = []
+    task_bounds: list[plc.Table] = []
     for row_group_indices in task_row_group_indices:
         if row_group_indices is None or not _stats_are_safe(
             rank_row_group_metadata, name, row_group_indices
@@ -197,48 +208,20 @@ def _candidate_bounds(
             selected, [key.order], [key.null_order], stream=stream
         ):
             return invalidate()
-        chunk_bounds.append(
-            _gather_rows(selected, [0, selected.num_rows() - 1], stream)
-        )
+        task_bounds.append(_gather_rows(selected, [0, selected.num_rows() - 1], stream))
 
-    return to_scan_dtype(
-        plc.concatenate.concatenate(chunk_bounds, stream=stream).columns()[0]
-    )
+    return plc.concatenate.concatenate(task_bounds, stream=stream).columns()[0]
 
 
-async def parquet_metadata_ordering(
-    context: Context,
-    comm: Communicator,
+def _extract_local_task_bounds(
     ir: StreamingScan,
-    global_chunk_count: int,
-    requests: tuple[PartitioningRequest, ...],
-    ir_context: IRExecutionContext,
-    collective_id: int,
-) -> Partitioning | None:
-    """
-    Return ordering partitioning inferred from parquet footer metadata.
-
-    Only columns identified by order partitioning requests are inspected. This
-    succeeds when footer min/max statistics prove that rank-local scan tasks
-    have globally ordered, non-overlapping bounds for one requested key.
-    """
-    assert ir.base_scan.typ == "parquet", (
-        f"Expected parquet Scan, got {ir.base_scan.typ}."
-    )
-    assert global_chunk_count > 0, "Scan partition count must be positive."
-
-    if not (candidates := _get_ordering_candidates(ir, requests)):
-        return None
-
-    tasks: list[ParquetScanTask] = []
-    for task in ir.tasks:
-        assert isinstance(task, ParquetScanTask)
-        tasks.append(task)
-
+    tasks: Sequence[ParquetScanTask],
+    candidates: list[tuple[str, OrderKey]],
+    rank_parquet_info_map: dict[str, CachedParquetInfo],
+    stream: Stream,
+) -> plc.Table:
+    """Return candidate endpoint columns with two rows per local scan task."""
     paths = list(dict.fromkeys(path for task in tasks for path in task.paths))
-    rank_parquet_info_map = await _get_rank_parquet_info_map(
-        ir.base_scan, paths, ir_context
-    )
     rank_row_group_offset_map: dict[str, int] = {}
     rank_row_group_metadata: list[plc.io.parquet_metadata.RowGroup] = []
     for path in paths:
@@ -252,13 +235,12 @@ async def parquet_metadata_ordering(
         for task in tasks
     ]
 
-    stream = ir_context.get_cuda_stream()
     file_metadata = [rank_parquet_info_map[path].file_metadata for path in paths]
-    bound_count = 2 * len(task_row_group_indices)
+    bound_count = 2 * len(tasks)
     columns: list[plc.Column] = []
     for name, key in candidates:
         column = (
-            _candidate_bounds(
+            _candidate_task_bounds(
                 file_metadata,
                 rank_row_group_metadata,
                 task_row_group_indices,
@@ -267,28 +249,23 @@ async def parquet_metadata_ordering(
                 ir.schema[name].plc_type,
                 stream,
             )
-            if task_row_group_indices
+            if tasks
             else None
         )
         if column is None:
             column = _null_column(ir, name, bound_count, stream)
         columns.append(column)
-    bounds = plc.Table(columns)
-    if comm.nranks > 1:
-        local_chunk = TableChunk.from_pylibcudf_table(
-            bounds, stream, exclusive_view=True, br=context.br()
-        )
-        allgather = AllGatherManager(context, comm, collective_id)
-        with allgather.inserting() as inserter:
-            await inserter.insert(comm.rank, local_chunk)
-        bounds = await allgather.extract_concatenated(
-            stream, ordered=True, ir_context=ir_context
-        )
+    return plc.Table(columns)
 
-    assert bounds.num_rows() == 2 * global_chunk_count, (
-        "Ordering chunk bounds must contain first/last rows for every scan chunk."
-    )
 
+def _partitioning_from_task_bounds(
+    context: Context,
+    candidates: list[tuple[str, OrderKey]],
+    bounds: plc.Table,
+    global_task_count: int,
+    stream: Stream,
+) -> Partitioning | None:
+    """Infer global ordering from rank-ordered task endpoint rows."""
     for i, (_, key) in enumerate(candidates):
         column = bounds.columns()[i]
         if column.null_count():
@@ -300,14 +277,14 @@ async def parquet_metadata_ordering(
         ):
             continue
 
-        if global_chunk_count < 2:
+        if global_task_count < 2:
             ordering_boundaries = plc.Table(
                 [plc.Column.from_iterable_of_py([], column.type(), stream=stream)]
             )
             strict = True
         else:
             ordering_boundaries, strict = _extract_ordering_boundaries(
-                candidate_bounds, global_chunk_count, stream
+                candidate_bounds, global_task_count, stream
             )
         return Partitioning(
             inter_rank=OrderScheme(
@@ -328,3 +305,61 @@ async def parquet_metadata_ordering(
             local="inherit",
         )
     return None
+
+
+async def parquet_metadata_ordering(
+    context: Context,
+    comm: Communicator,
+    ir: StreamingScan,
+    global_chunk_count: int,
+    requests: tuple[PartitioningRequest, ...],
+    ir_context: IRExecutionContext,
+    collective_id: int,
+) -> Partitioning | None:
+    """
+    Return ordering partitioning inferred from parquet footer metadata.
+
+    Only the leading key of each requested ordering is inspected. An ordering
+    on the leading key is useful metadata even when a downstream request
+    contains additional keys. Inference succeeds when footer min/max statistics
+    prove that scan tasks have globally ordered bounds.
+    """
+    assert ir.base_scan.typ == "parquet", (
+        f"Expected parquet Scan, got {ir.base_scan.typ}."
+    )
+    assert global_chunk_count > 0, "Scan partition count must be positive."
+
+    if not (candidates := _get_ordering_candidates(ir, requests)):
+        return None
+
+    tasks: list[ParquetScanTask] = []
+    for task in ir.tasks:
+        assert isinstance(task, ParquetScanTask)
+        tasks.append(task)
+
+    paths = list(dict.fromkeys(path for task in tasks for path in task.paths))
+    rank_parquet_info_map = await ir_context.to_thread(
+        _get_rank_parquet_info_map, ir.base_scan, paths
+    )
+    stream = ir_context.get_cuda_stream()
+    local_task_bounds = _extract_local_task_bounds(
+        ir, tasks, candidates, rank_parquet_info_map, stream
+    )
+    global_task_bounds = local_task_bounds
+    if comm.nranks > 1:
+        local_chunk = TableChunk.from_pylibcudf_table(
+            local_task_bounds, stream, exclusive_view=True, br=context.br()
+        )
+        allgather = AllGatherManager(context, comm, collective_id)
+        with allgather.inserting() as inserter:
+            await inserter.insert(comm.rank, local_chunk)
+        global_task_bounds = await allgather.extract_concatenated(
+            stream, ordered=True, ir_context=ir_context
+        )
+
+    assert global_task_bounds.num_rows() == 2 * global_chunk_count, (
+        "Ordering task bounds must contain first/last rows for every scan task."
+    )
+    return _partitioning_from_task_bounds(
+        context, candidates, global_task_bounds, global_chunk_count, stream
+    )
