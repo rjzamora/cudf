@@ -305,10 +305,9 @@ def test_parquet_scan_ordering_trace_skips_sort(
     pytest.importorskip("structlog")
 
     source = tmp_path / "data.parquet"
-    pl.DataFrame({"x": range(5_000), "y": range(5_000)}).write_parquet(
+    pl.DataFrame({"x": range(100), "y": range(100)}).write_parquet(
         source,
-        compression="uncompressed",
-        row_group_size=1_250,
+        row_group_size=10,
     )
 
     code = textwrap.dedent(f"""\
@@ -325,8 +324,7 @@ def test_parquet_scan_ordering_trace_skips_sort(
         executor="streaming",
         executor_options={{
             "dynamic_planning": {{"infer_ordering": True}},
-            "min_device_size": 1 << 30,
-            "target_partition_size": 21_000,
+            "target_partition_size": 1024,
         }},
         raise_on_fail=True,
     )
@@ -347,7 +345,7 @@ def test_parquet_scan_ordering_trace_skips_sort(
         returncode = proc.returncode
 
     assert returncode == 0, result.decode(errors="replace")
-    assert b"RESULT_ROWS=5000" in result
+    assert b"RESULT_ROWS=100" in result
 
     decisions = set()
     for line in result.splitlines():
