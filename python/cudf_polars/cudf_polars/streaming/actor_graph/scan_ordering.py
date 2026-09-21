@@ -163,6 +163,17 @@ def _candidate_task_bounds(
         "Decoded parquet bounds must match footer row-group metadata."
     )
 
+    if min_col.null_count() or max_col.null_count():
+        return None
+
+    valid_task_row_group_indices: list[list[int]] = []
+    for row_group_indices in task_row_group_indices:
+        if row_group_indices is None or not _stats_are_safe(
+            rank_row_group_metadata, name, row_group_indices
+        ):
+            return None
+        valid_task_row_group_indices.append(row_group_indices)
+
     if bounds_type != dtype:
         if not is_order_preserving_cast(bounds_type, dtype):
             return None
@@ -173,9 +184,6 @@ def _candidate_task_bounds(
         return plc.Column.all_null_like(
             min_col, 2 * len(task_row_group_indices), stream=stream
         )
-
-    if min_col.null_count() or max_col.null_count():
-        return invalidate()
 
     start, end = (
         (max_col, min_col)
@@ -190,12 +198,7 @@ def _candidate_task_bounds(
     )
 
     task_bounds: list[plc.Table] = []
-    for row_group_indices in task_row_group_indices:
-        if row_group_indices is None or not _stats_are_safe(
-            rank_row_group_metadata, name, row_group_indices
-        ):
-            return invalidate()
-
+    for row_group_indices in valid_task_row_group_indices:
         selected = _gather_rows(
             row_group_bounds,
             [
