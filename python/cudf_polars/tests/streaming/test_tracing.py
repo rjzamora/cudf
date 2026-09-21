@@ -299,6 +299,69 @@ def test_io_tasks_wait_for_memory_admission(
     assert second["admitted"] >= first["stop"]
 
 
+def test_parquet_scan_ordering_trace_skips_sort(
+    tmp_path: pathlib.Path, timeout_seconds: int
+) -> None:
+    pytest.importorskip("structlog")
+
+    source = tmp_path / "data.parquet"
+    pl.DataFrame({"x": range(5_000), "y": range(5_000)}).write_parquet(
+        source,
+        compression="uncompressed",
+        row_group_size=1_250,
+    )
+
+    code = textwrap.dedent(f"""\
+    import structlog
+    import polars as pl
+
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.JSONRenderer(),
+        ]
+    )
+    engine = pl.GPUEngine(
+        executor="streaming",
+        executor_options={{
+            "dynamic_planning": {{"infer_ordering": True}},
+            "min_device_size": 1 << 30,
+            "target_partition_size": 21_000,
+        }},
+        raise_on_fail=True,
+    )
+    result = pl.scan_parquet({str(source)!r}).sort("x").collect(engine=engine)
+    print("RESULT_ROWS=" + str(result.height))
+    """)
+
+    env = os.environ.copy()
+    env["CUDF_POLARS_LOG_TRACES"] = "1"
+
+    with subprocess.Popen(
+        [sys.executable, "-c", code],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    ) as proc:
+        result, _ = proc.communicate(timeout=timeout_seconds)
+        returncode = proc.returncode
+
+    assert returncode == 0, result.decode(errors="replace")
+    assert b"RESULT_ROWS=5000" in result
+
+    decisions = set()
+    for line in result.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event") == "Streaming Actor":
+            decisions.add((event.get("actor_ir_type"), event.get("decision")))
+
+    assert ("StreamingScan", "parquet_ordering") in decisions
+    assert ("Sort", "already_sorted") in decisions
+
+
 @pytest.mark.parametrize(
     "ordered,broadcast_limit,bloom_filter_max_size,join_strategy,method,reason,domain_rows,output_rows",
     [
