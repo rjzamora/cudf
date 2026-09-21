@@ -22,7 +22,7 @@ from cudf_polars.streaming.actor_graph.collectives.sort import (
 )
 from cudf_polars.streaming.io import ParquetScanTask
 from cudf_polars.streaming.partitioning_requests import OrderPartitioningRequest
-from cudf_polars.utils.dtypes import is_order_preserving_cast, make_empty_column
+from cudf_polars.utils.dtypes import is_order_preserving_cast
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -37,10 +37,11 @@ if TYPE_CHECKING:
 
 
 def _null_column(ir: StreamingScan, name: str, size: int, stream: Stream) -> plc.Column:
-    empty = make_empty_column(ir.schema[name], stream)
-    if size == 0:
-        return empty
-    return plc.Column.all_null_like(empty, size, stream=stream)
+    return plc.Column.from_scalar(
+        plc.Scalar.from_py(None, ir.schema[name].plc_type, stream=stream),
+        size,
+        stream=stream,
+    )
 
 
 def _gather_rows(table: plc.Table, rows: list[int], stream: Stream) -> plc.Table:

@@ -13,6 +13,7 @@ import pytest
 import polars as pl
 
 import pylibcudf as plc
+from cudf_streaming.channel_metadata import OrderScheme
 
 from cudf_polars import Translator
 from cudf_polars.containers import DataFrame, DataType
@@ -991,11 +992,18 @@ def _ordering_boundary_values(
     )
 
 
+def _parquet_scan_task(
+    scan: Scan,
+    paths: list[str],
+    split_index: int = 0,
+    total_splits: int = 1,
+) -> ParquetScanTask:
+    return ParquetScanTask(scan, paths, split_index, total_splits, scan.parquet_options)
+
+
 def test_parquet_scan_ordering_partitioning_from_footer_metadata(
     tmp_path: Path, spmd_engine
 ) -> None:
-    from cudf_streaming.channel_metadata import OrderScheme
-
     paths = []
     for i in range(2):
         path = tmp_path / f"part-{i}.parquet"
@@ -1015,7 +1023,7 @@ def test_parquet_scan_ordering_partitioning_from_footer_metadata(
         },
     )
     streaming_scan = StreamingScan(
-        [ParquetScanTask(scan, [path], 0, 1, scan.parquet_options) for path in paths],
+        [_parquet_scan_task(scan, [path]) for path in paths],
         scan,
     )
     unproven_request = OrderPartitioningRequest(
@@ -1058,7 +1066,7 @@ def test_parquet_scan_ordering_partitioning_rejects_null_chunks(
 
     scan = _make_parquet_scan(paths)
     streaming_scan = StreamingScan(
-        [ParquetScanTask(scan, [path], 0, 1, scan.parquet_options) for path in paths],
+        [_parquet_scan_task(scan, [path]) for path in paths],
         scan,
     )
 
@@ -1073,15 +1081,13 @@ def test_parquet_scan_ordering_partitioning_rejects_null_chunks(
 def test_parquet_scan_ordering_partitioning_uses_row_group_splits(
     tmp_path: Path, spmd_engine
 ) -> None:
-    from cudf_streaming.channel_metadata import OrderScheme
-
     path = tmp_path / "data.parquet"
     pl.DataFrame({"x": range(8)}).write_parquet(path, row_group_size=2)
     scan = _make_parquet_scan([str(path)])
     split_count = 4
     streaming_scan = StreamingScan(
         [
-            ParquetScanTask(scan, [str(path)], i, split_count, scan.parquet_options)
+            _parquet_scan_task(scan, [str(path)], i, split_count)
             for i in range(split_count)
         ],
         scan,
@@ -1103,8 +1109,6 @@ def test_parquet_scan_ordering_partitioning_uses_row_group_splits(
 def test_parquet_scan_ordering_partitioning_string_column(
     tmp_path: Path, spmd_engine
 ) -> None:
-    from cudf_streaming.channel_metadata import OrderScheme
-
     paths = []
     for i, values in enumerate((["a", "b"], ["c", "d"])):
         path = tmp_path / f"part-{i}.parquet"
@@ -1113,7 +1117,7 @@ def test_parquet_scan_ordering_partitioning_string_column(
 
     scan = _make_parquet_scan(paths, schema={"s": DataType(pl.String())})
     streaming_scan = StreamingScan(
-        [ParquetScanTask(scan, [path], 0, 1, scan.parquet_options) for path in paths],
+        [_parquet_scan_task(scan, [path]) for path in paths],
         scan,
     )
 
@@ -1143,9 +1147,7 @@ def test_parquet_scan_ordering_partitioning_fused_files_require_ordered_paths(
         paths.reverse()
 
     scan = _make_parquet_scan(paths)
-    streaming_scan = StreamingScan(
-        [ParquetScanTask(scan, paths, 0, 1, scan.parquet_options)], scan
-    )
+    streaming_scan = StreamingScan([_parquet_scan_task(scan, paths)], scan)
     partitioning = _run_parquet_metadata_ordering(
         streaming_scan,
         (_order_request("x"),),
@@ -1163,8 +1165,6 @@ def test_parquet_scan_ordering_partitioning_fused_files_require_ordered_paths(
 def test_parquet_scan_ordering_partitioning_allgather(
     tmp_path: Path, spmd_engine
 ) -> None:
-    from cudf_streaming.channel_metadata import OrderScheme
-
     if spmd_engine.comm.nranks < 2:
         pytest.skip("requires multiple ranks")
 
@@ -1176,9 +1176,7 @@ def test_parquet_scan_ordering_partitioning_allgather(
     ).write_parquet(path, row_group_size=2)
 
     scan = _make_parquet_scan([str(path)])
-    streaming_scan = StreamingScan(
-        [ParquetScanTask(scan, scan.paths, 0, 1, scan.parquet_options)], scan
-    )
+    streaming_scan = StreamingScan([_parquet_scan_task(scan, scan.paths)], scan)
     partitioning = _run_parquet_metadata_ordering(
         streaming_scan,
         (_order_request("x"),),
@@ -1197,8 +1195,6 @@ def test_parquet_scan_ordering_partitioning_allgather(
 def test_parquet_scan_ordering_partitioning_skips_synthetic_columns(
     tmp_path: Path, spmd_engine
 ) -> None:
-    from cudf_streaming.channel_metadata import OrderScheme
-
     path = tmp_path / "data.parquet"
     pl.DataFrame({"x": range(4)}).write_parquet(path, row_group_size=2)
     scan = _make_parquet_scan(
@@ -1209,7 +1205,7 @@ def test_parquet_scan_ordering_partitioning_skips_synthetic_columns(
         },
     )
     streaming_scan = StreamingScan(
-        [ParquetScanTask(scan, [str(path)], 0, 1, scan.parquet_options)],
+        [_parquet_scan_task(scan, [str(path)])],
         scan,
     )
 
