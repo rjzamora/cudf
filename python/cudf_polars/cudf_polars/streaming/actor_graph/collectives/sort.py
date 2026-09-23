@@ -18,12 +18,18 @@ from cudf_streaming.channel_metadata import (
     Ordering,
     Partitioning,
 )
+from cudf_streaming.partition_utils import (
+    unpack_and_concat,
+    unpack_and_concat_cost,
+)
 from cudf_streaming.table_chunk import (
     TableChunk,
     make_table_chunks_available_or_wait,
 )
+from rapidsmpf.memory.memory_reservation import opaque_memory_usage
 from rapidsmpf.shuffler import PartitionAssignment
 from rapidsmpf.streaming.core.actor import define_actor
+from rapidsmpf.streaming.core.memory_reserve_or_wait import reserve_memory
 from rapidsmpf.streaming.core.message import Message
 
 from cudf_polars.containers import DataFrame, DataType
@@ -84,6 +90,12 @@ if TYPE_CHECKING:
     from cudf_polars.streaming.actor_graph.tracing import ActorTracer
     from cudf_polars.typing import Schema
     from cudf_polars.utils.config import StreamingExecutor
+
+
+# A sort needs a full output table plus memory for the row-order map and
+# implementation workspace. Keep this deliberately conservative while the
+# sort-specific cost model is being developed.
+_SORT_RESERVATION_MULTIPLIER = 2
 
 
 @dataclass(frozen=True)
@@ -499,13 +511,15 @@ async def _receive_and_buffer_chunks(
 
     while (msg := await ch_in.recv(context)) is not None:
         seq_num = msg.sequence_number
+        chunk = TableChunk.from_message(msg, br=context.br())
         df = chunk_to_frame(
             # Make sure chunks are pre-sorted
             await evaluate_chunk(
                 context,
-                TableChunk.from_message(msg, br=context.br()),
+                chunk,
                 ir,
                 ir_context=ir_context,
+                reserve_extra=(_SORT_RESERVATION_MULTIPLIER * chunk.data_alloc_size()),
             ),
             ir,
         )
@@ -652,18 +666,35 @@ async def _extract_partitions_and_send(
     ncols_out = len(output_schema)
     for partition_id in shuffle.local_partitions():
         stream = ir_context.get_cuda_stream()
-        table = await shuffle.extract_chunk(partition_id, stream)
+        partitions = shuffle.extract_pieces(partition_id)
+        extract_cost = unpack_and_concat_cost(partitions)
+        sort_cost = _SORT_RESERVATION_MULTIPLIER * extract_cost
+        reservation = await reserve_memory(
+            context,
+            extract_cost + sort_cost,
+            # Extraction replaces the packed representation, and sorting
+            # replaces the unpacked table, so the lasting size is unchanged.
+            net_memory_delta=0,
+        )
+        sort_reservation = reservation.split(sort_cost)
+        table = unpack_and_concat(
+            partitions=partitions,
+            stream=stream,
+            br=context.br(),
+            reservation=reservation,
+        )
         if table.num_rows() > 0:
-            table = post_sort_ir.do_evaluate(
-                *post_sort_ir._non_child_args,
-                DataFrame.from_table(
-                    table,
-                    list(post_sort_ir.schema.keys()),
-                    list(post_sort_ir.schema.values()),
-                    stream,
-                ),
-                context=ir_context,
-            ).table
+            with opaque_memory_usage(sort_reservation):
+                table = post_sort_ir.do_evaluate(
+                    *post_sort_ir._non_child_args,
+                    DataFrame.from_table(
+                        table,
+                        list(post_sort_ir.schema.keys()),
+                        list(post_sort_ir.schema.values()),
+                        stream,
+                    ),
+                    context=ir_context,
+                ).table
             if table.num_columns() > ncols_out:
                 table = plc.Table(table.columns()[:ncols_out])
             chunk = TableChunk.from_pylibcudf_table(

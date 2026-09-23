@@ -872,6 +872,7 @@ async def evaluate_chunk(
     *irs: IR,
     ir_context: IRExecutionContext,
     ordering_metadata: OrderingMetadata | None = None,
+    reserve_extra: int | None = None,
 ) -> TableChunk:
     """
     Make chunk available, reserve memory, and evaluate.
@@ -890,16 +891,21 @@ async def evaluate_chunk(
     ordering_metadata
         Optional precomputed ordering metadata to synthesize local DataFrame
         metadata from during the first evaluation.
+    reserve_extra
+        Additional device bytes to reserve while evaluating. Defaults to one
+        copy of the input chunk.
 
     Returns
     -------
     The resulting table chunk after evaluation.
     """
     assert len(irs) > 0, "Expected at least one IR node"
+    if reserve_extra is None:
+        reserve_extra = chunk.data_alloc_size()
     chunk, extra = await make_table_chunks_available_or_wait(
         context,
         chunk,
-        reserve_extra=chunk.data_alloc_size(),
+        reserve_extra=reserve_extra,
         net_memory_delta=0,
     )
     with opaque_memory_usage(extra):
