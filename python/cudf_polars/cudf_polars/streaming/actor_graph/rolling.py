@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Rolling logic for the RapidsMPF streaming runtime."""
 
@@ -7,17 +7,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import pylibcudf as plc
+from cudf_streaming.channel_metadata import ChannelMetadata
+from cudf_streaming.table_chunk import (
+    TableChunk,
+    make_table_chunks_available_or_wait,
+)
 from rapidsmpf.memory.buffer import MemoryType
 from rapidsmpf.memory.memory_reservation import opaque_memory_usage
 from rapidsmpf.streaming.core.actor import define_actor
 from rapidsmpf.streaming.core.message import Message
-from rapidsmpf.streaming.cudf.channel_metadata import ChannelMetadata
-from rapidsmpf.streaming.cudf.table_chunk import (
-    TableChunk,
-    make_table_chunks_available_or_wait,
-)
-
-import pylibcudf as plc
 
 from cudf_polars.dsl.ir import IR, Rolling
 from cudf_polars.dsl.utils.windows import duration_to_scalar
@@ -42,7 +41,6 @@ if TYPE_CHECKING:
     from rapidsmpf.memory.buffer_resource import BufferResource
     from rapidsmpf.streaming.core.channel import Channel
     from rapidsmpf.streaming.core.context import Context
-
     from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.dsl.ir import IRExecutionContext
@@ -292,7 +290,7 @@ async def extract_region(
     )
     chunk_streams = [chunk.stream for chunk in chunks]
     with opaque_memory_usage(reservation):
-        stream = context.get_stream_from_pool()
+        stream = context.br().stream_pool.get_stream()
         join_cuda_streams(downstreams=(stream,), upstreams=chunk_streams)
         table = plc.concatenate.concatenate(
             [chunk.table_view() for chunk in chunks],
@@ -476,7 +474,11 @@ async def rolling_actor(
     left for a later implementation.
     """
     async with shutdown_on_error(
-        context, ch_in, ch_out, trace_ir=ir, ir_context=ir_context
+        context,
+        chs_in=(ch_in,),
+        chs_out=(ch_out,),
+        trace_ir=ir,
+        ir_context=ir_context,
     ) as tracer:
         metadata_in = await recv_metadata(ch_in, context)
         if comm.nranks != 1 and not metadata_in.duplicated:
@@ -487,12 +489,12 @@ async def rolling_actor(
             if tracer is not None:
                 tracer.set_duplicated()
 
-            stream = context.get_stream_from_pool()
+            stream = context.br().stream_pool.get_stream()
             ag = AllGatherManager(context, comm, collective_id)
             with ag.inserting() as inserter:
                 while (msg := await ch_in.recv(context)) is not None:
                     chunk = TableChunk.from_message(msg, context.br())
-                    inserter.insert(msg.sequence_number, chunk)
+                    await inserter.insert(msg.sequence_number, chunk)
             table = await ag.extract_concatenated(
                 stream, ordered=True, ir_context=ir_context
             )
@@ -509,7 +511,7 @@ async def rolling_actor(
                 ir_context=ir_context,
             )
             if tracer is not None:
-                tracer.add_chunk(table=result.table_view())
+                tracer.add_chunk(chunk=result)
             await ch_out.send(context, Message(0, result))
             await ch_out.drain(context)
             return
@@ -526,7 +528,7 @@ async def rolling_actor(
         if tracer is not None and metadata_in.duplicated:
             tracer.set_duplicated()
 
-        window = make_window(ir, context.get_stream_from_pool())
+        window = make_window(ir, context.br().stream_pool.get_stream())
         # streams that window deallocation will be ordered after
         observed_streams: set[Stream] = set()
         # chunks we have already evaluated that might be needed to evaluate future chunks
@@ -565,7 +567,7 @@ async def rolling_actor(
                     if cursor.num_rows != 0:
                         history.append(cursor)
                 if tracer is not None:
-                    tracer.add_chunk(table=result.table_view())
+                    tracer.add_chunk(chunk=result)
                 await ch_out.send(context, Message(cursor.sequence_number, result))
 
                 if future:
