@@ -299,13 +299,39 @@ async def _collect_small_side_for_broadcast(
 
     Returns (list of DataFrames to join against, total byte size of small side).
     """
-    size = 0
     chunks: list[TableChunk] = []
     while (msg := await ch.recv(context)) is not None:
         chunks.append(TableChunk.from_message(msg, br=context.br()))
-        size += chunks[-1].data_alloc_size()
-    row_count = sum(c.shape[0] for c in chunks)
+    return await _broadcast_chunks_to_frames(
+        context,
+        comm,
+        chunks,
+        ir,
+        need_allgather=need_allgather,
+        collective_id=collective_id,
+        ir_context=ir_context,
+        must_concatenate=must_concatenate,
+    )
 
+
+async def _broadcast_chunks_to_frames(
+    context: Context,
+    comm: Communicator,
+    chunks: list[TableChunk],
+    ir: IR,
+    *,
+    need_allgather: bool,
+    collective_id: int,
+    ir_context: IRExecutionContext,
+    must_concatenate: bool,
+) -> tuple[list[DataFrame], int]:
+    """
+    Build broadcast-side DataFrames from already-buffered chunks.
+
+    Returns (list of DataFrames to join against, total byte size of the chunks).
+    """
+    size = sum(chunk.data_alloc_size() for chunk in chunks)
+    row_count = sum(chunk.shape[0] for chunk in chunks)
     dfs: list[DataFrame] = []
     if need_allgather:
         allgather = AllGatherManager(context, comm, collective_id)

@@ -73,6 +73,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypedDict
 from cudf_polars.dsl import expr
 from cudf_polars.dsl.ir import (
     IR,
+    AsofJoin,
     ConditionalJoin,
     DataFrameScan,
     Distinct,
@@ -477,7 +478,29 @@ def _(node: Join, rec: GenericTransformer[IR, IR, _RewriteState]) -> IR:
     return apply_candidate(node, decision.candidate)
 
 
-def apply_candidate(ir: Join, candidate: Candidate) -> IR:
+@_rewrite.register(AsofJoin)
+def _(node: AsofJoin, rec: GenericTransformer[IR, IR, _RewriteState]) -> IR:
+    original = node
+    rewritten = reuse_if_unchanged(node, rec)
+    assert isinstance(rewritten, AsofJoin)
+    node = rewritten
+    if node is original:
+        facts = rec.state["facts"]
+    else:
+        facts = analyze_plan(node, rec.state["stats"])
+    decision = _select_asof_candidate(
+        node,
+        rec.state["threshold"],
+        facts,
+    )
+    if rec.state["trace"]:
+        _trace_decision(node, rec.state["threshold"], decision)
+    if decision.candidate is None:
+        return node
+    return apply_candidate(node, decision.candidate)
+
+
+def apply_candidate(ir: Join | AsofJoin, candidate: Candidate) -> IR:
     """Apply a selected join-domain prefilter candidate to a join."""
     left, right = ir.children
     domain = _make_domain(candidate, ir)
@@ -586,6 +609,38 @@ def _select_candidate(
             )
         )
 
+    if not candidates:
+        return Decision(reason="no_profitable_domain")
+    return Decision(reason="applied", candidate=min(candidates, key=lambda c: c.score))
+
+
+def _select_asof_candidate(
+    ir: AsofJoin,
+    threshold: float,
+    facts: PlanFacts,
+) -> Decision:
+    if ir.options[2] is not None:
+        return Decision(reason="sliced_join")
+
+    ((_, _, _, _, left_by, right_by, _, _), *_) = ir.options
+    if not left_by or len(left_by) != len(right_by):
+        return Decision(reason="non_column_join_key")
+
+    left, right = ir.children
+    left_keys = tuple(expr.Col(left.schema[name], name) for name in left_by)
+    right_keys = tuple(expr.Col(right.schema[name], name) for name in right_by)
+
+    candidates = list(
+        _simple_candidates(
+            "right",
+            right,
+            left,
+            right_keys,
+            left_keys,
+            threshold,
+            facts,
+        )
+    )
     if not candidates:
         return Decision(reason="no_profitable_domain")
     return Decision(reason="applied", candidate=min(candidates, key=lambda c: c.score))
@@ -700,7 +755,7 @@ def _composite_candidates(
             )
 
 
-def _make_domain(candidate: Candidate, ir: Join) -> IR:
+def _make_domain(candidate: Candidate, ir: Join | AsofJoin) -> IR:
     if isinstance(candidate, SimpleCandidate):
         return _project_bound_key(
             candidate.domain.node,
@@ -909,7 +964,7 @@ def has_filtering_hint_ancestor(root: IR, path: Sequence[int]) -> bool:
     return False
 
 
-def _trace_decision(ir: Join, threshold: float, decision: Decision) -> None:
+def _trace_decision(ir: Join | AsofJoin, threshold: float, decision: Decision) -> None:
     join_filter_pushdown: dict[str, Any] = {
         "considered": True,
         "threshold": threshold,

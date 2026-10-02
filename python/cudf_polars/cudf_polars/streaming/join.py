@@ -8,7 +8,13 @@ import operator
 from functools import reduce
 from typing import TYPE_CHECKING
 
-from cudf_polars.dsl.ir import ConditionalJoin, Join, Projection, Slice
+from cudf_polars.dsl.ir import (
+    AsofJoin,
+    ConditionalJoin,
+    Join,
+    Projection,
+    Slice,
+)
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.streaming.base import PartitionInfo
 from cudf_polars.streaming.dispatch import lower_ir_node
@@ -448,3 +454,29 @@ def _(
             left,
             right,
         )
+
+
+@lower_ir_node.register(AsofJoin)
+def _(
+    ir: AsofJoin, rec: LowerIRTransformer
+) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    """Lower AsofJoin for dynamic streaming execution."""
+    config_options = rec.state["config_options"]
+    if not _dynamic_planning_on(config_options):
+        raise NotImplementedError("Streaming AsofJoin requires dynamic planning.")
+
+    left, pi_left = rec(ir.children[0])
+    right, pi_right = rec(ir.children[1])
+    output_count = max(pi_left[left].count, pi_right[right].count)
+
+    if ir.options[2] is not None and output_count > 1:  # pragma: no cover
+        return _lower_ir_fallback(
+            ir,
+            rec,
+            msg="Slice not supported in AsofJoin for multiple partitions.",
+        )
+
+    new_node = ir.reconstruct([left, right])
+    partition_info = reduce(operator.or_, (pi_left, pi_right))
+    partition_info[new_node] = PartitionInfo(count=output_count)
+    return new_node, partition_info

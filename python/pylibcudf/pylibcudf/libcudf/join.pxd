@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 from libc.stddef cimport size_t
@@ -9,6 +9,7 @@ from libcpp.pair cimport pair
 from libcpp.vector cimport vector
 from pylibcudf.exception_handler cimport libcudf_exception_handler
 from pylibcudf.libcudf.column.column cimport column
+from pylibcudf.libcudf.column.column_view cimport column_view
 from pylibcudf.libcudf.expressions cimport expression
 from pylibcudf.libcudf.table.table cimport table
 from pylibcudf.libcudf.table.table_view cimport table_view
@@ -236,6 +237,27 @@ cdef extern from "cudf/join/filtered_join.hpp" namespace "cudf" nogil:
         ) except +libcudf_exception_handler
         gather_map_type anti_join(
             const table_view left,
+            cudaStream_t stream,
+            device_async_resource_ref mr
+        ) except +libcudf_exception_handler
+
+cdef extern from "cudf/join/asof_join.hpp" namespace "cudf" nogil:
+    cpdef enum class asof_join_strategy:
+        BACKWARD
+        FORWARD
+        NEAREST
+
+    cdef cppclass asof_join:
+        asof_join(
+            const table_view right_by,
+            const column_view right_on,
+            cudaStream_t stream
+        ) except +libcudf_exception_handler
+        gather_map_type join(
+            const table_view left_by,
+            const column_view left_on,
+            asof_join_strategy strategy,
+            bool allow_exact_matches,
             cudaStream_t stream,
             device_async_resource_ref mr
         ) except +libcudf_exception_handler

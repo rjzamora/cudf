@@ -134,6 +134,31 @@ def test_join_with_underestimated_broadcast_input(tmp_path, streaming_engine_fac
     )
 
 
+def test_dynamic_join_asof_backward(streaming_engine_factory):
+    engine = streaming_engine_factory(
+        StreamingOptions(
+            max_rows_per_partition=2,
+            target_partition_size=64,
+            broadcast_limit=1 << 20,
+        )
+    )
+    left = pl.LazyFrame(
+        {
+            "t": [0, 2, 4, 6, 7],
+            "x": [0, 2, 4, 6, 7],
+        }
+    ).set_sorted("t")
+    right = pl.LazyFrame(
+        {
+            "t": [1, 2, 3, 5],
+            "y": [10, 20, 30, 50],
+        }
+    ).set_sorted("t")
+    q = left.join_asof(right, on="t")
+
+    assert_gpu_result_equal(q, engine=engine)
+
+
 # ---------------------------------------------------------------------------
 # Tests migrated from tests/streaming/test_join.py
 # ---------------------------------------------------------------------------

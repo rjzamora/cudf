@@ -15,6 +15,7 @@ import cudf_polars.dsl.tracing
 import cudf_polars.quent._context
 import cudf_polars.quent._types
 from cudf_polars.dsl.ir import (
+    AsofJoin,
     Join,
     Union,
 )
@@ -181,7 +182,7 @@ def determine_fanout_nodes(
     for node in traversal([ir]):
         if node in unbounded:
             _mark_children_unbounded(node)
-        elif isinstance(node, (Union, Join, Over, PushdownFilterHint)):
+        elif isinstance(node, (Union, Join, AsofJoin, Over, PushdownFilterHint)):
             # Union processes children sequentially; Join may broadcast one
             # side; Over buffers (or samples-then-replays) its input before
             # producing output; PushdownFilterHint similarly might buffer

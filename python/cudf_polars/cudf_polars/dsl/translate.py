@@ -691,7 +691,8 @@ def _(node: plrs._ir_nodes.Join, translator: Translator, schema: Schema) -> ir.I
             for e in node.right_on
         ]
 
-    if (how := node.options[0]) in {
+    how = node.options[0]
+    if isinstance(how, str) and how in {
         "Inner",
         "Left",
         "Right",
@@ -708,12 +709,44 @@ def _(node: plrs._ir_nodes.Join, translator: Translator, schema: Schema) -> ir.I
             inp_left,
             inp_right,
         )
+    elif isinstance(how, tuple) and how[0] == "AsOf":
+        (
+            asof_how,
+            strategy,
+            tolerance,
+            tolerance_str,
+            left_by,
+            right_by,
+            allow_exact_matches,
+            check_sortedness,
+        ) = how
+        asof_options = (
+            (
+                asof_how,
+                strategy,
+                tolerance,
+                tolerance_str,
+                tuple(left_by or ()),
+                tuple(right_by or ()),
+                allow_exact_matches,
+                check_sortedness,
+            ),
+            *node.options[1:],
+        )
+        return ir.AsofJoin(
+            schema,
+            left_on,
+            right_on,
+            asof_options,
+            inp_left,
+            inp_right,
+        )
     else:
-        how, op1, op2 = node.options[0]
-        if how != "IEJoin":
+        join_type, op1, op2 = how
+        if join_type != "IEJoin":
             raise NotImplementedError(
-                f"Unsupported join type {how}"
-            )  # pragma: no cover; asof joins not yet exposed
+                f"Unsupported join type {join_type}"
+            )  # pragma: no cover
         if op2 is None:
             ops = [op1]
         else:

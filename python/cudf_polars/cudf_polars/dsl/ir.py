@@ -99,6 +99,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "IR",
+    "AsofJoin",
     "Cache",
     "ConditionalJoin",
     "DataFrameScan",
@@ -3431,6 +3432,214 @@ class Join(IR):
                         }
                     )
                     return left.with_columns(right.columns, stream=stream).slice(zlice)
+
+
+class AsofJoin(IR):
+    """An as-of join of two dataframes."""
+
+    __slots__ = ("left_on", "options", "right_on")
+    _non_child: ClassVar[tuple[str, ...]] = (
+        "schema",
+        "left_on",
+        "right_on",
+        "options",
+    )
+    _n_non_child_args = 4
+    left_on: tuple[expr.NamedExpr, ...]
+    """Expression used as the ordered key in the left frame."""
+    right_on: tuple[expr.NamedExpr, ...]
+    """Expression used as the ordered key in the right frame."""
+    options: tuple[
+        tuple[
+            Literal["AsOf"],
+            Literal["backward", "forward", "nearest"],
+            Any,
+            Any,
+            tuple[str, ...],
+            tuple[str, ...],
+            bool,
+            bool,
+        ],
+        bool,
+        Zlice | None,
+        str,
+        bool,
+        Literal["none", "left", "right", "left_right", "right_left"],
+    ]
+
+    def __init__(
+        self,
+        schema: Schema,
+        left_on: Sequence[expr.NamedExpr],
+        right_on: Sequence[expr.NamedExpr],
+        options: Any,
+        left: IR,
+        right: IR,
+    ):
+        self.schema = schema
+        self.left_on = tuple(left_on)
+        self.right_on = tuple(right_on)
+        self.options = options
+        self.children = (left, right)
+        self._non_child_args = (
+            self.schema,
+            self.left_on,
+            self.right_on,
+            self.options,
+        )
+
+    @classmethod
+    @log_do_evaluate
+    @nvtx_annotate_cudf_polars(message="AsofJoin")
+    def do_evaluate(
+        cls,
+        schema: Schema,
+        left_on_exprs: Sequence[expr.NamedExpr],
+        right_on_exprs: Sequence[expr.NamedExpr],
+        options: tuple[
+            tuple[
+                Literal["AsOf"],
+                Literal["backward", "forward", "nearest"],
+                Any,
+                Any,
+                tuple[str, ...],
+                tuple[str, ...],
+                bool,
+                bool,
+            ],
+            bool,
+            Zlice | None,
+            str,
+            bool,
+            Literal["none", "left", "right", "left_right", "right_left"],
+        ],
+        left: DataFrame,
+        right: DataFrame,
+        *,
+        context: IRExecutionContext,
+    ) -> DataFrame:
+        """Evaluate and return a dataframe."""
+        (
+            (
+                how,
+                strategy,
+                tolerance,
+                tolerance_str,
+                left_by_names,
+                right_by_names,
+                allow_exact_matches,
+                _check_sortedness,
+            ),
+            _nulls_equal,
+            zlice,
+            suffix,
+            _coalesce,
+            _maintain_order,
+        ) = options
+        if how != "AsOf":  # pragma: no cover
+            raise NotImplementedError(f"Unsupported as-of join type {how}")
+        if strategy != "backward":
+            raise NotImplementedError(
+                "Only backward as-of joins are currently supported"
+            )
+        if tolerance is not None or tolerance_str is not None:
+            raise NotImplementedError(
+                "As-of joins with tolerance are currently unsupported"
+            )
+        if not allow_exact_matches:
+            raise NotImplementedError(
+                "As-of joins without exact matches are currently unsupported"
+            )
+        if len(left_on_exprs) != 1 or len(right_on_exprs) != 1:
+            raise NotImplementedError(
+                "As-of joins currently require exactly one ordered key"
+            )
+
+        left_on = DataFrame(
+            broadcast(*(e.evaluate(left) for e in left_on_exprs), stream=left.stream),
+            stream=left.stream,
+        )
+        right_on = DataFrame(
+            broadcast(
+                *(e.evaluate(right) for e in right_on_exprs), stream=right.stream
+            ),
+            stream=right.stream,
+        )
+        left_by = left.select(left_by_names)
+        right_by = right.select(right_by_names)
+        right_needs_grouped_sort = False
+        if right_by_names:
+            first_right_by = right_by.column_map[right_by_names[0]]
+            right_needs_grouped_sort = not (
+                first_right_by.is_sorted == plc.types.Sorted.YES
+                and first_right_by.order == plc.types.Order.ASCENDING
+            )
+        with context.stream_ordered_after(left, right) as stream:
+            (left_on_col,) = left_on.table.columns()
+            (right_on_col,) = right_on.table.columns()
+            if right_needs_grouped_sort:
+                gather_map = plc.sorting.stable_sorted_order(
+                    plc.Table([*right_by.table.columns(), right_on_col]),
+                    [plc.types.Order.ASCENDING] * (right_by.num_columns + 1),
+                    [plc.types.NullOrder.BEFORE] * (right_by.num_columns + 1),
+                    stream=stream,
+                )
+                right = DataFrame.from_table(
+                    plc.copying.gather(
+                        right.table,
+                        gather_map,
+                        plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                        stream=stream,
+                    ),
+                    right.column_names,
+                    right.dtypes,
+                    stream=stream,
+                )
+                right_by = DataFrame.from_table(
+                    plc.copying.gather(
+                        right_by.table,
+                        gather_map,
+                        plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                        stream=stream,
+                    ),
+                    right_by.column_names,
+                    right_by.dtypes,
+                    stream=stream,
+                )
+                (right_on_col,) = plc.copying.gather(
+                    plc.Table([right_on_col]),
+                    gather_map,
+                    plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                    stream=stream,
+                ).columns()
+            right_map = plc.join.AsofJoin(
+                right_by.table, right_on_col, stream=stream
+            ).join(
+                left_by.table,
+                left_on_col,
+                plc.join.AsofJoinStrategy.BACKWARD,
+                allow_exact_matches,
+                stream=stream,
+            )
+            right = DataFrame.from_table(
+                plc.copying.gather(
+                    right.table,
+                    right_map,
+                    plc.copying.OutOfBoundsPolicy.NULLIFY,
+                    stream=stream,
+                ),
+                right.column_names,
+                right.dtypes,
+                stream=stream,
+            ).rename_columns(
+                {
+                    name: f"{name}{suffix}"
+                    for name in right.column_names
+                    if name in left.column_names_set
+                }
+            )
+            result = left.with_columns(right.columns, stream=stream)
+            return result.select(list(schema)).slice(zlice)
 
 
 class HStack(IR):

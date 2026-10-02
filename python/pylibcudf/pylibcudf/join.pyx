@@ -4,17 +4,21 @@
 from cython.operator import dereference
 
 from libc.stddef cimport size_t
+from libcpp cimport bool
 from libcpp.memory cimport make_unique, unique_ptr
 from libcpp.optional cimport optional
 from libcpp.utility cimport move
 from pylibcudf.libcudf cimport join as cpp_join
 from pylibcudf.libcudf cimport null_mask as cpp_null_mask
 from pylibcudf.libcudf.column.column cimport column
+from pylibcudf.libcudf.column.column_view cimport column_view
 from pylibcudf.libcudf.table.table cimport table
 from pylibcudf.libcudf.table.table_view cimport table_view
 from pylibcudf.libcudf.types cimport mask_state, null_equality
 from pylibcudf.libcudf.utilities.device_buffer cimport byte, device_buffer
 
+from pylibcudf.libcudf.join import \
+    asof_join_strategy as AsofJoinStrategy  # no-cython-lint, isort:skip
 from rmm.pylibrmm.stream cimport Stream
 from rmm.pylibrmm.memory_resource cimport DeviceMemoryResource
 
@@ -30,6 +34,8 @@ if TYPE_CHECKING:
 from cuda.bindings.cyruntime cimport cudaStream_t
 
 __all__ = [
+    "AsofJoin",
+    "AsofJoinStrategy",
     "conditional_full_join",
     "conditional_inner_join",
     "conditional_left_anti_join",
@@ -71,6 +77,103 @@ cdef Column _column_from_gather_map(
             )
         ), _stream, mr
     )
+
+
+cdef class AsofJoin:
+    """
+    Reusable as-of join built from the right-side keys.
+
+    The right-side columns are retained by this object because libcudf stores
+    views into them.
+
+    For details, see :cpp:class:`cudf::asof_join`.
+    """
+
+    def __cinit__(
+        self,
+        Table right_by,
+        Column right_on,
+        object stream: CudaStreamLike | None = None,
+    ) -> None:
+        """
+        Construct an as-of join object for subsequent probe calls.
+
+        Parameters
+        ----------
+        right_by : Table
+            Right-side equality grouping keys. Pass an empty table for an
+            ungrouped as-of join.
+        right_on : Column
+            Right-side ordered key.
+        stream : Stream, optional
+            CUDA stream used for device memory operations and kernel launches.
+        """
+        cdef Stream _stream = _get_stream(stream)
+        cdef cudaStream_t _cs = _stream.view().get()
+
+        cdef table_view c_right_by = right_by.view()
+        cdef column_view c_right_on = right_on.view()
+        with nogil:
+            self.c_obj.reset(
+                new cpp_join.asof_join(c_right_by, c_right_on, _cs)
+            )
+        self._right_by = right_by
+        self._right_on = right_on
+
+    def join(
+        self,
+        Table left_by,
+        Column left_on,
+        cpp_join.asof_join_strategy strategy,
+        bool allow_exact_matches,
+        object stream: CudaStreamLike | None = None,
+        DeviceMemoryResource mr=None,
+    ) -> Column:
+        """
+        Return one matching right-row index for each left row.
+
+        Parameters
+        ----------
+        left_by : Table
+            Left-side equality grouping keys. Pass an empty table for an
+            ungrouped as-of join.
+        left_on : Column
+            Left-side ordered key.
+        strategy : AsofJoinStrategy
+            Direction in which to search for a right-side match.
+        allow_exact_matches : bool
+            Whether equal ordered keys may match.
+        stream : Stream, optional
+            CUDA stream used for device memory operations and kernel launches.
+        mr : DeviceMemoryResource, optional
+            Device memory resource used to allocate the returned column.
+
+        Returns
+        -------
+        Column
+            Right-side gather map containing a row index or JoinNoMatch per
+            left row.
+        """
+        cdef cpp_join.gather_map_type c_result
+
+        cdef Stream _stream = _get_stream(stream)
+        cdef cudaStream_t _cs = _stream.view().get()
+        mr = _get_memory_resource(mr)
+
+        cdef table_view c_left_by = left_by.view()
+        cdef column_view c_left_on = left_on.view()
+        cdef cpp_join.asof_join_strategy c_strategy = strategy
+        cdef bool c_allow_exact_matches = allow_exact_matches
+        with nogil:
+            c_result = self.c_obj.get()[0].join(
+                c_left_by,
+                c_left_on,
+                c_strategy,
+                c_allow_exact_matches,
+                _cs,
+                mr.get_mr()
+            )
+        return _column_from_gather_map(move(c_result), _stream, mr)
 
 
 cpdef tuple[Column, Column] inner_join(

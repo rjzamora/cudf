@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
@@ -59,6 +59,36 @@ def test_cross_join(left, right):
 
 
 sentinel = np.iinfo(np.int32).min
+
+
+def test_asof_join_backward():
+    left = plc.Table.from_arrow(
+        pa.table(
+            {
+                "by": ["a", "a", "a", "b", "b", "c"],
+                "on": pa.array([0, 1, 2, 4, 6, 9], type=pa.int32()),
+            }
+        )
+    )
+    right = plc.Table.from_arrow(
+        pa.table(
+            {
+                "by": ["a", "a", "b", "b"],
+                "on": pa.array([1, 3, 2, 5], type=pa.int32()),
+            }
+        )
+    )
+
+    got = plc.join.AsofJoin(
+        plc.Table(right.columns()[:1]), right.columns()[1]
+    ).join(
+        plc.Table(left.columns()[:1]),
+        left.columns()[1],
+        plc.join.AsofJoinStrategy.BACKWARD,
+        True,
+    )
+
+    assert got.to_arrow().to_pylist() == [sentinel, 0, 0, 2, 3, sentinel]
 
 
 @pytest.mark.parametrize(

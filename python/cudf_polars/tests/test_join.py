@@ -64,6 +64,33 @@ def test_join_maintain_order(engine: pl.GPUEngine, left, right, maintain_order):
     assert_gpu_result_equal(q, engine=engine)
 
 
+@pytest.mark.parametrize("by", [False, True], ids=["no_by", "by"])
+@pytest.mark.skip_on_streaming_engine("Streaming AsofJoin has dedicated tests")
+def test_join_asof_backward(engine: pl.GPUEngine, by):
+    left = pl.LazyFrame(
+        {
+            "g": ["a", "a", "b", "b", "c"],
+            "t": [0, 2, 4, 6, 7],
+            "x": [0, 2, 4, 6, 7],
+        }
+    )
+    right = pl.LazyFrame(
+        {
+            "h": ["a", "b", "a", "b"],
+            "t": [1, 2, 3, 5],
+            "y": [10, 20, 30, 50],
+        }
+    )
+    if by:
+        q = left.join_asof(
+            right, on="t", by_left="g", by_right="h", check_sortedness=False
+        )
+    else:
+        q = left.join_asof(right, on="t")
+
+    assert_gpu_result_equal(q, engine=engine)
+
+
 @pytest.mark.parametrize(
     "join_expr",
     [

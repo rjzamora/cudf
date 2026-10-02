@@ -15,6 +15,7 @@ import cudf_polars.streaming.actor_graph.groupby
 import cudf_polars.streaming.actor_graph.hint_sorted
 import cudf_polars.streaming.actor_graph.io
 import cudf_polars.streaming.actor_graph.join
+import cudf_polars.streaming.actor_graph.join_asof
 import cudf_polars.streaming.actor_graph.over
 import cudf_polars.streaming.actor_graph.prefilter_actor
 import cudf_polars.streaming.actor_graph.repartition
