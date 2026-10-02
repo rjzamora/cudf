@@ -44,17 +44,19 @@ from cudf_polars.dsl.expressions.aggregation import Agg
 from cudf_polars.dsl.expressions.base import Col, ExecutionContext, NamedExpr
 from cudf_polars.dsl.expressions.binaryop import BinOp
 from cudf_polars.dsl.expressions.literal import Literal
-from cudf_polars.dsl.expressions.rolling import GroupedWindow
+from cudf_polars.dsl.expressions.rolling import FixedSizeRollingWindow, GroupedWindow
 from cudf_polars.dsl.expressions.ternary import Ternary
 from cudf_polars.dsl.expressions.unary import Cast, Len, UnaryFunction
 from cudf_polars.dsl.ir import Distinct, Empty, HConcat, Select
 from cudf_polars.dsl.traversal import (
     CachingVisitor,
+    traversal,
 )
 from cudf_polars.streaming.base import PartitionInfo
 from cudf_polars.streaming.distinct import lower_distinct
 from cudf_polars.streaming.over import _decompose_grouped_window_node
 from cudf_polars.streaming.repartition import Repartition
+from cudf_polars.streaming.rolling import FixedSizeRolling
 from cudf_polars.streaming.shuffle import Shuffle
 from cudf_polars.streaming.utils import _dynamic_planning_on
 
@@ -145,6 +147,38 @@ def select(
 
     columns = [Col(ne.value.dtype, ne.name) for ne in named_exprs]
     return columns, new_ir, partition_info
+
+
+def _fixed_size_rolling_overlap(exprs: Sequence[Expr]) -> tuple[int, int]:
+    """Return the row-count overlap required by fixed-size rolling exprs."""
+    preceding = following = 0
+    for node in traversal(exprs):
+        if isinstance(node, FixedSizeRollingWindow):
+            preceding = max(preceding, node.preceding - 1, 0)
+            following = max(following, node.following)
+    return preceding, following
+
+
+def fixed_size_rolling_select(
+    exprs: Sequence[Expr],
+    input_ir: IR,
+    partition_info: MutableMapping[IR, PartitionInfo],
+    *,
+    names: Generator[str, None, None],
+) -> tuple[list[Col], IR, MutableMapping[IR, PartitionInfo]]:
+    """Select fixed-size rolling expressions using row-count overlap."""
+    named_exprs = [NamedExpr(next(names), expr) for expr in exprs]
+    preceding, following = _fixed_size_rolling_overlap(exprs)
+    new_ir = FixedSizeRolling(
+        {ne.name: ne.value.dtype for ne in named_exprs},
+        named_exprs,
+        True,  # noqa: FBT003
+        preceding,
+        following,
+        input_ir,
+    )
+    partition_info[new_ir] = PartitionInfo(count=partition_info[input_ir].count)
+    return [Col(ne.value.dtype, ne.name) for ne in named_exprs], new_ir, partition_info
 
 
 def _decompose_unique(
@@ -449,6 +483,15 @@ def _decompose_expr_node(
             config_options,
             names=names,
         )
+    elif isinstance(expr, FixedSizeRollingWindow):
+        columns, input_ir, partition_info = fixed_size_rolling_select(
+            [expr],
+            input_ir,
+            partition_info,
+            names=names,
+        )
+        (expr,) = columns
+        return expr, input_ir, partition_info
     elif isinstance(expr, UnaryFunction) and expr.name == "null_count":
         columns, input_ir, partition_info = select(
             [expr],

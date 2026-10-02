@@ -299,10 +299,6 @@ def test_fixed_rolling_sum_dtypes(engine: pl.GPUEngine, dtype):
     assert_gpu_result_equal(q, engine=engine)
 
 
-# TODO: Remove once fixed-size rolling supports multi-partition streaming.
-@pytest.mark.filterwarnings(
-    "ignore:This selection is not supported for multiple partitions\\.:UserWarning"
-)
 def test_fixed_rolling_large_window(engine: pl.GPUEngine):
     data = list(range(500))
     df = pl.LazyFrame({"x": [float(v) for v in data]})
