@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import json
+import pickle
+import sys
 from pathlib import Path
 
 import pytest
 
 import polars as pl
 
+from cudf_polars.dsl.ir import CallbackSink
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.testing.asserts import assert_sink_result_equal
 
@@ -197,3 +200,16 @@ def test_callback_sink_rejects_multiple_ranks(spmd_engine_factory):
         match="Callback sinks are not yet supported for multiple ranks",
     ):
         sink.collect(engine=engine)
+
+
+def test_callback_sink_pickle_metadata():
+    payload = pickle.dumps(bool)
+    version = bytes(sys.version_info[1:3])
+    assert CallbackSink.load_function(b"\x01" + version + payload) is bool
+    assert CallbackSink.load_function(b"\x00\x00\x00" + payload) is bool
+
+    other_minor = (sys.version_info.minor + 1) % 256
+    with pytest.raises(ValueError, match="different Python version"):
+        CallbackSink.load_function(bytes((1, other_minor, 0)) + payload)
+    with pytest.raises(ValueError, match="Invalid Polars callback serialization"):
+        CallbackSink.load_function(b"\x02" + version + payload)

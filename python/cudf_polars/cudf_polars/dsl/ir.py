@@ -22,6 +22,7 @@ import json
 import pickle
 import random
 import reprlib
+import sys
 import time
 import uuid
 from collections.abc import Sized
@@ -1515,9 +1516,15 @@ class CallbackSink(IR):
     @staticmethod
     def load_function(function: bytes) -> Callable[[Any], bool]:
         """Decode the callback stored in Polars' Sink payload."""
-        # Polars prefixes the cloudpickle payload with this three-byte header.
-        if not function.startswith(b"\x01\x0d\x0f"):
-            raise NotImplementedError("Unsupported Polars callback serialization")
+        # Polars prefixes the pickle payload with a cloudpickle flag and the
+        # Python minor and micro versions used to serialize the function.
+        if len(function) <= 3 or function[0] not in (0, 1):
+            raise ValueError("Invalid Polars callback serialization")
+        if function[0] and tuple(function[1:3]) != sys.version_info[1:3]:
+            raise ValueError(
+                "Cannot deserialize a cloudpickled callback from a different "
+                "Python version"
+            )
         return pickle.loads(function[3:])
 
     @classmethod
