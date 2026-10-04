@@ -829,7 +829,8 @@ async def callback_sink_actor(
         callback = CallbackSink.load_function(ir.function)
         skip_callback = metadata.duplicated and comm.rank != 0
         stopped = False
-        pending: pl.DataFrame | None = None
+        pending: list[pl.DataFrame] = []
+        pending_rows = 0
         while (msg := await ch_in.recv(context)) is not None:
             if skip_callback or stopped:
                 continue
@@ -844,20 +845,28 @@ async def callback_sink_actor(
             host_df = await ir_context.to_thread(df.to_polars)
             if ir.chunk_size is None:
                 stopped = bool(await ir_context.to_thread(callback, host_df._df))
-            else:
-                pending = (
-                    host_df
-                    if pending is None
-                    else pl.concat((pending, host_df), rechunk=False)
-                )
-                while pending.height >= ir.chunk_size:
-                    batch = pending.slice(0, ir.chunk_size)
-                    pending = pending.slice(ir.chunk_size)
-                    if await ir_context.to_thread(callback, batch._df):
-                        stopped = True
-                        break
-        if not skip_callback and not stopped and pending is not None and pending.height:
-            await ir_context.to_thread(callback, pending._df)
+            elif host_df.height:
+                pending.append(host_df)
+                pending_rows += host_df.height
+                if pending_rows >= ir.chunk_size:
+                    combined = (
+                        pending[0]
+                        if len(pending) == 1
+                        else pl.concat(pending, rechunk=False)
+                    )
+                    while combined.height >= ir.chunk_size:
+                        batch = combined.slice(0, ir.chunk_size)
+                        combined = combined.slice(ir.chunk_size)
+                        if await ir_context.to_thread(callback, batch._df):
+                            stopped = True
+                            break
+                    pending = [combined] if combined.height else []
+                    pending_rows = combined.height
+        if not skip_callback and not stopped and pending_rows:
+            batch = (
+                pending[0] if len(pending) == 1 else pl.concat(pending, rechunk=False)
+            )
+            await ir_context.to_thread(callback, batch._df)
 
         empty_chunk = empty_table_chunk(ir, context, ir_context.get_cuda_stream())
         await ch_out.send(context, Message(0, empty_chunk))

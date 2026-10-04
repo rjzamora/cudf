@@ -154,9 +154,22 @@ def test_sink_ndjson(df, streaming_engine_factory, tmp_path, max_rows_per_partit
     )
 
 
-def test_callback_sink_batches(df, spmd_engine_factory, tmp_path):
+@pytest.mark.parametrize(
+    "max_rows_per_partition,chunk_size,expected_sizes",
+    [(10, 7, [7, 7, 7, 7, 2]), (1, 7, [7, 7, 7, 7, 2]), (1, 100, [30])],
+)
+def test_callback_sink_batches(
+    df,
+    spmd_engine_factory,
+    tmp_path,
+    max_rows_per_partition,
+    chunk_size,
+    expected_sizes,
+):
     engine = spmd_engine_factory(
-        StreamingOptions(max_rows_per_partition=10, raise_on_fail=True)
+        StreamingOptions(
+            max_rows_per_partition=max_rows_per_partition, raise_on_fail=True
+        )
     )
     output = tmp_path / "batches.jsonl"
 
@@ -164,12 +177,12 @@ def test_callback_sink_batches(df, spmd_engine_factory, tmp_path):
         with output.open("a") as file:
             file.write(json.dumps(batch.to_dict(as_series=False)) + "\n")
 
-    sink = df.sink_batches(write_batch, chunk_size=7, lazy=True)
+    sink = df.sink_batches(write_batch, chunk_size=chunk_size, lazy=True)
     assert not output.exists()
     assert sink.collect(engine=engine).shape == (0, 0)
 
     batches = [json.loads(line) for line in output.read_text().splitlines()]
-    assert [len(batch["x"]) for batch in batches] == [7, 7, 7, 7, 2]
+    assert [len(batch["x"]) for batch in batches] == expected_sizes
     assert [x for batch in batches for x in batch["x"]] == list(range(30))
 
 
