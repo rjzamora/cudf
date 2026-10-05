@@ -41,7 +41,7 @@ from rapidsmpf.streaming.core.message import Message
 import cudf_polars.dsl.tracing
 import cudf_polars.quent._types
 from cudf_polars.containers import DataFrame
-from cudf_polars.dsl.expr import Cast, Col, NamedExpr, TemporalFunction
+from cudf_polars.dsl.expr import Col, NamedExpr
 from cudf_polars.dsl.ir import (
     Filter,
     GroupBy,
@@ -53,6 +53,7 @@ from cudf_polars.dsl.ir import (
 from cudf_polars.dsl.tracing import Scope
 from cudf_polars.dsl.utils.column_domain import column_domain_bindings
 from cudf_polars.dsl.utils.naming import names_to_indices
+from cudf_polars.dsl.utils.ordering import ordering_derivation
 from cudf_polars.streaming.actor_graph.collectives.allgather import AllGatherManager
 from cudf_polars.streaming.actor_graph.tracing import (
     ActorTracer,
@@ -80,7 +81,6 @@ if TYPE_CHECKING:
     from rapidsmpf.streaming.core.spillable_messages import SpillableMessages
     from rmm.pylibrmm.stream import Stream
 
-    from cudf_polars.dsl.expr import Expr
     from cudf_polars.dsl.ir import IR, IRExecutionContext
     from cudf_polars.streaming.actor_graph.dispatch import SubNetGenerator
     from cudf_polars.typing import Schema
@@ -474,47 +474,6 @@ def join_preserves_side_order(
     return maintain_order.startswith(side)
 
 
-def _is_truncate_transparent_cast(expr: Cast) -> bool:
-    src_id = expr.children[0].dtype.id()
-    dst_id = expr.dtype.id()
-    if src_id == dst_id:
-        return True
-    return (
-        src_id == plc.TypeId.INT64 and dst_id == plc.TypeId.TIMESTAMP_NANOSECONDS
-    ) or (src_id == plc.TypeId.TIMESTAMP_NANOSECONDS and dst_id == plc.TypeId.INT64)
-
-
-def _unwrap_truncate_transparent_casts(expr: Expr) -> Expr:
-    while isinstance(expr, Cast) and _is_truncate_transparent_cast(expr):
-        (expr,) = expr.children
-    return expr
-
-
-def _truncate_source_name(expr: Expr) -> str | None:
-    expr = _unwrap_truncate_transparent_casts(expr)
-    if (
-        isinstance(expr, TemporalFunction)
-        and expr.name is TemporalFunction.Name.Truncate
-    ):
-        source = _unwrap_truncate_transparent_casts(expr.children[0])
-        if isinstance(source, Col):
-            return source.name
-    return None
-
-
-def _ordering_derivation(ne: NamedExpr) -> tuple[str, bool] | None:
-    """
-    Return derivation metadata for supported one-column ordering derivations.
-
-    This is intentionally narrow for now: only temporal truncation is recognized.
-    """
-    source_name = _truncate_source_name(ne.value)
-    if source_name is None:
-        return None
-    # Truncated boundaries may be non-strict.
-    return source_name, False
-
-
 def _derived_ordering(
     ordering: Ordering,
     ne: NamedExpr,
@@ -527,10 +486,10 @@ def _derived_ordering(
     if context is None:
         return None
 
-    derivation = _ordering_derivation(ne)
+    derivation = ordering_derivation(ne.value)
     if derivation is None:
         return None
-    source_name, strict_boundaries = derivation
+    source_name = derivation.source_name
 
     old_key_names = indices_to_names(ordering.column_indices, child_schema)
     try:
@@ -587,7 +546,7 @@ def _derived_ordering(
     return Ordering(
         keys,
         boundaries,
-        strict_boundaries=strict_boundaries,
+        strict_boundaries=derivation.strict_boundaries,
         locally_ordered=ordering.locally_ordered,
     )
 
