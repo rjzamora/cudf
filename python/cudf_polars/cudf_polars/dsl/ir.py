@@ -46,7 +46,7 @@ from pylibcudf import expressions as plc_expr
 import cudf_polars.dsl.expr as expr
 from cudf_polars.containers import Column, DataFrame, DataType
 from cudf_polars.containers.dataframe import NamedColumn
-from cudf_polars.dsl.expressions import rolling, unary
+from cudf_polars.dsl.expressions import dynamic, rolling, unary
 from cudf_polars.dsl.expressions.base import ExecutionContext
 from cudf_polars.dsl.nodebase import Node
 from cudf_polars.dsl.to_ast import _DECIMAL_IDS, to_ast, to_parquet_filter
@@ -2344,6 +2344,146 @@ def _has_struct_in_list(polars_type: pl.DataType) -> bool:
     while isinstance(current, pl.List):
         current = current.inner
     return isinstance(current, pl.Struct)
+
+
+class GroupByDynamic(IR):
+    """Perform a fixed-width dynamic groupby."""
+
+    __slots__ = (
+        "agg_requests",
+        "every",
+        "index_dtype",
+        "index_name",
+        "keys",
+        "offset",
+        "zlice",
+    )
+    _non_child = (
+        "schema",
+        "index_name",
+        "index_dtype",
+        "every",
+        "offset",
+        "keys",
+        "agg_requests",
+        "zlice",
+    )
+    _n_non_child_args = 8
+    index_name: str
+    """Index column used to assign rows to windows."""
+    index_dtype: DataType
+    """Datatype of the index column."""
+    every: int
+    """Fixed window width in physical index ticks."""
+    offset: int
+    """Window offset in physical index ticks."""
+    keys: tuple[expr.NamedExpr, ...]
+    """Additional grouping keys."""
+    agg_requests: tuple[expr.NamedExpr, ...]
+    """Aggregation expressions."""
+    zlice: Zlice | None
+    """Optional slice to apply after grouping."""
+
+    def __init__(
+        self,
+        schema: Schema,
+        index_name: str,
+        index_dtype: DataType,
+        every: int,
+        offset: int,
+        keys: Sequence[expr.NamedExpr],
+        agg_requests: Sequence[expr.NamedExpr],
+        zlice: Zlice | None,
+        df: IR,
+    ):
+        self.schema = schema
+        self.index_name = index_name
+        self.index_dtype = index_dtype
+        self.every = every
+        self.offset = offset
+        self.keys = tuple(keys)
+        self.agg_requests = tuple(agg_requests)
+        self.zlice = zlice
+        self.children = (df,)
+        self._non_child_args = (
+            schema,
+            index_name,
+            index_dtype,
+            every,
+            offset,
+            self.keys,
+            self.agg_requests,
+            zlice,
+        )
+
+    @property
+    def preserves_output_order(self) -> bool:
+        """Dynamic windows preserve index order for ungrouped inputs."""
+        return not self.keys
+
+    @staticmethod
+    def _sort_by_group_keys(df: DataFrame, keys: Sequence[expr.NamedExpr]) -> DataFrame:
+        """Return a frame stably sorted by the dynamic group keys."""
+        if not keys:
+            return df
+        sort_keys = broadcast(
+            *(key.evaluate(df) for key in keys),
+            target_length=df.num_rows,
+            stream=df.stream,
+        )
+        sorted_table = plc.sorting.stable_sort_by_key(
+            df.table,
+            plc.Table([key.obj for key in sort_keys]),
+            [plc.types.Order.ASCENDING] * len(sort_keys),
+            [plc.types.NullOrder.BEFORE] * len(sort_keys),
+            stream=df.stream,
+        )
+        return DataFrame(
+            (
+                Column(column, name=old.name, dtype=old.dtype)
+                for column, old in zip(sorted_table.columns(), df.columns, strict=True)
+            ),
+            stream=df.stream,
+        )
+
+    @classmethod
+    @log_do_evaluate
+    @nvtx_annotate_cudf_polars(message="GroupByDynamic")
+    def do_evaluate(
+        cls,
+        schema: Schema,
+        index_name: str,
+        index_dtype: DataType,
+        every: int,
+        offset: int,
+        keys: Sequence[expr.NamedExpr],
+        agg_requests: Sequence[expr.NamedExpr],
+        zlice: Zlice | None,
+        df: DataFrame,
+        *,
+        context: IRExecutionContext,
+    ) -> DataFrame:
+        """Evaluate and return a dataframe."""
+        df = cls._sort_by_group_keys(df, keys)
+        dynamic_key = expr.NamedExpr(
+            index_name,
+            dynamic.DynamicWindowLabel(
+                index_dtype,
+                every,
+                offset,
+                not keys,
+                expr.Col(index_dtype, index_name),
+            ),
+        )
+        return GroupBy.do_evaluate(
+            schema,
+            (*keys, dynamic_key),
+            agg_requests,
+            True,  # noqa: FBT003
+            zlice,
+            df,
+            context=context,
+        )
 
 
 class GroupBy(IR):

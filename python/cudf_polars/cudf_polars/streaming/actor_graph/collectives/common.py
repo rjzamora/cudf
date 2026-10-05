@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Literal
 
 from rapidsmpf.shuffler import Shuffler
 
-from cudf_polars.dsl.ir import Distinct, GroupBy, Sort
+from cudf_polars.dsl.ir import Distinct, GroupBy, GroupByDynamic, Sort
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.streaming.filter_hint import PushdownFilterHint
 from cudf_polars.streaming.io import StreamingScan, StreamingSink
@@ -108,6 +108,7 @@ class ReserveOpIDs:
                 StreamingScan,
                 Sort,
                 GroupBy,
+                GroupByDynamic,
                 Distinct,
                 Over,
                 PushdownFilterHint,
@@ -137,6 +138,13 @@ class ReserveOpIDs:
                     and self.dynamic_planning_enabled
                 ):
                     # GroupBy/Distinct need 2 IDs: one for size allgather, one for shuffle
+                    self.collective_id_map[node] = [
+                        _get_new_collective_id_unsafe(),
+                        _get_new_collective_id_unsafe(),
+                    ]
+                elif isinstance(node, GroupByDynamic) and self.dynamic_planning_enabled:
+                    # GroupByDynamic may need one ID to extract ordering metadata
+                    # and one ID to realign partitions by bucket boundaries.
                     self.collective_id_map[node] = [
                         _get_new_collective_id_unsafe(),
                         _get_new_collective_id_unsafe(),
