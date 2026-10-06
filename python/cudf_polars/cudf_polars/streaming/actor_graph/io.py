@@ -21,6 +21,7 @@ from cudf_streaming.table_chunk import (
     make_table_chunks_available_or_wait,
 )
 from rapidsmpf.memory.memory_reservation import opaque_memory_usage
+from rapidsmpf.streaming.coll.sparse_alltoall import SparseAlltoall
 from rapidsmpf.streaming.core.memory_reserve_or_wait import reserve_memory
 from rapidsmpf.streaming.core.message import Message
 
@@ -55,6 +56,8 @@ from cudf_polars.streaming.rank_aware_source import RankAwareSource
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
+
+    from polars import polars as plrs  # type: ignore[attr-defined]
 
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.streaming.core.channel import Channel
@@ -805,6 +808,71 @@ def _(
     return nodes, channels
 
 
+class _CallbackConsumer:
+    """Convert table chunks and invoke a callback on host batches."""
+
+    def __init__(
+        self,
+        callback: Callable[[plrs.PyDataFrame], bool],
+        chunk_size: int | None,
+        ir_context: IRExecutionContext,
+        context: Context,
+        input_ir: IR,
+    ) -> None:
+        self.callback = callback
+        self.chunk_size = chunk_size
+        self.ir_context = ir_context
+        self.context = context
+        self.input_ir = input_ir
+        self.stopped = False
+        self.pending: list[pl.DataFrame] = []
+        self.pending_rows = 0
+
+    async def consume(self, chunk: TableChunk) -> None:
+        """Convert a table chunk and invoke the callback on complete batches."""
+        if self.stopped:
+            return
+        chunk, _ = await make_table_chunks_available_or_wait(
+            self.context,
+            chunk,
+            reserve_extra=0,
+            net_memory_delta=-chunk.data_alloc_size(),
+        )
+        df = chunk_to_frame(chunk, self.input_ir)
+        host_df = await self.ir_context.to_thread(df.to_polars)
+        if self.chunk_size is None:
+            self.stopped = bool(
+                await self.ir_context.to_thread(self.callback, host_df._df)
+            )
+        elif host_df.height:
+            self.pending.append(host_df)
+            self.pending_rows += host_df.height
+            if self.pending_rows >= self.chunk_size:
+                combined = (
+                    self.pending[0]
+                    if len(self.pending) == 1
+                    else pl.concat(self.pending, rechunk=False)
+                )
+                while combined.height >= self.chunk_size:
+                    batch = combined.slice(0, self.chunk_size)
+                    combined = combined.slice(self.chunk_size)
+                    if await self.ir_context.to_thread(self.callback, batch._df):
+                        self.stopped = True
+                        break
+                self.pending = [combined] if combined.height else []
+                self.pending_rows = combined.height
+
+    async def finish(self) -> None:
+        """Invoke the callback on a final partial batch."""
+        if not self.stopped and self.pending_rows:
+            batch = (
+                self.pending[0]
+                if len(self.pending) == 1
+                else pl.concat(self.pending, rechunk=False)
+            )
+            await self.ir_context.to_thread(self.callback, batch._df)
+
+
 @define_actor()
 async def callback_sink_actor(
     context: Context,
@@ -813,8 +881,9 @@ async def callback_sink_actor(
     ir_context: IRExecutionContext,
     ch_in: Channel[TableChunk],
     ch_out: Channel[TableChunk],
+    collective_id: int,
 ) -> None:
-    """Invoke a Polars callback for each host batch, then return an empty result."""
+    """Invoke a callback on input batches and emit an empty result."""
     async with shutdown_on_error(
         context,
         chs_in=(ch_in,),
@@ -826,47 +895,63 @@ async def callback_sink_actor(
         await send_metadata(
             ch_out, context, ChannelMetadata(local_count=1, duplicated=True)
         )
-        callback = CallbackSink.load_function(ir.function)
-        skip_callback = metadata.duplicated and comm.rank != 0
-        stopped = False
-        pending: list[pl.DataFrame] = []
-        pending_rows = 0
-        while (msg := await ch_in.recv(context)) is not None:
-            if skip_callback or stopped:
-                continue
-            chunk = TableChunk.from_message(msg, br=context.br())
-            chunk, _ = await make_table_chunks_available_or_wait(
+        consumer = (
+            _CallbackConsumer(
+                CallbackSink.load_function(ir.function),
+                ir.chunk_size,
+                ir_context,
                 context,
-                chunk,
-                reserve_extra=0,
-                net_memory_delta=-chunk.data_alloc_size(),
+                ir.children[0],
             )
-            df = chunk_to_frame(chunk, ir.children[0])
-            host_df = await ir_context.to_thread(df.to_polars)
-            if ir.chunk_size is None:
-                stopped = bool(await ir_context.to_thread(callback, host_df._df))
-            elif host_df.height:
-                pending.append(host_df)
-                pending_rows += host_df.height
-                if pending_rows >= ir.chunk_size:
-                    combined = (
-                        pending[0]
-                        if len(pending) == 1
-                        else pl.concat(pending, rechunk=False)
+            if comm.rank == 0
+            else None
+        )
+
+        # For now, collect all chunks on rank 0 for processing
+        exchange = (
+            SparseAlltoall(
+                context,
+                comm,
+                collective_id,
+                srcs=range(1, comm.nranks) if comm.rank == 0 else (),
+                dsts=(0,) if comm.rank != 0 else (),
+            )
+            if comm.nranks > 1
+            else None
+        )
+
+        try:
+            while (msg := await ch_in.recv(context)) is not None:
+                if (consumer is not None and consumer.stopped) or (
+                    metadata.duplicated and comm.rank != 0
+                ):
+                    continue
+                chunk = TableChunk.from_message(msg, br=context.br())
+                if comm.rank == 0:
+                    assert consumer is not None
+                    await consumer.consume(chunk)
+                else:
+                    chunk, extra = await make_table_chunks_available_or_wait(
+                        context,
+                        chunk,
+                        reserve_extra=chunk.into_packed_data_cost(),
+                        net_memory_delta=0,
                     )
-                    while combined.height >= ir.chunk_size:
-                        batch = combined.slice(0, ir.chunk_size)
-                        combined = combined.slice(ir.chunk_size)
-                        if await ir_context.to_thread(callback, batch._df):
-                            stopped = True
-                            break
-                    pending = [combined] if combined.height else []
-                    pending_rows = combined.height
-        if not skip_callback and not stopped and pending_rows:
-            batch = (
-                pending[0] if len(pending) == 1 else pl.concat(pending, rechunk=False)
-            )
-            await ir_context.to_thread(callback, batch._df)
+                    assert exchange is not None
+                    exchange.insert(0, chunk.into_packed_data(extra))
+        finally:
+            if exchange is not None:
+                await exchange.insert_finished(context)
+
+        if comm.rank == 0:
+            assert consumer is not None
+            if exchange is not None:
+                for src in range(1, comm.nranks):
+                    for packed in exchange.extract(src):
+                        if not consumer.stopped:
+                            chunk = TableChunk.from_packed_data(packed, context.br())
+                            await consumer.consume(chunk)
+            await consumer.finish()
 
         empty_chunk = empty_table_chunk(ir, context, ir_context.get_cuda_stream())
         await ch_out.send(context, Message(0, empty_chunk))
@@ -887,6 +972,7 @@ def _(
             ir_context_for_node(rec, ir),
             channels[ir.children[0]].reserve_output_slot(),
             channels[ir].reserve_input_slot(),
+            rec.state["collective_id_map"][ir][0],
         )
     ]
     return nodes, channels

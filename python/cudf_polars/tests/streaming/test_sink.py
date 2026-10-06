@@ -156,7 +156,12 @@ def test_sink_ndjson(df, streaming_engine_factory, tmp_path, max_rows_per_partit
 
 @pytest.mark.parametrize(
     "max_rows_per_partition,chunk_size,expected_sizes",
-    [(10, 7, [7, 7, 7, 7, 2]), (1, 7, [7, 7, 7, 7, 2]), (1, 100, [30])],
+    [
+        (10, None, [10, 10, 10]),
+        (10, 7, [7, 7, 7, 7, 2]),
+        (1, 7, [7, 7, 7, 7, 2]),
+        (1, 100, [30]),
+    ],
 )
 def test_callback_sink_batches(
     df,
@@ -202,17 +207,76 @@ def test_callback_sink_stops_after_true(df, spmd_engine_factory, tmp_path):
 
 
 @pytest.mark.spmd
-def test_callback_sink_rejects_multiple_ranks(spmd_engine_factory):
-    engine = spmd_engine_factory(StreamingOptions(raise_on_fail=True))
-    if engine.comm.nranks == 1:
-        pytest.skip("requires multiple SPMD ranks")
+@pytest.mark.parametrize("chunk_size", [None, 3])
+@pytest.mark.parametrize("stop_after_first", [False, True])
+def test_callback_sink_multiple_ranks(
+    spmd_engine_factory, tmp_path, chunk_size, stop_after_first
+):
+    engine = spmd_engine_factory(
+        StreamingOptions(max_rows_per_partition=2, raise_on_fail=True)
+    )
+    rank = engine.comm.rank
+    output = tmp_path / "rank_batches.jsonl"
 
-    sink = pl.LazyFrame({"x": [1]}).sink_batches(lambda batch: None, lazy=True)
-    with pytest.raises(
-        NotImplementedError,
-        match="Callback sinks are not yet supported for multiple ranks",
-    ):
-        sink.collect(engine=engine)
+    def write_batch(batch: pl.DataFrame) -> bool:
+        with output.open("a") as file:
+            file.write(json.dumps(batch.to_dict(as_series=False)) + "\n")
+        return stop_after_first
+
+    df = pl.LazyFrame({"x": range(rank * 5, rank * 5 + 5)})
+    sink = df.sink_batches(write_batch, chunk_size=chunk_size, lazy=True)
+    assert sink.collect(engine=engine).shape == (0, 0)
+    if rank == 0:
+        batches = [json.loads(line) for line in output.read_text().splitlines()]
+        expected = list(range(engine.comm.nranks * 5))
+        if stop_after_first:
+            expected = expected[: chunk_size or 2]
+        assert [x for batch in batches for x in batch["x"]] == expected
+        if stop_after_first:
+            assert len(batches) == 1
+        elif chunk_size is not None:
+            assert all(len(batch["x"]) == chunk_size for batch in batches[:-1])
+    else:
+        assert not output.exists()
+
+
+@pytest.mark.spmd
+def test_callback_sink_empty_rank_zero(spmd_engine_factory, tmp_path):
+    engine = spmd_engine_factory(StreamingOptions(raise_on_fail=True))
+    output = tmp_path / "empty_rank_zero.jsonl"
+
+    def write_batch(batch: pl.DataFrame) -> None:
+        with output.open("a") as file:
+            file.write(json.dumps(batch.to_dict(as_series=False)) + "\n")
+
+    values = [] if engine.comm.rank == 0 else [engine.comm.rank]
+    df = pl.LazyFrame({"x": pl.Series(values, dtype=pl.Int64)})
+    df.sink_batches(write_batch, engine=engine)
+    if engine.comm.rank == 0 and engine.comm.nranks > 1:
+        batches = [json.loads(line) for line in output.read_text().splitlines()]
+        assert [x for batch in batches for x in batch["x"]] == list(
+            range(1, engine.comm.nranks)
+        )
+    else:
+        assert not output.exists()
+
+
+@pytest.mark.spmd
+def test_callback_sink_duplicated_input(spmd_engine_factory, tmp_path):
+    engine = spmd_engine_factory(StreamingOptions(raise_on_fail=True))
+    output = tmp_path / "duplicated_batches.jsonl"
+
+    def write_batch(batch: pl.DataFrame) -> None:
+        with output.open("a") as file:
+            file.write(json.dumps(batch.to_dict(as_series=False)) + "\n")
+
+    df = pl.LazyFrame({"x": [engine.comm.rank + 1]}).select(pl.col("x").sum())
+    df.sink_batches(write_batch, engine=engine)
+    if engine.comm.rank == 0:
+        batches = [json.loads(line) for line in output.read_text().splitlines()]
+        assert batches == [{"x": [sum(range(1, engine.comm.nranks + 1))]}]
+    else:
+        assert not output.exists()
 
 
 def test_callback_sink_pickle_metadata():

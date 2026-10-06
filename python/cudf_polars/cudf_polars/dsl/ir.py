@@ -1514,7 +1514,7 @@ class CallbackSink(IR):
         self.children = (df,)
 
     @staticmethod
-    def load_function(function: bytes) -> Callable[[Any], bool]:
+    def load_function(function: bytes) -> Callable[[polars.PyDataFrame], bool]:
         """Decode the callback stored in Polars' Sink payload."""
         # Polars prefixes the pickle payload with a cloudpickle flag and the
         # Python minor and micro versions used to serialize the function.

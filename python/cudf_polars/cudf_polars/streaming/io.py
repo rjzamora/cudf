@@ -932,10 +932,6 @@ def _(
     ir: CallbackSink, rec: LowerIRTransformer
 ) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
     child, partition_info = rec(ir.children[0])
-    if rec.state["nranks"] > 1:
-        raise NotImplementedError(
-            "Callback sinks are not yet supported for multiple ranks."
-        )
     result = ir.reconstruct([child])
     partition_info[result] = PartitionInfo(count=1)
     return result, partition_info

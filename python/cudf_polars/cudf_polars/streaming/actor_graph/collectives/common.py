@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Literal
 
 from rapidsmpf.shuffler import Shuffler
 
-from cudf_polars.dsl.ir import Distinct, GroupBy, Sort
+from cudf_polars.dsl.ir import CallbackSink, Distinct, GroupBy, Sort
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.streaming.filter_hint import PushdownFilterHint
 from cudf_polars.streaming.io import StreamingScan, StreamingSink
@@ -92,6 +92,7 @@ class ReserveOpIDs:
 
         # Find all collective IR nodes.
         collective_types: tuple[type, ...] = (
+            CallbackSink,
             Shuffle,
             Join,
             Repartition,
@@ -101,6 +102,7 @@ class ReserveOpIDs:
         )
         if self.dynamic_planning_enabled:
             collective_types = (
+                CallbackSink,
                 Shuffle,
                 Join,
                 Repartition,
