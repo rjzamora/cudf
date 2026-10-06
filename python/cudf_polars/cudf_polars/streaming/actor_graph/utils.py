@@ -687,6 +687,45 @@ def _remap_scheme_simple(
     return scheme  # None or "inherit" passes through unchanged
 
 
+def _remap_scheme_bindings(ir: IR, scheme: PartitioningScheme) -> PartitioningScheme:
+    old_to_new_names: defaultdict[str, dict[str, None]] = defaultdict(dict)
+    for output_name, source in column_domain_bindings(ir).items():
+        if source.child_index == 0:
+            old_to_new_names[source.name][output_name] = None
+
+    child = ir.children[0]
+    if isinstance(scheme, HashScheme):
+        old_key_names = indices_to_names(scheme.column_indices, child.schema)
+        if set(old_key_names).issubset(set(old_to_new_names)):
+            new_indices = names_to_indices(
+                tuple(
+                    _preferred_target_name(name, old_to_new_names[name])
+                    for name in old_key_names
+                ),
+                ir.schema,
+            )
+            return HashScheme(new_indices, scheme.modulus)
+        return None
+    if isinstance(scheme, OrderScheme):
+        new_orderings: list[Ordering] = []
+        for ordering in scheme.orderings:
+            old_key_names = indices_to_names(ordering.column_indices, child.schema)
+            if not set(old_key_names).issubset(set(old_to_new_names)):
+                continue
+            new_indices = names_to_indices(
+                tuple(
+                    _preferred_target_name(name, old_to_new_names[name])
+                    for name in old_key_names
+                ),
+                ir.schema,
+            )
+            new_orderings.append(_update_ordering_indices(ordering, new_indices))
+        if new_orderings:
+            return OrderScheme(new_orderings)
+        return None
+    return scheme
+
+
 def _hstack_to_select(hstack: HStack) -> Select:
     """Translate HStack to the equivalent Select node."""
     col_map = {ne.name: ne for ne in hstack.columns}
@@ -744,10 +783,8 @@ def maybe_remap_partitioning(
         )
     if isinstance(ir, (GroupBy, Rolling)):
         return Partitioning(
-            inter_rank=_remap_scheme_simple(
-                ir, partitioning.inter_rank, ir.children[0]
-            ),
-            local=_remap_scheme_simple(ir, partitioning.local, ir.children[0]),
+            inter_rank=_remap_scheme_bindings(ir, partitioning.inter_rank),
+            local=_remap_scheme_bindings(ir, partitioning.local),
         )
     if isinstance(ir, (Join, Projection, Filter)):
         child = child_ir if child_ir is not None else ir.children[0]

@@ -25,6 +25,7 @@ from cudf_streaming.table_chunk import TableChunk
 from cudf_polars import Translator
 from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.dsl import expr
+from cudf_polars.dsl.expressions.base import ExecutionContext
 from cudf_polars.dsl.ir import (
     DataFrameScan,
     GroupBy,
@@ -32,6 +33,7 @@ from cudf_polars.dsl.ir import (
     IRExecutionContext,
     MapFunction,
     Projection,
+    Rolling,
     Select,
     Sort,
 )
@@ -432,6 +434,59 @@ def test_remap_partitioning_groupby(streaming_engine) -> None:
     assert result.inter_rank.column_indices == expected
     assert result.inter_rank.modulus == 8
     assert result.local == "inherit"
+
+
+def test_remap_partitioning_drops_aggregation_alias(streaming_engine) -> None:
+    child = _make_select_ir(streaming_engine, ("a", "b")).children[0]
+    groupby = GroupBy(
+        {"a": child.schema["a"], "b": child.schema["b"]},
+        (expr.NamedExpr("a", expr.Col(child.schema["a"], "a")),),
+        (
+            expr.NamedExpr(
+                "b",
+                expr.Agg(
+                    child.schema["b"],
+                    "sum",
+                    None,
+                    ExecutionContext.GROUPBY,
+                    expr.Col(child.schema["b"], "b"),
+                ),
+            ),
+        ),
+        False,  # noqa: FBT003
+        None,
+        child,
+    )
+    rolling = Rolling(
+        {"a": child.schema["a"], "b": child.schema["b"]},
+        expr.NamedExpr("a", expr.Col(child.schema["a"], "a")),
+        plc.DataType(plc.TypeId.INT64),
+        -2,
+        0,
+        "right",
+        (),
+        (
+            expr.NamedExpr(
+                "b",
+                expr.Agg(
+                    child.schema["b"],
+                    "sum",
+                    None,
+                    ExecutionContext.ROLLING,
+                    expr.Col(child.schema["b"], "b"),
+                ),
+            ),
+        ),
+        None,
+        child,
+    )
+    part = Partitioning(inter_rank=HashScheme((1,), 8), local="inherit")
+
+    for node in (groupby, rolling):
+        result = maybe_remap_partitioning(node, part)
+        assert result is not None
+        assert result.inter_rank is None
+        assert result.local == "inherit"
 
 
 def test_remap_partitioning_hstack_appends_preserves_keys(streaming_engine) -> None:

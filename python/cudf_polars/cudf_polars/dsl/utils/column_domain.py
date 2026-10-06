@@ -17,6 +17,7 @@ from cudf_polars.dsl.ir import (
     HStack,
     Join,
     Projection,
+    Rolling,
     Select,
     Slice,
     Sort,
@@ -107,6 +108,15 @@ def _(node: GroupBy) -> Mapping[str, ColumnBinding]:
         key.name: ColumnBinding(0, key.value.name)
         for key in node.keys
         if isinstance(key.value, expr.Col)
+    }
+
+
+@column_domain_bindings.register(Rolling)
+def _(node: Rolling) -> Mapping[str, ColumnBinding]:
+    return {
+        item.name: ColumnBinding(0, item.value.name)
+        for item in (*node.keys, node.index)
+        if isinstance(item.value, expr.Col)
     }
 
 
