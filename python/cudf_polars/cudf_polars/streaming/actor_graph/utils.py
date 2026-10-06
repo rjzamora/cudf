@@ -48,6 +48,7 @@ from cudf_polars.dsl.ir import (
     HStack,
     Join,
     Projection,
+    Rolling,
     Select,
 )
 from cudf_polars.dsl.tracing import Scope
@@ -741,7 +742,7 @@ def maybe_remap_partitioning(
             inter_rank=_remap_scheme_select(ir, partitioning.inter_rank, context),
             local=_remap_scheme_select(ir, partitioning.local, context),
         )
-    if isinstance(ir, GroupBy):
+    if isinstance(ir, (GroupBy, Rolling)):
         return Partitioning(
             inter_rank=_remap_scheme_simple(
                 ir, partitioning.inter_rank, ir.children[0]

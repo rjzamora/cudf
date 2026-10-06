@@ -8,6 +8,7 @@ import datetime as dt
 import pytest
 
 import polars as pl
+from polars import polars as plrs  # type: ignore[attr-defined]
 from polars.testing import assert_frame_equal
 
 from cudf_polars.engine.options import StreamingOptions
@@ -110,6 +111,17 @@ def test_rolling_integer_edge_cases(engine, df) -> None:
         sum_values=pl.col("values").sum(),
         count=pl.len(),
     )
+
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.skipif(
+    not hasattr(plrs._expr_nodes, "RollingFunction"),
+    reason="RollingFunction not available in this polars version",
+)
+def test_fixed_size_rolling_mean(engine) -> None:
+    df = pl.LazyFrame({"x": [1.0, 2.0, 4.0, 8.0, 16.0]})
+    q = df.select(pl.col("x").rolling_mean(window_size=3))
 
     assert_gpu_result_equal(q, engine=engine)
 

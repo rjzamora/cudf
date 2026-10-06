@@ -17,6 +17,7 @@ from cudf_polars.streaming.io import StreamingScan, StreamingSink
 from cudf_polars.streaming.join import Join
 from cudf_polars.streaming.over import Over
 from cudf_polars.streaming.repartition import Repartition
+from cudf_polars.streaming.rolling import FixedSizeRolling
 from cudf_polars.streaming.shuffle import Shuffle
 
 if TYPE_CHECKING:
@@ -99,6 +100,7 @@ class ReserveOpIDs:
             StreamingScan,
             Sort,
             Rolling,
+            FixedSizeRolling,
         )
         if self.dynamic_planning_enabled:
             collective_types = (
@@ -109,6 +111,7 @@ class ReserveOpIDs:
                 StreamingScan,
                 Sort,
                 Rolling,
+                FixedSizeRolling,
                 GroupBy,
                 Distinct,
                 Over,
