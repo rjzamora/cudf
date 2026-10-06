@@ -311,6 +311,7 @@ def test_ordering_as_strict(
     assert strict_ordering.strict_boundaries
     assert strict_ordering.locally_ordered == ordering.locally_ordered
     assert not ordering.boundaries_aligned_with(strict_ordering, context.br())
+    assert strict_ordering.as_strict(context.br()) is strict_ordering
     assert strict_ordering.boundaries_aligned_with(
         strict_ordering2, context.br()
     )

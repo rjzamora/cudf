@@ -157,21 +157,33 @@ cdef class Ordering:
 
     def as_strict(self, BufferResource br not None) -> Ordering:
         """Return a strict ``Ordering`` with duplicate boundaries removed."""
+        if self.strict_boundaries:
+            return self
         boundaries = self.get_boundaries(br)
         boundary_table = boundaries.table_view()
         n_columns = boundary_table.num_columns()
+        stream = boundaries.stream
         unique_boundaries = plc.stream_compaction.unique(
             boundary_table,
             list(range(n_columns)),
             plc.stream_compaction.DuplicateKeepOption.KEEP_FIRST,
             plc.types.NullEquality.EQUAL,
-            stream=boundaries.stream,
+            stream=stream,
         )
+        if unique_boundaries.num_rows() == boundary_table.num_rows():
+            return Ordering.from_cpp(
+                cpp_Ordering(
+                    self._handle.keys,
+                    self._handle.boundaries,
+                    True,
+                    self._handle.locally_ordered,
+                )
+            )
         return Ordering(
             self.keys,
             TableChunk.from_pylibcudf_table(
                 unique_boundaries,
-                boundaries.stream,
+                stream,
                 exclusive_view=True,
                 br=br,
             ),
