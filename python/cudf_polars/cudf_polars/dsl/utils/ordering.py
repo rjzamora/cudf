@@ -21,10 +21,21 @@ __all__ = ["OrderingDerivation", "ordering_derivation"]
 
 @dataclass(frozen=True)
 class OrderingDerivation:
-    """A monotone output expression derived from a single input column."""
+    """
+    A monotone output expression derived from a single input column.
+
+    Attributes
+    ----------
+    source_name
+        Name of the input column whose ordering can be transformed.
+    preserves_strict_boundaries
+        Whether distinct source boundaries remain distinct after applying the
+        expression. The derived ordering is strict only when the source
+        ordering is strict and this value is true.
+    """
 
     source_name: str
-    strict_boundaries: bool
+    preserves_strict_boundaries: bool
 
 
 def _is_order_transparent_cast(expr: Cast) -> bool:
@@ -47,7 +58,7 @@ def _bucketed_derivation(source: Expr) -> OrderingDerivation | None:
     if (source_name := _source_column_name(source)) is None:
         return None
     # Adjacent input partitions can map to the same bucket label.
-    return OrderingDerivation(source_name, strict_boundaries=False)
+    return OrderingDerivation(source_name, preserves_strict_boundaries=False)
 
 
 @singledispatch
@@ -60,10 +71,7 @@ def ordering_derivation(expr: Expr) -> OrderingDerivation | None:
 def _(expr: Cast) -> OrderingDerivation | None:
     if not _is_order_transparent_cast(expr):
         return None
-    child = expr.children[0]
-    if isinstance(child, Col):
-        return OrderingDerivation(child.name, strict_boundaries=True)
-    return ordering_derivation(child)
+    return ordering_derivation(expr.children[0])
 
 
 @ordering_derivation.register

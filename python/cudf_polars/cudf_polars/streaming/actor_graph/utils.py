@@ -546,7 +546,9 @@ def _derived_ordering(
     return Ordering(
         keys,
         boundaries,
-        strict_boundaries=derivation.strict_boundaries,
+        strict_boundaries=(
+            ordering.strict_boundaries and derivation.preserves_strict_boundaries
+        ),
         locally_ordered=ordering.locally_ordered,
     )
 

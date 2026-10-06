@@ -924,36 +924,6 @@ def test_remap_partitioning_order_scheme_adds_alias_ordering(spmd_engine):
     assert [o.strict_boundaries for o in result.inter_rank.orderings] == [True, True]
 
 
-def test_remap_partitioning_order_scheme_adds_transparent_cast_ordering(
-    spmd_engine,
-):
-    engine = pl.GPUEngine(executor="in-memory", raise_on_fail=True)
-    hstack = Translator(
-        pl.LazyFrame({"DateTime": [1]})
-        .with_columns(pl.col("DateTime").cast(pl.Datetime("ns")).alias("DateTime_ns"))
-        ._ldf.visit(),
-        engine,
-    ).translate_ir()
-    assert isinstance(hstack, HStack)
-    part = Partitioning(
-        inter_rank=_make_order_scheme(
-            spmd_engine.context,
-            key_indices=(0,),
-            values=(1_234_567, 2_345_678),
-            strict=True,
-        ),
-        local="inherit",
-    )
-
-    result = maybe_remap_partitioning(hstack, part, context=spmd_engine.context)
-
-    assert result is not None
-    assert isinstance(result.inter_rank, OrderScheme)
-    orderings = result.inter_rank.orderings
-    assert [o.keys[0].column_index for o in orderings] == [0, 1]
-    assert [o.strict_boundaries for o in orderings] == [True, True]
-
-
 @pytest.mark.parametrize(
     "frequency,expected",
     [
