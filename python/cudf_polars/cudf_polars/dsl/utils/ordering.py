@@ -58,9 +58,12 @@ def ordering_derivation(expr: Expr) -> OrderingDerivation | None:
 
 @ordering_derivation.register
 def _(expr: Cast) -> OrderingDerivation | None:
-    if _is_order_transparent_cast(expr):
-        return ordering_derivation(expr.children[0])
-    return None
+    if not _is_order_transparent_cast(expr):
+        return None
+    child = expr.children[0]
+    if isinstance(child, Col):
+        return OrderingDerivation(child.name, strict_boundaries=True)
+    return ordering_derivation(child)
 
 
 @ordering_derivation.register
