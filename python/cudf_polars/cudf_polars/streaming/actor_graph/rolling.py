@@ -57,8 +57,12 @@ class RangeOverlap:
     """Range-window metadata for one buffered input chunk."""
 
     index_column: plc.Column
-    lower_bound: plc.Column
-    upper_bound: plc.Column
+    lower_bound_column: plc.Column
+    upper_bound_column: plc.Column
+    first: Any | None
+    last: Any | None
+    lower_bound: Any | None
+    upper_bound: Any | None
 
 
 @dataclass
@@ -161,6 +165,8 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
     index_dtype: plc.DataType
     find_start: Callable[..., plc.Column]
     find_end: Callable[..., plc.Column]
+    start_inclusive: bool
+    end_inclusive: bool
     stream: Stream
     index_name: str
     observed_streams: set[Stream] = field(default_factory=set)
@@ -171,16 +177,12 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
         """Create reusable range-bound state for the rolling actor."""
         (index,) = names_to_indices([ir.index.name], ir.children[0].schema)
         side = ir.closed_window
+        start_inclusive = side in ("both", "left")
+        end_inclusive = side not in ("both", "right")
         find_start = (
-            plc.search.lower_bound
-            if side in ("both", "left")
-            else plc.search.upper_bound
+            plc.search.lower_bound if start_inclusive else plc.search.upper_bound
         )
-        find_end = (
-            plc.search.upper_bound
-            if ir.closed_window in ("both", "right")
-            else plc.search.lower_bound
-        )
+        find_end = plc.search.lower_bound if end_inclusive else plc.search.upper_bound
         dtype = ir.index_dtype
         policy = cls(
             # Note: not using windows_to_offsets because that flips the sign of
@@ -195,6 +197,8 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
             dtype,
             find_start,
             find_end,
+            start_inclusive,
+            end_inclusive,
             stream,
             ir.index.name,
         )
@@ -219,15 +223,18 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
         """Check that the index remains sorted across chunk boundaries."""
         if cursor.num_rows == 0:
             return
-        first = index_value(cursor, 0, br=context.br())
-        if self.previous_index_value is not None and first < self.previous_index_value:
+        del context
+        assert cursor.overlap.first is not None
+        assert cursor.overlap.last is not None
+        if (
+            self.previous_index_value is not None
+            and cursor.overlap.first < self.previous_index_value
+        ):
             raise RuntimeError(
                 f"Index column '{self.index_name}' in rolling is not sorted, "
                 "please sort first"
             )
-        self.previous_index_value = index_value(
-            cursor, cursor.num_rows - 1, br=context.br()
-        )
+        self.previous_index_value = cursor.overlap.last
 
     async def prepare_chunk(
         self,
@@ -254,6 +261,7 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
                 )
         if nrows == 0:
             lower_bound = upper_bound = index_column
+            first = last = lower_bound_value = upper_bound_value = None
         else:
             lower_bound = index_with_offset(
                 index_column, 0, self.lower, chunk.stream, context.br()
@@ -261,12 +269,30 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
             upper_bound = index_with_offset(
                 index_column, nrows - 1, self.upper, chunk.stream, context.br()
             )
+            first = column_value(index_column, 0, stream=chunk.stream, br=context.br())
+            last = column_value(
+                index_column, nrows - 1, stream=chunk.stream, br=context.br()
+            )
+            lower_bound_value = _host_ordering_value(
+                lower_bound, stream=chunk.stream, br=context.br()
+            )
+            upper_bound_value = _host_ordering_value(
+                upper_bound, stream=chunk.stream, br=context.br()
+            )
         buffered = RangeBufferedChunk(
             msg.sequence_number,
             chunk,
             row_offset,
             nrows,
-            RangeOverlap(index_column, lower_bound, upper_bound),
+            RangeOverlap(
+                index_column,
+                lower_bound,
+                upper_bound,
+                first,
+                last,
+                lower_bound_value,
+                upper_bound_value,
+            ),
         )
         self.observe(buffered)
         return buffered
@@ -293,14 +319,26 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
         """Drop history chunks that cannot contribute to the cursor chunk."""
         if not history:
             return []
-        insertion_point = global_insertion_row(
-            history,
-            cursor.overlap.lower_bound,
-            self.find_start,
-            needle_stream=cursor.chunk.stream,
-            br=context.br(),
+        del context
+        return [
+            chunk
+            for chunk in history
+            if chunk_may_contain_insertion_point(
+                chunk,
+                cursor.overlap.lower_bound,
+                inclusive=self.start_inclusive,
+            )
+        ]
+
+    def has_complete_future(
+        self, chunk: RangeBufferedChunk, current: RangeBufferedChunk
+    ) -> bool:
+        """Return whether chunk contains current's upper insertion point."""
+        return chunk_may_contain_insertion_point(
+            chunk,
+            current.overlap.upper_bound,
+            inclusive=self.end_inclusive,
         )
-        return [chunk for chunk in history if chunk.row_stop > insertion_point]
 
     async def fill_future(
         self,
@@ -311,12 +349,8 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
         row_offset: int,
     ) -> tuple[bool, int]:
         """Read leading chunks until current has a complete range window."""
-        while not chunk_contains_upper_bound(
-            latest_nonempty_chunk(current, future),
-            current.overlap.upper_bound,
-            self.find_end,
-            needle_stream=current.chunk.stream,
-            br=context.br(),
+        while not self.has_complete_future(
+            latest_nonempty_chunk(current, future), current
         ):
             chunk, row_offset = await self.recv_chunk(
                 context, ch_in, row_offset=row_offset
@@ -340,15 +374,19 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
         chunks = [*history, cursor, *future]
         ghost_start = global_insertion_row(
             chunks,
+            cursor.overlap.lower_bound_column,
             cursor.overlap.lower_bound,
             self.find_start,
+            inclusive=self.start_inclusive,
             needle_stream=cursor.chunk.stream,
             br=context.br(),
         )
         ghost_stop = global_insertion_row(
             chunks,
+            cursor.overlap.upper_bound_column,
             cursor.overlap.upper_bound,
             self.find_end,
+            inclusive=self.end_inclusive,
             needle_stream=cursor.chunk.stream,
             br=context.br(),
         )
@@ -508,27 +546,46 @@ def _host_ordering_value(
     return value.to_scalar(stream=stream).to_py(stream=stream)
 
 
-def index_value(chunk: RangeBufferedChunk, row: int, *, br: BufferResource) -> Any:
-    """Return one index value from a non-empty buffered chunk."""
-    stream = chunk.chunk.stream
-    (value,) = plc.copying.slice(
-        chunk.overlap.index_column, [row, row + 1], stream=stream
-    )
+def column_value(
+    column: plc.Column, row: int, *, stream: Stream, br: BufferResource
+) -> Any:
+    """Return one value from a non-empty column."""
+    (value,) = plc.copying.slice(column, [row, row + 1], stream=stream)
     return _host_ordering_value(value, stream=stream, br=br)
+
+
+def chunk_may_contain_insertion_point(
+    chunk: RangeBufferedChunk,
+    needle_value: Any | None,
+    *,
+    inclusive: bool,
+) -> bool:
+    """Return whether chunk may contain a lower/upper-bound insertion point."""
+    if chunk.num_rows == 0:
+        return False
+    assert needle_value is not None
+    assert chunk.overlap.last is not None
+    if inclusive:
+        return chunk.overlap.last >= needle_value
+    return chunk.overlap.last > needle_value
 
 
 def global_insertion_row(
     chunks: Sequence[RangeBufferedChunk],
     needle: plc.Column,
+    needle_value: Any | None,
     find: Callable[..., plc.Column],
     *,
+    inclusive: bool,
     needle_stream: Stream,
     br: BufferResource,
 ) -> int:
     """Return the globally indexed insertion row of a needle in some chunks."""
     assert len(chunks) > 0
     for chunk in chunks:
-        if chunk.num_rows == 0:
+        if not chunk_may_contain_insertion_point(
+            chunk, needle_value, inclusive=inclusive
+        ):
             continue
         stream = chunk.chunk.stream
         join_cuda_streams(downstreams=[stream], upstreams=[needle_stream])
@@ -551,21 +608,6 @@ def global_insertion_row(
             return chunk.row_start + insertion_point
     # Needle is later than all the chunks we know about.
     return chunks[-1].row_stop
-
-
-def chunk_contains_upper_bound(
-    chunk: RangeBufferedChunk,
-    needle: plc.Column,
-    find: Callable[..., plc.Column],
-    *,
-    needle_stream: Stream,
-    br: BufferResource,
-) -> bool:
-    """Return whether no future chunk can add rows to this upper bound."""
-    insertion_row = global_insertion_row(
-        [chunk], needle, find, needle_stream=needle_stream, br=br
-    )
-    return insertion_row < chunk.num_rows + chunk.row_start
 
 
 def latest_nonempty_chunk(
