@@ -56,6 +56,8 @@ class FixedSizeRolling(IR):
         self.preceding_overlap = preceding_overlap
         self.following_overlap = following_overlap
         self.children = (df,)
+        # Keep overlap fields in _non_child for reconstruction/hashing, but
+        # not in _non_child_args because in-memory evaluation is just Select.
         self._non_child_args = (self.exprs, should_broadcast)
 
     @classmethod
