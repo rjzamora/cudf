@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING, Literal
 
 from rapidsmpf.shuffler import Shuffler
 
-from cudf_polars.dsl.ir import CallbackSink, Distinct, GroupBy, Sort
+from cudf_polars.dsl.ir import (
+    CallbackSink,
+    Distinct,
+    GroupBy,
+    Rolling,
+    Sort,
+)
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.streaming.filter_hint import PushdownFilterHint
 from cudf_polars.streaming.io import StreamingScan, StreamingSink
@@ -99,6 +105,7 @@ class ReserveOpIDs:
             StreamingSink,
             StreamingScan,
             Sort,
+            Rolling,
         )
         if self.dynamic_planning_enabled:
             collective_types = (
@@ -109,6 +116,7 @@ class ReserveOpIDs:
                 StreamingSink,
                 StreamingScan,
                 Sort,
+                Rolling,
                 GroupBy,
                 Distinct,
                 Over,
