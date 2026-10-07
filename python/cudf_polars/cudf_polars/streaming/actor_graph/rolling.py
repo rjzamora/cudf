@@ -26,11 +26,12 @@ from cudf_polars.dsl.utils.windows import duration_to_scalar
 from cudf_polars.streaming.actor_graph.collectives.allgather import AllGatherManager
 from cudf_polars.streaming.actor_graph.collectives.overlap import (
     BufferedChunk,
+    RankValueRangeRouter,
     ResolvedRowSend,
     RowExchange,
+    RowExchangeKind,
     RowExchangePlan,
-    ValueRangeRouter,
-    exchange_payload_chunks,
+    exchange_control_chunks,
     exchange_resolved_slices,
     extract_region,
     gather_row_counts,
@@ -103,9 +104,20 @@ class RangeRankStats:
 BufferedChunkT = TypeVar("BufferedChunkT", bound=BufferedChunk)
 _INT64_DTYPE = DataType(pl.Int64())
 
+_PL_POLARS_INTEGER_TYPES = {
+    plc.TypeId.INT8: pl.Int8(),
+    plc.TypeId.INT16: pl.Int16(),
+    plc.TypeId.INT32: pl.Int32(),
+    plc.TypeId.INT64: pl.Int64(),
+    plc.TypeId.UINT8: pl.UInt8(),
+    plc.TypeId.UINT16: pl.UInt16(),
+    plc.TypeId.UINT32: pl.UInt32(),
+    plc.TypeId.UINT64: pl.UInt64(),
+}
 
-class OverlapPolicy(Protocol[BufferedChunkT]):
-    """Protocol for staging overlap around a cursor chunk."""
+
+class LocalRollingPolicy(Protocol[BufferedChunkT]):
+    """Protocol for local evaluation over ghost-expanded cursor chunks."""
 
     def observe(self, chunk: BufferedChunkT) -> None:
         """Record resources that must outlive chunk processing."""
@@ -164,7 +176,7 @@ class OverlapPolicy(Protocol[BufferedChunkT]):
 
 
 @dataclass
-class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
+class RangeOverlapPolicy(LocalRollingPolicy[RangeBufferedChunk]):
     """Overlap policy for range-based rolling windows."""
 
     lower: plc.Scalar
@@ -179,6 +191,13 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
     index_name: str
     observed_streams: set[Stream] = field(default_factory=set)
     previous_index_value: Any | None = None
+
+    @property
+    def request_dtype(self) -> plc.DataType:
+        """Return the compact scalar dtype used for range exchange payloads."""
+        if plc.traits.is_chrono(self.index_dtype):
+            return _chrono_storage_dtype(self.index_dtype)
+        return self.index_dtype
 
     @classmethod
     def from_ir(cls, ir: Rolling, stream: Stream) -> RangeOverlapPolicy:
@@ -227,6 +246,23 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
                 upstreams=tuple(self.observed_streams),
             )
 
+    def validate_index_column(self, index_column: plc.Column, stream: Stream) -> None:
+        """Validate chunk-local ordering before using search primitives."""
+        if index_column.null_count() != 0:
+            raise RuntimeError(
+                f"Index column '{self.index_name}' in rolling may not contain nulls"
+            )
+        if index_column.size() > 1 and not plc.sorting.is_sorted(
+            plc.Table([index_column]),
+            [plc.types.Order.ASCENDING],
+            [plc.types.NullOrder.BEFORE],
+            stream=stream,
+        ):
+            raise RuntimeError(
+                f"Index column '{self.index_name}' in rolling is not sorted, "
+                "please sort first"
+            )
+
     def validate_cursor(self, context: Context, cursor: RangeBufferedChunk) -> None:
         """Check that the index remains sorted across chunk boundaries."""
         if cursor.num_rows == 0:
@@ -251,6 +287,7 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
         chunk: TableChunk,
         *,
         row_offset: int,
+        host_window_bounds: bool = False,
     ) -> RangeBufferedChunk:
         """Stage a chunk and extract its physical index bounds."""
         nrows, _ = chunk.shape
@@ -267,6 +304,7 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
                 index_column = plc.unary.cast(
                     index_column, self.index_dtype, stream=chunk.stream
                 )
+            self.validate_index_column(index_column, chunk.stream)
         if nrows == 0:
             lower_bound = upper_bound = index_column
             first = last = lower_bound_value = upper_bound_value = None
@@ -281,12 +319,15 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
             last = column_value(
                 index_column, nrows - 1, stream=chunk.stream, br=context.br()
             )
-            lower_bound_value = _host_ordering_value(
-                lower_bound, stream=chunk.stream, br=context.br()
-            )
-            upper_bound_value = _host_ordering_value(
-                upper_bound, stream=chunk.stream, br=context.br()
-            )
+            if host_window_bounds:
+                lower_bound_value = _host_ordering_value(
+                    lower_bound, stream=chunk.stream, br=context.br()
+                )
+                upper_bound_value = _host_ordering_value(
+                    upper_bound, stream=chunk.stream, br=context.br()
+                )
+            else:
+                lower_bound_value = upper_bound_value = None
         return RangeBufferedChunk(
             sequence_number,
             chunk,
@@ -309,6 +350,7 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
         msg: Message,
         *,
         row_offset: int,
+        host_window_bounds: bool = False,
     ) -> RangeBufferedChunk:
         """Convert a message to a staged chunk and extract its physical index."""
         buffered = await self.prepare_table_chunk(
@@ -316,6 +358,7 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
             msg.sequence_number,
             TableChunk.from_message(msg, br=context.br()),
             row_offset=row_offset,
+            host_window_bounds=host_window_bounds,
         )
         self.observe(buffered)
         return buffered
@@ -326,11 +369,17 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
         ch_in: Channel[TableChunk],
         *,
         row_offset: int,
+        host_window_bounds: bool = False,
     ) -> tuple[RangeBufferedChunk | None, int]:
         """Receive and prepare one input chunk."""
         if (msg := await ch_in.recv(context)) is None:
             return None, row_offset
-        chunk = await self.prepare_chunk(context, msg, row_offset=row_offset)
+        chunk = await self.prepare_chunk(
+            context,
+            msg,
+            row_offset=row_offset,
+            host_window_bounds=host_window_bounds,
+        )
         return chunk, chunk.row_stop
 
     def evict_history(
@@ -342,26 +391,50 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
         """Drop history chunks that cannot contribute to the cursor chunk."""
         if not history:
             return []
-        del context
-        return [
-            chunk
-            for chunk in history
-            if chunk_may_contain_insertion_point(
-                chunk,
-                cursor.overlap.lower_bound,
-                inclusive=self.start_inclusive,
-            )
-        ]
+        if cursor.overlap.lower_bound is not None:
+            return [
+                chunk
+                for chunk in history
+                if chunk_may_contain_insertion_point(
+                    chunk,
+                    cursor.overlap.lower_bound,
+                    inclusive=self.start_inclusive,
+                )
+            ]
+        insertion_point = global_insertion_row(
+            history,
+            cursor.overlap.lower_bound_column,
+            None,
+            self.find_start,
+            inclusive=self.start_inclusive,
+            needle_stream=cursor.chunk.stream,
+            br=context.br(),
+        )
+        return [chunk for chunk in history if chunk.row_stop > insertion_point]
 
     def has_complete_future(
-        self, chunk: RangeBufferedChunk, current: RangeBufferedChunk
+        self,
+        chunk: RangeBufferedChunk,
+        current: RangeBufferedChunk,
+        context: Context,
     ) -> bool:
         """Return whether chunk contains current's upper insertion point."""
-        return chunk_may_contain_insertion_point(
-            chunk,
-            current.overlap.upper_bound,
+        if current.overlap.upper_bound is not None:
+            return chunk_may_contain_insertion_point(
+                chunk,
+                current.overlap.upper_bound,
+                inclusive=self.end_inclusive,
+            )
+        insertion_point = global_insertion_row(
+            [chunk],
+            current.overlap.upper_bound_column,
+            None,
+            self.find_end,
             inclusive=self.end_inclusive,
+            needle_stream=current.chunk.stream,
+            br=context.br(),
         )
+        return insertion_point < chunk.row_stop
 
     async def fill_future(
         self,
@@ -373,7 +446,7 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
     ) -> tuple[bool, int]:
         """Read leading chunks until current has a complete range window."""
         while not self.has_complete_future(
-            latest_nonempty_chunk(current, future), current
+            latest_nonempty_chunk(current, future), current, context
         ):
             chunk, row_offset = await self.recv_chunk(
                 context, ch_in, row_offset=row_offset
@@ -395,6 +468,24 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
     ) -> TableChunk:
         """Evaluate the rolling aggregation for the cursor chunk."""
         chunks = [*history, cursor, *future]
+        return await self.evaluate_cursor_with_chunks(
+            context,
+            ir,
+            ir_context,
+            cursor,
+            chunks=chunks,
+        )
+
+    async def evaluate_cursor_with_chunks(
+        self,
+        context: Context,
+        ir: IR,
+        ir_context: IRExecutionContext,
+        cursor: RangeBufferedChunk,
+        *,
+        chunks: Sequence[RangeBufferedChunk],
+    ) -> TableChunk:
+        """Evaluate the cursor against an already assembled context."""
         ghost_start = global_insertion_row(
             chunks,
             cursor.overlap.lower_bound_column,
@@ -428,19 +519,11 @@ class RangeOverlapPolicy(OverlapPolicy[RangeBufferedChunk]):
 
 
 @dataclass
-class RowCountOverlapPolicy(OverlapPolicy[BufferedChunk]):
+class RowCountOverlapPolicy(LocalRollingPolicy[BufferedChunk]):
     """Overlap policy for fixed-size rolling expressions."""
 
     preceding: int
     following: int
-
-    def row_slice_exchange_plan(self, row_counts: Sequence[int]) -> RowExchangePlan:
-        """Return the inter-rank row-count slice exchange plan."""
-        return RowExchangePlan.from_row_counts(
-            row_counts,
-            preceding=self.preceding,
-            following=self.following,
-        )
 
     def observe(self, chunk: BufferedChunk) -> None:
         """Row-count overlap has no policy-owned chunk resources."""
@@ -595,7 +678,8 @@ def chunk_may_contain_insertion_point(
     """Return whether chunk may contain a lower/upper-bound insertion point."""
     if chunk.num_rows == 0:
         return False
-    assert needle_value is not None
+    if needle_value is None:
+        return True
     assert chunk.overlap.last is not None
     if inclusive:
         return chunk.overlap.last >= needle_value
@@ -661,7 +745,7 @@ async def evaluate_available_chunk(
 ) -> TableChunk:
     """Evaluate an already available chunk."""
     reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
-        chunk.data_alloc_size(), net_memory_delta=-chunk.data_alloc_size()
+        chunk.data_alloc_size(), net_memory_delta=0
     )
     with opaque_memory_usage(reservation):
         return await ir_context.to_thread(
@@ -698,12 +782,26 @@ async def evaluate_ghosted_cursor(
         [cursor.row_start - ghost_start, cursor.row_stop - ghost_start],
         stream=result.stream,
     )
+    result_bytes = sum(column.device_buffer_size() for column in table.columns())
+    reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
+        result_bytes, net_memory_delta=result_bytes
+    )
+    with opaque_memory_usage(reservation):
+        table = table.copy(result.stream, context.br().device_mr)
     return TableChunk.from_pylibcudf_table(
-        table.copy(result.stream, context.br().device_mr),
+        table,
         result.stream,
         exclusive_view=True,
         br=context.br(),
     )
+
+
+def _fixed_width_dtype(dtype: plc.DataType) -> DataType:
+    """Return the corresponding cudf-polars dtype for an integer payload."""
+    try:
+        return DataType(_PL_POLARS_INTEGER_TYPES[dtype.id()])
+    except KeyError as err:
+        raise NotImplementedError(f"Unsupported overlap payload dtype {dtype}") from err
 
 
 async def _recv_all_fixed_size_chunks(
@@ -733,7 +831,10 @@ async def _recv_all_range_chunks(
     row_offset = 0
     while True:
         chunk, row_offset = await policy.recv_chunk(
-            context, ch_in, row_offset=row_offset
+            context,
+            ch_in,
+            row_offset=row_offset,
+            host_window_bounds=True,
         )
         if chunk is None:
             return chunks, row_offset
@@ -770,23 +871,30 @@ def _range_stats_chunk(
     context: Context,
     stats: RangeRankStats,
     stream: Stream,
+    dtype: plc.DataType,
 ) -> TableChunk:
-    """Return one row of int64 range stats for all-gather."""
-    dtype = plc.DataType(plc.TypeId.INT64)
+    """Return one row of range stats for all-gather."""
+    row_count_dtype = plc.DataType(plc.TypeId.INT64)
     table = plc.Table(
         [
             plc.Column.from_scalar(
-                plc.Scalar.from_py(value, dtype, stream=stream),
+                plc.Scalar.from_py(stats.row_count, row_count_dtype, stream=stream),
                 1,
                 stream=stream,
-            )
-            for value in (
-                stats.row_count,
-                stats.first,
-                stats.last,
-                stats.lower_bound,
-                stats.upper_bound,
-            )
+            ),
+            *(
+                plc.Column.from_scalar(
+                    plc.Scalar.from_py(value, dtype, stream=stream),
+                    1,
+                    stream=stream,
+                )
+                for value in (
+                    stats.first,
+                    stats.last,
+                    stats.lower_bound,
+                    stats.upper_bound,
+                )
+            ),
         ]
     )
     return TableChunk.from_pylibcudf_table(
@@ -804,17 +912,20 @@ async def gather_range_stats(
     local_stats: RangeRankStats,
     *,
     collective_id: int,
+    dtype: plc.DataType,
 ) -> list[RangeRankStats]:
     """Collect range-window stats from every rank."""
     stream = context.br().stream_pool.get_stream()
     ag = AllGatherManager(context, comm, collective_id)
     with ag.inserting() as inserter:
-        await inserter.insert(0, _range_stats_chunk(context, local_stats, stream))
+        await inserter.insert(
+            0, _range_stats_chunk(context, local_stats, stream, dtype)
+        )
     table = await ag.extract_concatenated(stream, ordered=True, ir_context=ir_context)
     stats = DataFrame.from_table(
         table,
         ["row_count", "first", "last", "lower_bound", "upper_bound"],
-        [_INT64_DTYPE] * 5,
+        [_INT64_DTYPE, *[_fixed_width_dtype(dtype)] * 4],
         stream,
     ).to_polars()
     if len(stats) != comm.nranks:
@@ -893,9 +1004,9 @@ def _rank_request_bounds(stats: RangeRankStats) -> ValueRange | None:
     return min(value_range), max(value_range)
 
 
-def _range_router(rank_stats: Sequence[RangeRankStats]) -> ValueRangeRouter:
-    """Return a value-range router for inter-rank range overlap."""
-    return ValueRangeRouter(
+def _range_router(rank_stats: Sequence[RangeRankStats]) -> RankValueRangeRouter:
+    """Return a rank-endpoint router for inter-rank range overlap."""
+    return RankValueRangeRouter(
         tuple(_rank_source_range(stats) for stats in rank_stats),
         tuple(_rank_request_bounds(stats) for stats in rank_stats),
     )
@@ -953,10 +1064,10 @@ def _range_requests_by_source(
 def _range_request_chunk(
     context: Context,
     requests: Sequence[ValueRange],
+    dtype: plc.DataType,
 ) -> TableChunk:
     """Return a table chunk containing value-range requests."""
     stream = context.br().stream_pool.get_stream()
-    dtype = plc.DataType(plc.TypeId.INT64)
     lower = plc.Column.from_iterable_of_py(
         [request[0] for request in requests],
         dtype,
@@ -975,12 +1086,15 @@ def _range_request_chunk(
     )
 
 
-def _range_requests_from_chunk(chunk: TableChunk) -> list[ValueRange]:
+def _range_requests_from_chunk(
+    chunk: TableChunk,
+    dtype: plc.DataType,
+) -> list[ValueRange]:
     """Read value-range requests from an internal request chunk."""
     requests = DataFrame.from_table(
         chunk.table_view(),
         ["lower", "upper"],
-        [_INT64_DTYPE, _INT64_DTYPE],
+        [_fixed_width_dtype(dtype)] * 2,
         chunk.stream,
     ).to_polars()
     return list(requests.iter_rows())
@@ -1077,6 +1191,9 @@ async def _prepare_exchanged_range_chunks(
     """Attach range-overlap metadata to exchanged chunks."""
     result: list[RangeBufferedChunk] = []
     for chunk in chunks:
+        if isinstance(chunk, RangeBufferedChunk):
+            result.append(chunk)
+            continue
         range_chunk = await policy.prepare_table_chunk(
             context,
             chunk.sequence_number,
@@ -1088,13 +1205,27 @@ async def _prepare_exchanged_range_chunks(
     return result
 
 
-async def execute_rolling_policy(
+def _range_multirank_supported(policy: RangeOverlapPolicy) -> bool:
+    """Return whether the current range payload codec can represent the index."""
+    return policy.request_dtype.id() in {
+        plc.TypeId.INT8,
+        plc.TypeId.INT16,
+        plc.TypeId.INT32,
+        plc.TypeId.INT64,
+        plc.TypeId.UINT8,
+        plc.TypeId.UINT16,
+        plc.TypeId.UINT32,
+        plc.TypeId.UINT64,
+    }
+
+
+async def execute_local_rolling_policy(
     context: Context,
     ir: IR,
     ir_context: IRExecutionContext,
     ch_out: Channel[TableChunk],
     ch_in: Channel[TableChunk],
-    policy: OverlapPolicy[Any],
+    policy: LocalRollingPolicy[Any],
     tracer: ActorTracer | None,
 ) -> None:
     """Evaluate ordered chunks with contiguous ghost regions."""
@@ -1178,7 +1309,11 @@ async def execute_fixed_size_multirank_policy(
         local_rows=local_rows,
         collective_id=collective_id,
     )
-    plan = policy.row_slice_exchange_plan(row_counts)
+    plan = RowExchangePlan.from_row_counts(
+        row_counts,
+        preceding=policy.preceding,
+        following=policy.following,
+    )
 
     local_start, _ = plan.source_span(comm.rank)
     for chunk in local_chunks:
@@ -1243,6 +1378,7 @@ async def execute_range_multirank_policy(
         ir_context,
         local_stats,
         collective_id=collective_id,
+        dtype=policy.request_dtype,
     )
     _validate_global_range_ordering(rank_stats)
     source_spans = _source_spans_from_rank_stats(rank_stats)
@@ -1261,10 +1397,11 @@ async def execute_range_multirank_policy(
         request_destinations,
     )
     request_chunks = {
-        destination: _range_request_chunk(context, range_requests.get(destination, ()))
-        for destination in request_destinations
+        destination: _range_request_chunk(context, requests, policy.request_dtype)
+        for destination, requests in range_requests.items()
+        if requests
     }
-    remote_request_chunks = await exchange_payload_chunks(
+    remote_request_chunks = await exchange_control_chunks(
         context,
         comm,
         ir_context,
@@ -1275,10 +1412,12 @@ async def execute_range_multirank_policy(
     sends: list[ResolvedRowSend] = []
     for destination, chunks in remote_request_chunks.items():
         requests = [
-            request for chunk in chunks for request in _range_requests_from_chunk(chunk)
+            request
+            for chunk in chunks
+            for request in _range_requests_from_chunk(chunk, policy.request_dtype)
         ]
         sends.extend(
-            ResolvedRowSend(destination, start, stop, is_ghost=True)
+            ResolvedRowSend(destination, start, stop, RowExchangeKind.GHOST)
             for start, stop in _resolve_range_requests(
                 context,
                 policy,
@@ -1292,6 +1431,7 @@ async def execute_range_multirank_policy(
         ir_context,
         local_chunks,
         local_owned_intervals=((local_start, local_stop),),
+        local_empty_span=(local_start, local_stop),
         sends=sends,
         sources=tuple(sorted(range_requests)),
         collective_id=collective_id,
@@ -1316,14 +1456,12 @@ async def execute_range_multirank_policy(
                 ir_context=ir_context,
             )
         else:
-            cursor_index = all_chunks.index(cursor)
-            result = await policy.evaluate_cursor(
+            result = await policy.evaluate_cursor_with_chunks(
                 context,
                 ir,
                 ir_context,
                 cursor,
-                history=all_chunks[:cursor_index],
-                future=all_chunks[cursor_index + 1 :],
+                chunks=all_chunks,
             )
         if tracer is not None:
             tracer.add_chunk(chunk=result)
@@ -1356,7 +1494,7 @@ async def overlap_actor(
         metadata_in = await recv_metadata(ch_in, context)
         partitioning = (
             maybe_remap_partitioning(ir, metadata_in.partitioning, context=context)
-            if isinstance(ir, Rolling)
+            if isinstance(ir, (Rolling, FixedSizeRolling))
             else None
         )
         await send_metadata(
@@ -1371,12 +1509,16 @@ async def overlap_actor(
         if tracer is not None and metadata_in.duplicated:
             tracer.set_duplicated()
 
-        policy: OverlapPolicy[Any]
+        policy: LocalRollingPolicy[Any]
         if isinstance(ir, Rolling):
             policy = RangeOverlapPolicy.from_ir(
                 ir, context.br().stream_pool.get_stream()
             )
-            if comm.nranks != 1 and not metadata_in.duplicated:
+            if (
+                comm.nranks != 1
+                and not metadata_in.duplicated
+                and _range_multirank_supported(policy)
+            ):
                 await execute_range_multirank_policy(
                     context,
                     comm,
@@ -1389,6 +1531,11 @@ async def overlap_actor(
                     collective_id=collective_id,
                 )
                 return
+            if comm.nranks != 1 and not metadata_in.duplicated:
+                raise NotImplementedError(
+                    "Range rolling with this index dtype is not supported "
+                    "for multiple ranks"
+                )
         else:
             policy = RowCountOverlapPolicy(ir.preceding_overlap, ir.following_overlap)
             if comm.nranks != 1 and not metadata_in.duplicated:
@@ -1404,7 +1551,7 @@ async def overlap_actor(
                     collective_id=collective_id,
                 )
                 return
-        await execute_rolling_policy(
+        await execute_local_rolling_policy(
             context,
             ir,
             ir_context,

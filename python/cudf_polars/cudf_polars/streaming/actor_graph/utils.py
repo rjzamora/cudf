@@ -60,6 +60,7 @@ from cudf_polars.streaming.actor_graph.tracing import (
     record_channel_metrics,
     send_chunk,
 )
+from cudf_polars.streaming.rolling import FixedSizeRolling
 from cudf_polars.streaming.utils import _concat
 from cudf_polars.utils.dtypes import make_empty_column
 
@@ -591,7 +592,9 @@ def _derived_ordering(
     )
 
 
-def _select_column_targets(select: Select) -> dict[str, dict[str, None]]:
+def _select_column_targets(
+    select: Select | FixedSizeRolling,
+) -> dict[str, dict[str, None]]:
     old_to_new_names: defaultdict[str, dict[str, None]] = defaultdict(dict)
     for output_name, source in column_domain_bindings(select).items():
         old_to_new_names[source.name][output_name] = None
@@ -603,7 +606,9 @@ def _preferred_target_name(old_name: str, targets: dict[str, None]) -> str:
 
 
 def _remap_scheme_select(
-    select: Select, scheme: PartitioningScheme, context: Context | None
+    select: Select | FixedSizeRolling,
+    scheme: PartitioningScheme,
+    context: Context | None,
 ) -> PartitioningScheme:
     if isinstance(scheme, HashScheme):
         old_to_new_names = _select_column_targets(select)
@@ -773,7 +778,7 @@ def maybe_remap_partitioning(
     """
     if partitioning is None:
         return None  # Nothing to preserve
-    if isinstance(ir, (Select, HStack)):
+    if isinstance(ir, (Select, HStack, FixedSizeRolling)):
         if isinstance(ir, HStack):
             # HStack is a special case of Select
             ir = _hstack_to_select(ir)

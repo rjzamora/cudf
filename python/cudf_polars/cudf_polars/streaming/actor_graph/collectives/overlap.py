@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any
 
 import polars as pl
@@ -53,14 +54,17 @@ def value_ranges_overlap(
 
 
 @dataclass(frozen=True)
-class ValueRangeRouter:
+class RankValueRangeRouter:
     """
-    Route logical value-range requests to candidate source ranks.
+    Route logical value-range requests with rank-level endpoint stats.
 
     ``source_ranges`` describe values each source rank may own. ``request_ranges``
     describe values each destination rank may need. The router is conservative:
     overlapping ranges mean a request may be needed, not that rows must be sent.
     Source ranks still resolve exact payloads locally.
+
+    This is intentionally coarser than an Ordering-boundary router. It only
+    knows one value range per rank.
     """
 
     source_ranges: tuple[ValueRange | None, ...]
@@ -110,6 +114,13 @@ class RowExchangeResult:
 
     owned: list[BufferedChunk]
     ghosts: list[BufferedChunk]
+
+
+class RowExchangeKind(IntEnum):
+    """Kind of row payload carried by a row-slice exchange."""
+
+    OWNED = 0
+    GHOST = 1
 
 
 @dataclass(frozen=True)
@@ -271,7 +282,7 @@ class ResolvedRowSend:
     destination: int
     start: int
     stop: int
-    is_ghost: bool
+    kind: RowExchangeKind
 
 
 class RowExchange:
@@ -298,13 +309,13 @@ class RowExchange:
         sends: list[ResolvedRowSend] = []
         for dst in self.plan.remote_destinations(self.comm.rank):
             sends.extend(
-                ResolvedRowSend(dst, start, stop, is_ghost=False)
+                ResolvedRowSend(dst, start, stop, RowExchangeKind.OWNED)
                 for start, stop in self.plan.owned_intervals_from_source(
                     self.comm.rank, dst
                 )
             )
             sends.extend(
-                ResolvedRowSend(dst, start, stop, is_ghost=True)
+                ResolvedRowSend(dst, start, stop, RowExchangeKind.GHOST)
                 for start, stop in self.plan.ghost_intervals_from_source(
                     self.comm.rank, dst
                 )
@@ -317,6 +328,7 @@ class RowExchange:
             local_owned_intervals=self.plan.owned_intervals_from_source(
                 self.comm.rank, self.comm.rank
             ),
+            local_empty_span=self.plan.output_span(self.comm.rank),
             sends=sends,
             sources=self.plan.remote_sources(self.comm.rank),
             collective_id=self.collective_id,
@@ -330,6 +342,7 @@ async def exchange_resolved_slices(
     local_chunks: Sequence[BufferedChunk],
     *,
     local_owned_intervals: Sequence[RowRange],
+    local_empty_span: RowRange | None = None,
     sends: Sequence[ResolvedRowSend],
     sources: Sequence[int],
     collective_id: int,
@@ -340,6 +353,7 @@ async def exchange_resolved_slices(
         ir_context,
         local_chunks,
         local_owned_intervals,
+        local_empty_span=local_empty_span,
     )
     destinations = tuple(sorted({send.destination for send in sends}))
     if not sources and not destinations:
@@ -374,12 +388,12 @@ async def exchange_resolved_slices(
                 f"from rank {src}: got {len(pieces)}"
             )
         for metadata, data in zip(pieces[::2], pieces[1::2], strict=True):
-            start, stop, is_ghost = await _unpack_slice_metadata(
+            start, stop, kind = await _unpack_slice_metadata(
                 context, ir_context, metadata
             )
             chunk = await _unpack_sparse_chunk(context, ir_context, [data])
             buffered = BufferedChunk(-1, chunk, start, stop - start)
-            if is_ghost:
+            if kind == RowExchangeKind.GHOST:
                 ghosts.append(buffered)
             else:
                 owned.append(buffered)
@@ -389,7 +403,7 @@ async def exchange_resolved_slices(
     )
 
 
-async def exchange_payload_chunks(
+async def exchange_control_chunks(
     context: Context,
     comm: Communicator,
     ir_context: IRExecutionContext,
@@ -398,7 +412,7 @@ async def exchange_payload_chunks(
     sources: Sequence[int],
     collective_id: int,
 ) -> dict[int, list[TableChunk]]:
-    """Exchange arbitrary overlap-control payloads by source rank."""
+    """Exchange compact overlap request/state chunks by source rank."""
     if not sources and not chunks_by_destination:
         return {}
     exchange = SparseAlltoall(
@@ -425,6 +439,8 @@ async def _local_owned_chunks(
     ir_context: IRExecutionContext,
     local_chunks: Sequence[BufferedChunk],
     intervals: Sequence[RowRange],
+    *,
+    local_empty_span: RowRange | None = None,
 ) -> list[BufferedChunk]:
     """Return rows this rank already owns after boundary routing."""
     owned: list[BufferedChunk] = []
@@ -441,7 +457,22 @@ async def _local_owned_chunks(
                 copy_result=False,
             )
         )
+    if local_empty_span is not None:
+        start, stop = local_empty_span
+        owned.extend(
+            replace(chunk, sequence_number=-1)
+            for chunk in local_chunks
+            if chunk.num_rows == 0
+            and _empty_chunk_in_span(chunk.row_start, start, stop)
+        )
     return owned
+
+
+def _empty_chunk_in_span(row_start: int, start: int, stop: int) -> bool:
+    """Return whether an empty chunk belongs to a possibly-empty span."""
+    if start == stop:
+        return row_start == start
+    return start <= row_start < stop
 
 
 async def _send_resolved_slice(
@@ -458,7 +489,7 @@ async def _send_resolved_slice(
         context,
         send.start,
         send.stop,
-        is_ghost=send.is_ghost,
+        kind=send.kind,
     )
     chunk = await extract_region(
         context,
@@ -477,7 +508,7 @@ def _slice_metadata_chunk(
     start: int,
     stop: int,
     *,
-    is_ghost: bool,
+    kind: RowExchangeKind,
 ) -> TableChunk:
     """Return a one-row metadata chunk for a resolved slice."""
     stream = context.br().stream_pool.get_stream()
@@ -489,7 +520,7 @@ def _slice_metadata_chunk(
                 1,
                 stream=stream,
             )
-            for value in (start, stop, int(is_ghost))
+            for value in (start, stop, int(kind))
         ]
     )
     return TableChunk.from_pylibcudf_table(
@@ -504,20 +535,20 @@ async def _unpack_slice_metadata(
     context: Context,
     ir_context: IRExecutionContext,
     piece: PackedData,
-) -> tuple[int, int, bool]:
+) -> tuple[int, int, RowExchangeKind]:
     """Unpack one resolved-slice metadata payload."""
     chunk = await _unpack_sparse_chunk(context, ir_context, [piece])
     metadata = (
         DataFrame.from_table(
             chunk.table_view(),
-            ["start", "stop", "is_ghost"],
+            ["start", "stop", "kind"],
             [_INT64_DTYPE, _INT64_DTYPE, _INT64_DTYPE],
             chunk.stream,
         )
         .to_polars()
         .row(0)
     )
-    return metadata[0], metadata[1], bool(metadata[2])
+    return metadata[0], metadata[1], RowExchangeKind(metadata[2])
 
 
 def _range_intersection(left: RowRange, right: RowRange) -> RowRange | None:
@@ -571,9 +602,10 @@ def _sorted_chunks_with_sequence_numbers(
 ) -> list[BufferedChunk]:
     """Return chunks sorted by row position and numbered in output order."""
     result = sorted(chunks, key=lambda chunk: (chunk.row_start, chunk.sequence_number))
-    for sequence_number, chunk in enumerate(result):
-        chunk.sequence_number = sequence_number
-    return result
+    return [
+        replace(chunk, sequence_number=sequence_number)
+        for sequence_number, chunk in enumerate(result)
+    ]
 
 
 def _validate_chunk_coverage(
@@ -602,7 +634,7 @@ async def extract_region_chunks(
 ) -> list[BufferedChunk]:
     """Slice buffered chunks intersecting a complete global row range."""
     _validate_chunk_coverage(input_chunks, row_start, row_stop)
-    chunks: list[TableChunk] = []
+    result: list[BufferedChunk] = []
     expected_start = row_start
     for buf in input_chunks:
         if buf.row_start >= row_stop:
@@ -615,6 +647,7 @@ async def extract_region_chunks(
                     "Buffered chunks do not cover requested row range "
                     f"[{row_start}, {row_stop})"
                 )
+            full_chunk = start == buf.row_start and stop == buf.row_stop
             if start == buf.row_start and stop == buf.row_stop:
                 chunk = buf.chunk
             else:
@@ -639,17 +672,17 @@ async def extract_region_chunks(
                         exclusive_view=True,
                         br=context.br(),
                     )
-            chunks.append(chunk)
+            if full_chunk and not copy_result:
+                result.append(replace(buf, sequence_number=-1))
+            else:
+                result.append(BufferedChunk(-1, chunk, start, chunk.shape[0]))
             expected_start = stop
     if expected_start != row_stop:
         raise RuntimeError(
             "Buffered chunks do not cover requested row range "
             f"[{row_start}, {row_stop})"
         )
-    return [
-        BufferedChunk(-1, chunk, start, chunk.shape[0])
-        for chunk, start in zip(chunks, _chunk_starts(chunks, row_start), strict=True)
-    ]
+    return result
 
 
 async def extract_region(
@@ -689,16 +722,6 @@ async def extract_region(
         return TableChunk.from_pylibcudf_table(
             table, stream=stream, exclusive_view=True, br=context.br()
         )
-
-
-def _chunk_starts(chunks: Sequence[TableChunk], row_start: int) -> list[int]:
-    """Return global row starts for chunks known to be contiguous."""
-    starts: list[int] = []
-    cursor = row_start
-    for chunk in chunks:
-        starts.append(cursor)
-        cursor += chunk.shape[0]
-    return starts
 
 
 def _row_count_chunk(context: Context, row_count: int, stream: Stream) -> TableChunk:

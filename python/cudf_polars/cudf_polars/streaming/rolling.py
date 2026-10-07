@@ -6,8 +6,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar
 
+from cudf_polars.dsl import expr
 from cudf_polars.dsl.ir import IR, Rolling, Select
 from cudf_polars.dsl.tracing import log_do_evaluate, nvtx_annotate_cudf_polars
+from cudf_polars.dsl.utils.column_domain import ColumnBinding, column_domain_bindings
 from cudf_polars.streaming.base import PartitionInfo
 from cudf_polars.streaming.dispatch import lower_ir_node
 from cudf_polars.streaming.utils import _lower_ir_fallback
@@ -16,7 +18,6 @@ if TYPE_CHECKING:
     from collections.abc import MutableMapping, Sequence
 
     from cudf_polars.containers import DataFrame
-    from cudf_polars.dsl import expr
     from cudf_polars.dsl.ir import IRExecutionContext
     from cudf_polars.streaming.dispatch import LowerIRTransformer
     from cudf_polars.typing import Schema
@@ -82,6 +83,16 @@ def _(
     new_node = ir.reconstruct([child])
     partition_info[new_node] = PartitionInfo(count=partition_info[child].count)
     return new_node, partition_info
+
+
+@column_domain_bindings.register(FixedSizeRolling)
+def _(node: FixedSizeRolling) -> dict[str, ColumnBinding]:
+    """Return direct passthrough bindings for fixed-size rolling outputs."""
+    return {
+        item.name: ColumnBinding(0, item.value.name)
+        for item in node.exprs
+        if isinstance(item.value, expr.Col)
+    }
 
 
 @lower_ir_node.register(Rolling)
