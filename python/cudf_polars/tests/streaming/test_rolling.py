@@ -119,9 +119,10 @@ def test_rolling_integer_edge_cases(engine, df) -> None:
     not hasattr(plrs._expr_nodes, "RollingFunction"),
     reason="RollingFunction not available in this polars version",
 )
-def test_fixed_size_rolling_mean(engine) -> None:
+@pytest.mark.parametrize("center", [False, True])
+def test_fixed_size_rolling_mean(engine, center) -> None:
     df = pl.LazyFrame({"x": [1.0, 2.0, 4.0, 8.0, 16.0]})
-    q = df.select(pl.col("x").rolling_mean(window_size=3))
+    q = df.select(pl.col("x").rolling_mean(window_size=3, center=center))
 
     assert_gpu_result_equal(q, engine=engine)
 

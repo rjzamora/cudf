@@ -7,17 +7,23 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
+import polars as pl
+
 import pylibcudf as plc
 from cudf_streaming.channel_metadata import ChannelMetadata
+from cudf_streaming.partition_utils import unpack_and_concat, unpack_and_concat_cost
 from cudf_streaming.table_chunk import (
     TableChunk,
     make_table_chunks_available_or_wait,
 )
 from rapidsmpf.memory.buffer import MemoryType
 from rapidsmpf.memory.memory_reservation import opaque_memory_usage
+from rapidsmpf.streaming.coll.sparse_alltoall import SparseAlltoall
 from rapidsmpf.streaming.core.actor import define_actor
+from rapidsmpf.streaming.core.memory_reserve_or_wait import reserve_memory
 from rapidsmpf.streaming.core.message import Message
 
+from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.dsl.ir import IR, Rolling
 from cudf_polars.dsl.utils.windows import duration_to_scalar
 from cudf_polars.streaming.actor_graph.collectives.allgather import AllGatherManager
@@ -42,6 +48,7 @@ if TYPE_CHECKING:
 
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.memory.buffer_resource import BufferResource
+    from rapidsmpf.memory.packed_data import PackedData
     from rapidsmpf.streaming.core.channel import Channel
     from rapidsmpf.streaming.core.context import Context
     from rmm.pylibrmm.stream import Stream
@@ -50,6 +57,10 @@ if TYPE_CHECKING:
     from cudf_polars.streaming.actor_graph.dispatch import SubNetGenerator
     from cudf_polars.streaming.actor_graph.tracing import ActorTracer
     from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
+
+
+RowRange = tuple[int, int]
+_INT64_DTYPE = DataType(pl.Int64())
 
 
 @dataclass
@@ -620,6 +631,102 @@ def latest_nonempty_chunk(
     return current
 
 
+def _range_intersection(left: RowRange, right: RowRange) -> RowRange | None:
+    """Return the non-empty intersection of two row ranges."""
+    start = max(left[0], right[0])
+    stop = min(left[1], right[1])
+    if start < stop:
+        return start, stop
+    return None
+
+
+def _row_starts(row_counts: Sequence[int]) -> list[int]:
+    """Return global row starts for a sequence of per-rank row counts."""
+    starts = [0]
+    for count in row_counts:
+        starts.append(starts[-1] + count)
+    return starts
+
+
+def _rank_span(row_offsets: Sequence[int], rank: int) -> RowRange:
+    """Return the global row range owned by one rank."""
+    return row_offsets[rank], row_offsets[rank + 1]
+
+
+def _request_spans(
+    owned: RowRange,
+    *,
+    preceding: int,
+    following: int,
+    total_rows: int,
+) -> list[RowRange]:
+    """Return ghost spans needed to evaluate a rank-owned row range."""
+    start, stop = owned
+    if start == stop:
+        return []
+    spans: list[RowRange] = []
+    if preceding > 0:
+        spans.append((max(0, start - preceding), start))
+    if following > 0:
+        spans.append((stop, min(total_rows, stop + following)))
+    return [span for span in spans if span[0] < span[1]]
+
+
+def _requested_source_intervals(
+    row_offsets: Sequence[int],
+    source_rank: int,
+    requests: Sequence[RowRange],
+) -> list[RowRange]:
+    """Return rows a source rank owns that intersect requested spans."""
+    source_span = _rank_span(row_offsets, source_rank)
+    intervals = [
+        interval
+        for request in requests
+        if (interval := _range_intersection(source_span, request)) is not None
+    ]
+    return sorted(intervals)
+
+
+def _remote_sources_for_requests(
+    row_offsets: Sequence[int],
+    my_rank: int,
+    requests: Sequence[RowRange],
+) -> list[int]:
+    """Return remote ranks that can satisfy requested ghost spans."""
+    return [
+        rank
+        for rank in range(len(row_offsets) - 1)
+        if rank != my_rank and _requested_source_intervals(row_offsets, rank, requests)
+    ]
+
+
+def _remote_destinations_for_owned_rows(
+    row_offsets: Sequence[int],
+    my_rank: int,
+    *,
+    preceding: int,
+    following: int,
+    total_rows: int,
+) -> list[int]:
+    """Return remote ranks that need ghost rows owned by this rank."""
+    my_span = _rank_span(row_offsets, my_rank)
+    if my_span[0] == my_span[1]:
+        return []
+    destinations: list[int] = []
+    for rank in range(len(row_offsets) - 1):
+        if rank == my_rank:
+            continue
+        requests = _request_spans(
+            _rank_span(row_offsets, rank),
+            preceding=preceding,
+            following=following,
+            total_rows=total_rows,
+        )
+        if _requested_source_intervals(row_offsets, my_rank, requests):
+            destinations.append(rank)
+    return destinations
+
+
 async def extract_region(
     context: Context,
     input_chunks: Sequence[BufferedChunk],
@@ -627,6 +734,7 @@ async def extract_region(
     row_stop: int,
     *,
     ir_context: IRExecutionContext,
+    copy_result: bool = False,
 ) -> TableChunk:
     """Slice all buffered chunks intersecting a global row range."""
     chunks: list[TableChunk] = []
@@ -657,7 +765,19 @@ async def extract_region(
                 )
     assert chunks, "Should have found at least one chunk to extract from"
     if len(chunks) == 1:
-        return chunks[0]
+        chunk = chunks[0]
+        if not copy_result:
+            return chunk
+        reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
+            chunk.data_alloc_size(), net_memory_delta=0
+        )
+        with opaque_memory_usage(reservation):
+            return TableChunk.from_pylibcudf_table(
+                chunk.table_view().copy(chunk.stream, context.br().device_mr),
+                chunk.stream,
+                exclusive_view=True,
+                br=context.br(),
+            )
     reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
         sum(chunk.data_alloc_size() for chunk in chunks), net_memory_delta=0
     )
@@ -730,6 +850,109 @@ async def evaluate_ghosted_cursor(
     )
 
 
+def _row_count_chunk(context: Context, row_count: int, stream: Stream) -> TableChunk:
+    """Return a single-row chunk containing one int64 row count."""
+    col = plc.Column.from_scalar(
+        plc.Scalar.from_py(
+            row_count,
+            plc.DataType(plc.TypeId.INT64),
+            stream=stream,
+        ),
+        1,
+        stream=stream,
+    )
+    return TableChunk.from_pylibcudf_table(
+        plc.Table([col]),
+        stream,
+        exclusive_view=True,
+        br=context.br(),
+    )
+
+
+async def _gather_row_counts(
+    context: Context,
+    comm: Communicator,
+    ir_context: IRExecutionContext,
+    *,
+    local_rows: int,
+    collective_id: int,
+) -> list[int]:
+    """Collect one local row count from every rank."""
+    stream = context.br().stream_pool.get_stream()
+    ag = AllGatherManager(context, comm, collective_id)
+    with ag.inserting() as inserter:
+        await inserter.insert(0, _row_count_chunk(context, local_rows, stream))
+    table = await ag.extract_concatenated(stream, ordered=True, ir_context=ir_context)
+    counts = (
+        DataFrame.from_table(table, ["row_count"], [_INT64_DTYPE], stream)
+        .to_polars()["row_count"]
+        .to_list()
+    )
+    assert len(counts) == comm.nranks
+    return counts
+
+
+async def _recv_all_fixed_size_chunks(
+    context: Context,
+    ch_in: Channel[TableChunk],
+    policy: RowCountOverlapPolicy,
+) -> tuple[list[BufferedChunk], int]:
+    """Drain a fixed-size rolling input channel into available chunks."""
+    chunks: list[BufferedChunk] = []
+    row_offset = 0
+    while True:
+        chunk, row_offset = await policy.recv_chunk(
+            context, ch_in, row_offset=row_offset
+        )
+        if chunk is None:
+            return chunks, row_offset
+        chunks.append(chunk)
+
+
+async def _insert_sparse_chunk(
+    context: Context,
+    exchange: SparseAlltoall,
+    dst: int,
+    chunk: TableChunk,
+) -> None:
+    """Insert one table chunk into a sparse all-to-all exchange."""
+    chunk, extra = await make_table_chunks_available_or_wait(
+        context,
+        chunk,
+        reserve_extra=chunk.into_packed_data_cost(),
+        net_memory_delta=0,
+    )
+    exchange.insert(dst, chunk.into_packed_data(extra))
+    del chunk
+
+
+async def _unpack_sparse_chunk(
+    context: Context,
+    ir_context: IRExecutionContext,
+    pieces: Sequence[PackedData],
+) -> TableChunk:
+    """Unpack one expected sparse all-to-all payload into a table chunk."""
+    stream = context.br().stream_pool.get_stream()
+    reservation = await reserve_memory(
+        context,
+        unpack_and_concat_cost(pieces),
+        net_memory_delta=0,
+    )
+    table = await ir_context.to_thread(
+        unpack_and_concat,
+        partitions=pieces,
+        stream=stream,
+        br=context.br(),
+        reservation=reservation,
+    )
+    return TableChunk.from_pylibcudf_table(
+        table,
+        stream,
+        exclusive_view=True,
+        br=context.br(),
+    )
+
+
 async def execute_rolling_policy(
     context: Context,
     ir: IR,
@@ -795,6 +1018,131 @@ async def execute_rolling_policy(
         policy.close()
 
 
+async def execute_fixed_size_multirank_policy(
+    context: Context,
+    comm: Communicator,
+    ir: FixedSizeRolling,
+    ir_context: IRExecutionContext,
+    ch_out: Channel[TableChunk],
+    ch_in: Channel[TableChunk],
+    policy: RowCountOverlapPolicy,
+    tracer: ActorTracer | None,
+    *,
+    collective_id: int,
+) -> None:
+    """Evaluate fixed-size rolling with sparse inter-rank ghost slices."""
+    local_chunks, local_rows = await _recv_all_fixed_size_chunks(
+        context,
+        ch_in,
+        policy,
+    )
+    row_counts = await _gather_row_counts(
+        context,
+        comm,
+        ir_context,
+        local_rows=local_rows,
+        collective_id=collective_id,
+    )
+    row_offsets = _row_starts(row_counts)
+    total_rows = row_offsets[-1]
+    local_start, local_stop = _rank_span(row_offsets, comm.rank)
+    local_requests = _request_spans(
+        (local_start, local_stop),
+        preceding=policy.preceding,
+        following=policy.following,
+        total_rows=total_rows,
+    )
+    remote_sources = _remote_sources_for_requests(
+        row_offsets,
+        comm.rank,
+        local_requests,
+    )
+    remote_destinations = _remote_destinations_for_owned_rows(
+        row_offsets,
+        comm.rank,
+        preceding=policy.preceding,
+        following=policy.following,
+        total_rows=total_rows,
+    )
+
+    for chunk in local_chunks:
+        chunk.row_start += local_start
+
+    ghost_chunks: list[BufferedChunk] = []
+    if remote_sources or remote_destinations:
+        exchange = SparseAlltoall(
+            context,
+            comm,
+            collective_id,
+            srcs=remote_sources,
+            dsts=remote_destinations,
+        )
+        for dst in remote_destinations:
+            dst_requests = _request_spans(
+                _rank_span(row_offsets, dst),
+                preceding=policy.preceding,
+                following=policy.following,
+                total_rows=total_rows,
+            )
+            intervals = _requested_source_intervals(
+                row_offsets,
+                comm.rank,
+                dst_requests,
+            )
+            for start, stop in intervals:
+                chunk = await extract_region(
+                    context,
+                    local_chunks,
+                    start,
+                    stop,
+                    ir_context=ir_context,
+                    copy_result=True,
+                )
+                await _insert_sparse_chunk(context, exchange, dst, chunk)
+
+        await exchange.insert_finished(context)
+
+        for src in remote_sources:
+            expected = _requested_source_intervals(
+                row_offsets,
+                src,
+                local_requests,
+            )
+            pieces = exchange.extract(src)
+            assert len(pieces) == len(expected)
+            for (start, stop), piece in zip(expected, pieces, strict=True):
+                chunk = await _unpack_sparse_chunk(context, ir_context, [piece])
+                ghost_chunks.append(BufferedChunk(-1, chunk, start, stop - start))
+
+    all_chunks = sorted(
+        [*ghost_chunks, *local_chunks],
+        key=lambda chunk: (chunk.row_start, chunk.sequence_number),
+    )
+    for cursor in local_chunks:
+        if cursor.num_rows == 0:
+            result = await evaluate_available_chunk(
+                context,
+                cursor.chunk,
+                ir,
+                ir_context=ir_context,
+            )
+        else:
+            result = await evaluate_ghosted_cursor(
+                context,
+                ir,
+                ir_context,
+                cursor,
+                chunks=all_chunks,
+                ghost_start=max(0, cursor.row_start - policy.preceding),
+                ghost_stop=min(total_rows, cursor.row_stop + policy.following),
+            )
+        if tracer is not None:
+            tracer.add_chunk(chunk=result)
+        await ch_out.send(context, Message(cursor.sequence_number, result))
+
+    await ch_out.drain(context)
+
+
 async def evaluate_allgathered(
     context: Context,
     comm: Communicator,
@@ -847,7 +1195,7 @@ async def overlap_actor(
         ir_context=ir_context,
     ) as tracer:
         metadata_in = await recv_metadata(ch_in, context)
-        if comm.nranks != 1 and not metadata_in.duplicated:
+        if isinstance(ir, Rolling) and comm.nranks != 1 and not metadata_in.duplicated:
             _fallback_inform(
                 "Rolling does not support multi-rank inputs. "
                 "Falling back to all-gather evaluation.",
@@ -898,6 +1246,19 @@ async def overlap_actor(
             )
         else:
             policy = RowCountOverlapPolicy(ir.preceding_overlap, ir.following_overlap)
+            if comm.nranks != 1 and not metadata_in.duplicated:
+                await execute_fixed_size_multirank_policy(
+                    context,
+                    comm,
+                    ir,
+                    ir_context,
+                    ch_out,
+                    ch_in,
+                    policy,
+                    tracer,
+                    collective_id=collective_id,
+                )
+                return
         await execute_rolling_policy(
             context,
             ir,
