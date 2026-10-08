@@ -44,6 +44,7 @@ from cudf_polars.streaming.actor_graph.collectives.sort import (
 )
 from cudf_polars.streaming.actor_graph.core import evaluate_logical_plan
 from cudf_polars.streaming.actor_graph.hint_sorted import extract_hint_sorted_metadata
+from cudf_polars.streaming.actor_graph.rolling import _merge_learned_inter_rank
 from cudf_polars.streaming.actor_graph.utils import (
     NormalizedPartitioning,
     _apply_ordering_metadata,
@@ -951,6 +952,38 @@ def test_remap_partitioning_order_scheme_drops_key(spmd_engine):
     result = maybe_remap_partitioning(_make_select_ir(engine, ("b",)), part)
     assert result is not None
     assert result.inter_rank is None
+
+
+def test_rolling_learned_inter_rank_preserves_local_metadata(spmd_engine):
+    """Learned rolling boundaries fill inter-rank metadata only."""
+    existing_local = HashScheme((1,), 8)
+    existing = Partitioning(inter_rank=None, local=existing_local)
+    learned_inter_rank = _make_order_scheme(spmd_engine.context, key_indices=(0,))
+    learned = Partitioning(inter_rank=learned_inter_rank, local="inherit")
+
+    result = _merge_learned_inter_rank(existing, learned)
+
+    assert result is not None
+    assert isinstance(result.inter_rank, OrderScheme)
+    assert result.inter_rank.orderings[0].boundaries_aligned_with(
+        learned_inter_rank.orderings[0],
+        spmd_engine.context.br(),
+    )
+    assert result.local == existing_local
+
+
+def test_rolling_learned_inter_rank_does_not_replace_existing(spmd_engine):
+    """Existing inter-rank metadata wins over learned rolling boundaries."""
+    existing_inter_rank = HashScheme((1,), 8)
+    existing = Partitioning(inter_rank=existing_inter_rank, local="inherit")
+    learned = Partitioning(
+        inter_rank=_make_order_scheme(spmd_engine.context, key_indices=(0,)),
+        local="inherit",
+    )
+
+    result = _merge_learned_inter_rank(existing, learned)
+
+    assert result is existing
 
 
 def test_remap_partitioning_order_scheme_adds_alias_ordering(spmd_engine):
