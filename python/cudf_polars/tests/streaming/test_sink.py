@@ -255,6 +255,44 @@ def test_callback_sink_multiple_ranks(
 
 
 @pytest.mark.spmd
+@pytest.mark.parametrize("maintain_order", [False, True])
+def test_callback_sink_parallel_option(spmd_engine_factory, tmp_path, maintain_order):
+    engine = spmd_engine_factory(
+        StreamingOptions(
+            max_rows_per_partition=2,
+            parallel_sink_batches=True,
+            raise_on_fail=True,
+        )
+    )
+    rank = engine.comm.rank
+    output = tmp_path / f"parallel_rank_{rank}.jsonl"
+
+    def write_batch(batch: pl.DataFrame) -> None:
+        with output.open("a") as file:
+            file.write(json.dumps(batch.to_dict(as_series=False)) + "\n")
+
+    df = pl.LazyFrame({"x": range(rank * 5, rank * 5 + 5)})
+    df.sink_batches(
+        write_batch,
+        chunk_size=3,
+        maintain_order=maintain_order,
+        engine=engine,
+    )
+
+    if maintain_order and rank != 0:
+        assert not output.exists()
+    else:
+        batches = [json.loads(line) for line in output.read_text().splitlines()]
+        expected = (
+            list(range(engine.comm.nranks * 5))
+            if maintain_order
+            else list(range(rank * 5, rank * 5 + 5))
+        )
+        assert [x for batch in batches for x in batch["x"]] == expected
+        assert all(len(batch["x"]) == 3 for batch in batches[:-1])
+
+
+@pytest.mark.spmd
 def test_callback_sink_empty_rank_zero(spmd_engine_factory, tmp_path):
     engine = spmd_engine_factory(StreamingOptions(raise_on_fail=True))
     output = tmp_path / "empty_rank_zero.jsonl"
@@ -276,8 +314,16 @@ def test_callback_sink_empty_rank_zero(spmd_engine_factory, tmp_path):
 
 
 @pytest.mark.spmd
-def test_callback_sink_duplicated_input(spmd_engine_factory, tmp_path):
-    engine = spmd_engine_factory(StreamingOptions(raise_on_fail=True))
+@pytest.mark.parametrize("parallel_sink_batches", [False, True])
+def test_callback_sink_duplicated_input(
+    spmd_engine_factory, tmp_path, parallel_sink_batches
+):
+    engine = spmd_engine_factory(
+        StreamingOptions(
+            parallel_sink_batches=parallel_sink_batches,
+            raise_on_fail=True,
+        )
+    )
     output = tmp_path / "duplicated_batches.jsonl"
 
     def write_batch(batch: pl.DataFrame) -> None:
@@ -285,7 +331,11 @@ def test_callback_sink_duplicated_input(spmd_engine_factory, tmp_path):
             file.write(json.dumps(batch.to_dict(as_series=False)) + "\n")
 
     df = pl.LazyFrame({"x": [engine.comm.rank + 1]}).select(pl.col("x").sum())
-    df.sink_batches(write_batch, engine=engine)
+    df.sink_batches(
+        write_batch,
+        maintain_order=not parallel_sink_batches,
+        engine=engine,
+    )
     if engine.comm.rank == 0:
         batches = [json.loads(line) for line in output.read_text().splitlines()]
         assert batches == [{"x": [sum(range(1, engine.comm.nranks + 1))]}]

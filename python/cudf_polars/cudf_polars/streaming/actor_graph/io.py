@@ -882,6 +882,7 @@ async def callback_sink_actor(
     ch_in: Channel[TableChunk],
     ch_out: Channel[TableChunk],
     collective_id: int,
+    parallel: bool,  # noqa: FBT001
 ) -> None:
     """Invoke a callback on input batches and emit an empty result."""
     async with shutdown_on_error(
@@ -903,11 +904,11 @@ async def callback_sink_actor(
                 context,
                 ir.children[0],
             )
-            if comm.rank == 0
+            if parallel or comm.rank == 0
             else None
         )
 
-        # For now, collect all chunks on rank 0 for processing
+        # Ordered callbacks and the default mode process all chunks on rank 0.
         exchange = (
             SparseAlltoall(
                 context,
@@ -916,19 +917,18 @@ async def callback_sink_actor(
                 srcs=range(1, comm.nranks) if comm.rank == 0 else (),
                 dsts=(0,) if comm.rank != 0 else (),
             )
-            if comm.nranks > 1
+            if comm.nranks > 1 and not parallel
             else None
         )
 
         try:
             while (msg := await ch_in.recv(context)) is not None:
-                if (consumer is not None and consumer.stopped) or (
-                    metadata.duplicated and comm.rank != 0
-                ):
+                if metadata.duplicated and comm.rank != 0:
+                    continue
+                if consumer is not None and consumer.stopped:
                     continue
                 chunk = TableChunk.from_message(msg, br=context.br())
-                if comm.rank == 0:
-                    assert consumer is not None
+                if consumer is not None:
                     await consumer.consume(chunk)
                 else:
                     chunk, extra = await make_table_chunks_available_or_wait(
@@ -943,8 +943,7 @@ async def callback_sink_actor(
             if exchange is not None:
                 await exchange.insert_finished(context)
 
-        if comm.rank == 0:
-            assert consumer is not None
+        if consumer is not None:
             if exchange is not None:
                 for src in range(1, comm.nranks):
                     for packed in exchange.extract(src):
@@ -973,6 +972,8 @@ def _(
             channels[ir.children[0]].reserve_output_slot(),
             channels[ir].reserve_input_slot(),
             rec.state["collective_id_map"][ir][0],
+            rec.state["config_options"].executor.parallel_sink_batches
+            and not ir.maintain_order,
         )
     ]
     return nodes, channels
