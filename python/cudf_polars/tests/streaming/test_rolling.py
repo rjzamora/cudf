@@ -11,8 +11,16 @@ import polars as pl
 from polars import polars as plrs  # type: ignore[attr-defined]
 from polars.testing import assert_frame_equal
 
+import pylibcudf as plc
+from cudf_streaming.channel_metadata import OrderScheme
+
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.engine.spmd import SPMDEngine
+from cudf_polars.streaming.actor_graph.rolling import (
+    RangeOverlapPolicy,
+    RangeRequests,
+    _range_partitioning_from_requests,
+)
 from cudf_polars.testing.asserts import (
     assert_gpu_result_equal,
     assert_ir_translation_raises,
@@ -27,6 +35,41 @@ POLARS_LT_136_EMPTY_SUM_XFAIL = pytest.mark.xfail(
         "newer Polars returns 0."
     ),
 )
+
+
+def test_range_rolling_learns_rank_level_ordering(spmd_engine) -> None:
+    context = spmd_engine.context
+    stream = context.br().stream_pool.get_stream()
+    dtype = plc.DataType(plc.TypeId.INT64)
+    policy = RangeOverlapPolicy(
+        plc.Scalar.from_py(0, dtype, stream=stream),
+        plc.Scalar.from_py(0, dtype, stream=stream),
+        0,
+        dtype,
+        plc.search.lower_bound,
+        plc.search.lower_bound,
+        start_inclusive=True,
+        end_inclusive=True,
+        stream=stream,
+        index_name="orderby",
+    )
+    partitioning = _range_partitioning_from_requests(
+        context,
+        policy,
+        RangeRequests(
+            row_counts=(2, 10, 1),
+            has_request=(True, True, True),
+            lower_values=(1, 5, 50),
+            upper_values=(4, 49, 55),
+            first_values=(1, 5, 50),
+            last_values=(4, 49, 55),
+        ),
+    )
+
+    assert partitioning is not None
+    assert isinstance(partitioning.inter_rank, OrderScheme)
+    (ordering,) = partitioning.inter_rank.orderings
+    assert ordering.num_boundaries == 2
 
 
 @pytest.fixture

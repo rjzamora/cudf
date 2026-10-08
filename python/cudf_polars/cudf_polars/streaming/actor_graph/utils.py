@@ -194,6 +194,7 @@ class ChunkStore:
     """Ordered spillable buffer for Messages."""
 
     def __init__(self, ctx: Context) -> None:
+        self._ctx = ctx
         self._mids: deque[int] = deque()
         self._store = ctx.spillable_messages()
 
@@ -207,14 +208,122 @@ class ChunkStore:
             self._store.extract(mid=mid)
         self._mids.clear()
 
-    def insert(self, msg: Message) -> None:
+    def insert(self, msg: Message) -> int:
         """Insert a message into the store."""
-        self._mids.append(self._store.insert(msg))
+        mid = self._store.insert(msg)
+        self._mids.append(mid)
+        return mid
 
     def __iter__(self) -> Generator[Message, None, None]:
         """Yield messages in insertion order, draining the store."""
         while self._mids:
             yield self._store.extract(mid=self._mids.popleft())
+
+
+class RandomAccessChunkStore(ChunkStore):
+    """
+    Spillable message store supporting non-FIFO copy and extract by ID.
+
+    ``insert`` returns a logical ID that remains stable across non-consuming
+    copies. Internally, a copy may extract and reinsert the stored message, so
+    the logical ID can point to different physical spillable-message IDs over
+    time.
+    """
+
+    def __init__(self, ctx: Context) -> None:
+        super().__init__(ctx)
+        self._physical_mids: dict[int, int] = {}
+        self._sequence_numbers: dict[int, int] = {}
+
+    def insert(self, msg: Message) -> int:
+        """Insert a message and return its ID."""
+        mid = super().insert(msg)
+        self._physical_mids[mid] = mid
+        self._sequence_numbers[mid] = msg.sequence_number
+        return mid
+
+    def clear(self) -> None:
+        """Discard all stored messages."""
+        for mid in self._mids:
+            self._store.extract(mid=self._physical_mids[mid])
+        self._mids.clear()
+        self._physical_mids.clear()
+        self._sequence_numbers.clear()
+
+    def release(self, mid: int) -> None:
+        """Discard one stored message."""
+        if mid not in self._sequence_numbers:
+            return
+        self._mids.remove(mid)
+        self._store.extract(mid=self._physical_mids.pop(mid))
+        del self._sequence_numbers[mid]
+
+    def extract(self, mid: int) -> Message:
+        """Return and release one stored message."""
+        del self._sequence_numbers[mid]
+        self._mids.remove(mid)
+        return self._store.extract(mid=self._physical_mids.pop(mid))
+
+    def __iter__(self) -> Generator[Message, None, None]:
+        """Yield messages in insertion order, draining the store."""
+        while self._mids:
+            yield self.extract(self._mids[0])
+
+    async def copy(
+        self,
+        mid: int,
+        *,
+        start: int = 0,
+        stop: int | None = None,
+    ) -> Message:
+        """Return an independent row-slice copy while keeping ``mid`` valid."""
+        sequence_number = self._sequence_numbers[mid]
+        msg = self._store.extract(mid=self._physical_mids[mid])
+        try:
+            chunk = TableChunk.from_message(msg, br=self._ctx.br())
+        except BaseException:
+            self._physical_mids[mid] = self._store.insert(msg)
+            raise
+        try:
+            chunk, extra = await make_table_chunks_available_or_wait(
+                self._ctx,
+                chunk,
+                reserve_extra=0,
+                net_memory_delta=0,
+            )
+            with opaque_memory_usage(extra):
+                pass
+            nrows, _ = chunk.shape
+            stop = nrows if stop is None else stop
+            if not 0 <= start <= stop <= nrows:
+                raise ValueError(
+                    f"Invalid row slice [{start}, {stop}) for {nrows} rows"
+                )
+            if start == 0 and stop == nrows:
+                sliced = chunk
+            else:
+                (table,) = plc.copying.slice(
+                    chunk.table_view(),
+                    [start, stop],
+                    stream=chunk.stream,
+                )
+                sliced = TableChunk.from_pylibcudf_table(
+                    table,
+                    chunk.stream,
+                    exclusive_view=False,
+                    br=self._ctx.br(),
+                )
+            reservation = await self._ctx.memory(MemoryType.DEVICE).reserve_or_wait(
+                sliced.data_alloc_size(),
+                net_memory_delta=sliced.data_alloc_size(),
+            )
+            with opaque_memory_usage(reservation):
+                copied = sliced.copy(reservation)
+        finally:
+            self._physical_mids[mid] = self._store.insert(
+                Message(sequence_number, chunk)
+            )
+        return Message(sequence_number, copied)
 
 
 @contextlib.contextmanager

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 import polars as pl
 
@@ -24,7 +24,6 @@ from cudf_streaming.table_chunk import (
 from rapidsmpf.memory.buffer import MemoryType
 from rapidsmpf.memory.memory_reservation import opaque_memory_usage
 from rapidsmpf.streaming.core.actor import define_actor
-from rapidsmpf.streaming.core.message import Message
 
 from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.dsl.ir import IR, Rolling
@@ -34,16 +33,12 @@ from cudf_polars.streaming.actor_graph.collectives.overlap import (
     BufferedChunk,
     BufferedChunkSource,
     ResolvedGhostSend,
-    RowExchange,
-    RowExchangePlan,
     exchange_resolved_ghost_slices,
     extract_region,
     gather_row_counts,
 )
-from cudf_polars.streaming.actor_graph.collectives.sort import (
-    _extract_boundaries_from_endpoint_rows,
-)
 from cudf_polars.streaming.actor_graph.dispatch import generate_ir_sub_network
+from cudf_polars.streaming.actor_graph.tracing import send_chunk
 from cudf_polars.streaming.actor_graph.utils import (
     ChannelManager,
     _evaluate_chunk_sync,
@@ -58,12 +53,13 @@ from cudf_polars.streaming.rolling import FixedSizeRolling
 from cudf_polars.utils.cuda_stream import join_cuda_streams
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.memory.buffer_resource import BufferResource
     from rapidsmpf.streaming.core.channel import Channel
     from rapidsmpf.streaming.core.context import Context
+    from rapidsmpf.streaming.core.message import Message
     from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.dsl.ir import IRExecutionContext
@@ -98,20 +94,17 @@ _INT64_DTYPE = DataType(pl.Int64())
 _INT8_DTYPE = DataType(pl.Int8())
 
 
-class RollingPolicy(Protocol[BufferedChunkT]):
-    """Protocol for evaluating ghost-expanded cursor chunks."""
+class _RollingPolicy(Generic[BufferedChunkT]):
+    """Base policy for evaluating ghost-expanded cursor chunks."""
 
     def observe(self, chunk: BufferedChunkT) -> None:
-        """Record resources that must outlive chunk processing."""
-        ...
+        del chunk
 
     def close(self) -> None:
-        """Finalize any policy-owned resources."""
-        ...
+        pass
 
     def validate_cursor(self, context: Context, cursor: BufferedChunkT) -> None:
-        """Validate ordering assumptions before evaluating cursor."""
-        ...
+        del context, cursor
 
     def evict_history(
         self,
@@ -119,8 +112,7 @@ class RollingPolicy(Protocol[BufferedChunkT]):
         cursor: BufferedChunkT,
         context: Context,
     ) -> list[BufferedChunkT]:
-        """Drop chunks that cannot contribute to the cursor chunk."""
-        ...
+        raise NotImplementedError
 
     def has_complete_future(
         self,
@@ -128,8 +120,7 @@ class RollingPolicy(Protocol[BufferedChunkT]):
         current: BufferedChunkT,
         context: Context,
     ) -> bool:
-        """Return whether latest has enough leading context for current."""
-        ...
+        raise NotImplementedError
 
     def release_cached_before(
         self,
@@ -137,8 +128,7 @@ class RollingPolicy(Protocol[BufferedChunkT]):
         cursor: BufferedChunkT,
         context: Context,
     ) -> int:
-        """Return the row boundary before which local source chunks can be released."""
-        ...
+        raise NotImplementedError
 
     async def evaluate_cursor(
         self,
@@ -150,8 +140,7 @@ class RollingPolicy(Protocol[BufferedChunkT]):
         history: list[BufferedChunkT],
         future: list[BufferedChunkT],
     ) -> TableChunk:
-        """Evaluate the cursor chunk with any required overlap."""
-        ...
+        raise NotImplementedError
 
     async def prepare_chunk(
         self,
@@ -160,12 +149,11 @@ class RollingPolicy(Protocol[BufferedChunkT]):
         *,
         row_offset: int,
     ) -> BufferedChunkT:
-        """Convert an input message to a chunk with overlap metadata."""
-        ...
+        raise NotImplementedError
 
 
 @dataclass
-class RangeOverlapPolicy(RollingPolicy[RangeBufferedChunk]):
+class RangeOverlapPolicy(_RollingPolicy[RangeBufferedChunk]):
     """Overlap policy for range-based rolling windows."""
 
     lower: plc.Scalar
@@ -385,24 +373,6 @@ class RangeOverlapPolicy(RollingPolicy[RangeBufferedChunk]):
     ) -> TableChunk:
         """Evaluate the rolling aggregation for the cursor chunk."""
         chunks = [*history, cursor, *future]
-        return await self.evaluate_cursor_with_chunks(
-            context,
-            ir,
-            ir_context,
-            cursor,
-            chunks=chunks,
-        )
-
-    async def evaluate_cursor_with_chunks(
-        self,
-        context: Context,
-        ir: IR,
-        ir_context: IRExecutionContext,
-        cursor: RangeBufferedChunk,
-        *,
-        chunks: Sequence[RangeBufferedChunk],
-    ) -> TableChunk:
-        """Evaluate the cursor against an already assembled context."""
         ghost_start = global_insertion_row(
             chunks,
             cursor.overlap.lower_bound_column,
@@ -432,22 +402,11 @@ class RangeOverlapPolicy(RollingPolicy[RangeBufferedChunk]):
 
 
 @dataclass
-class RowCountOverlapPolicy(RollingPolicy[BufferedChunk]):
+class RowCountOverlapPolicy(_RollingPolicy[BufferedChunk]):
     """Overlap policy for fixed-size rolling expressions."""
 
     preceding: int
     following: int
-
-    def observe(self, chunk: BufferedChunk) -> None:
-        """Row-count overlap has no policy-owned chunk resources."""
-        del chunk
-
-    def close(self) -> None:
-        """Row-count overlap owns no resources that need finalization."""
-
-    def validate_cursor(self, context: Context, cursor: BufferedChunk) -> None:
-        """Row-count rolling has no ordering requirement."""
-        del context, cursor
 
     async def prepare_chunk(
         self,
@@ -543,7 +502,6 @@ class RangeInputSummary:
     first_value_column: plc.Column | None
     last_value_column: plc.Column | None
     chunk_bounds: tuple[RangeChunkBounds, ...]
-    endpoint_rows: plc.Table | None
 
 
 @dataclass(frozen=True)
@@ -556,12 +514,6 @@ class RangeRequests:
     upper_values: tuple[Any | None, ...]
     first_values: tuple[Any | None, ...]
     last_values: tuple[Any | None, ...]
-    lower_column: plc.Column
-    upper_column: plc.Column
-    first_column: plc.Column
-    last_column: plc.Column
-    stream: Stream
-    table: plc.Table
 
 
 @dataclass(frozen=True)
@@ -573,10 +525,6 @@ class StagedChunk(Generic[BufferedChunkT]):
     output_sequence_number: int | None = None
 
 
-def _noop_cleanup() -> None:
-    """Default cleanup hook for prepared inputs without buffered state."""
-
-
 @dataclass
 class RollingInput(Generic[BufferedChunkT]):
     """A prepared rolling input stream plus optional metadata learned from it."""
@@ -584,13 +532,14 @@ class RollingInput(Generic[BufferedChunkT]):
     chunks: AsyncIterator[StagedChunk[BufferedChunkT]]
     partitioning: Partitioning | None = None
     release_sources: tuple[BufferedChunkSource, ...] = ()
-    cleanup: Callable[[], None] = _noop_cleanup
+    cleanup: Callable[[], None] | None = None
     _closed: bool = field(default=False, init=False)
 
     def close(self) -> None:
         """Release input-owned buffered state."""
         if not self._closed:
-            self.cleanup()
+            if self.cleanup is not None:
+                self.cleanup()
             self._closed = True
 
     def release_cached_before(self, row_stop: int) -> None:
@@ -603,14 +552,14 @@ class RollingInput(Generic[BufferedChunkT]):
 class RollingManager(Generic[BufferedChunkT]):
     """Prepared rolling policy and input, with shared cleanup."""
 
-    policy: RollingPolicy[BufferedChunkT]
+    policy: _RollingPolicy[BufferedChunkT]
     rolling_input: RollingInput[BufferedChunkT]
 
-    async def __aenter__(self) -> RollingManager[BufferedChunkT]:
+    def __enter__(self) -> RollingManager[BufferedChunkT]:
         """Return the prepared rolling context."""
         return self
 
-    async def __aexit__(self, *exc_info: object) -> None:
+    def __exit__(self, *exc_info: object) -> None:
         """Release prepared input and policy-owned resources."""
         self.rolling_input.close()
         self.policy.close()
@@ -716,16 +665,6 @@ def _search_in_chunk(
     return value
 
 
-def latest_nonempty_chunk(
-    current: BufferedChunkT, future: list[BufferedChunkT]
-) -> BufferedChunkT:
-    """Return the last non-empty chunk staged at or after current."""
-    for chunk in reversed(future):
-        if chunk.num_rows != 0:
-            return chunk
-    return current
-
-
 async def evaluate_available_chunk(
     context: Context,
     chunk: TableChunk,
@@ -813,24 +752,50 @@ def _row_count_ghost_spans(
     return tuple(span for span in spans if span[0] < span[1])
 
 
-def _fixed_size_exchange_plan(
-    row_counts: Sequence[int],
+def _range_intersection(left: RowRange, right: RowRange) -> RowRange | None:
+    """Return the overlap of two row ranges, if any."""
+    start = max(left[0], right[0])
+    stop = min(left[1], right[1])
+    return (start, stop) if start < stop else None
+
+
+def _fixed_size_ghost_requests(
+    source_spans: Sequence[RowRange],
     policy: RowCountOverlapPolicy,
-) -> RowExchangePlan:
-    """Build the row-slice exchange plan for fixed-size rolling."""
-    offsets = _row_starts(row_counts)
-    spans = tuple((offsets[i], offsets[i + 1]) for i in range(len(row_counts)))
-    total_rows = offsets[-1]
-    ghost_requests = tuple(
+) -> tuple[tuple[RowRange, ...], ...]:
+    """Return the global ghost rows needed by each rank."""
+    total_rows = source_spans[-1][1] if source_spans else 0
+    return tuple(
         _row_count_ghost_spans(
             span,
             preceding=policy.preceding,
             following=policy.following,
             total_rows=total_rows,
         )
-        for span in spans
+        for span in source_spans
     )
-    return RowExchangePlan.from_spans(spans, ghost_requests)
+
+
+def _fixed_size_exchange_routing(
+    rank: int,
+    source_spans: Sequence[RowRange],
+    ghost_requests: Sequence[Sequence[RowRange]],
+) -> tuple[list[ResolvedGhostSend], tuple[int, ...], tuple[int, ...]]:
+    """Return local sends, remote sources, and remote destinations."""
+    sends: list[ResolvedGhostSend] = []
+    expected_sources: list[int] = []
+    destinations: list[int] = []
+    for other, span in enumerate(source_spans):
+        if other == rank:
+            continue
+        if any(_range_intersection(span, request) for request in ghost_requests[rank]):
+            expected_sources.append(other)
+        for request in ghost_requests[other]:
+            if (send := _range_intersection(source_spans[rank], request)) is not None:
+                sends.append(ResolvedGhostSend(other, *send))
+                if other not in destinations:
+                    destinations.append(other)
+    return sends, tuple(expected_sources), tuple(destinations)
 
 
 async def _recv_all_fixed_size_chunks(
@@ -869,7 +834,6 @@ async def _recv_all_range_chunks(
     first_value_column: plc.Column | None = None
     last_value_column: plc.Column | None = None
     chunk_bounds: list[RangeChunkBounds] = []
-    endpoint_rows: list[plc.Table] = []
     previous_last: Any | None = None
     while (msg := await ch_in.recv(context)) is not None:
         buffered = await policy.prepare_chunk(context, msg, row_offset=row_offset)
@@ -910,39 +874,7 @@ async def _recv_all_range_chunks(
             stream=buffered.chunk.stream,
             br=context.br(),
         )
-        first_endpoint = _single_ordering_value_column(
-            buffered.overlap.first,
-            policy.index_dtype,
-            stream=buffered.chunk.stream,
-            br=context.br(),
-        )
-        last_endpoint = _single_ordering_value_column(
-            buffered.overlap.last,
-            policy.index_dtype,
-            stream=buffered.chunk.stream,
-            br=context.br(),
-        )
-        endpoint_rows.append(
-            plc.Table(
-                [
-                    plc.concatenate.concatenate(
-                        [first_endpoint, last_endpoint],
-                        stream=buffered.chunk.stream,
-                    )
-                ]
-            )
-        )
         source.insert(buffered)
-    if endpoint_rows and policy.observed_streams:
-        join_cuda_streams(
-            downstreams=(policy.stream,),
-            upstreams=tuple(policy.observed_streams),
-        )
-    endpoint_table = (
-        plc.concatenate.concatenate(endpoint_rows, stream=policy.stream)
-        if endpoint_rows
-        else None
-    )
     return RangeInputSummary(
         local_rows=row_offset,
         has_rows=has_rows,
@@ -951,7 +883,6 @@ async def _recv_all_range_chunks(
         first_value_column=first_value_column,
         last_value_column=last_value_column,
         chunk_bounds=tuple(chunk_bounds),
-        endpoint_rows=endpoint_table,
     )
 
 
@@ -981,25 +912,38 @@ def _single_ordering_value_column(
     return _single_value_column(value, dtype, stream)
 
 
-def _empty_column(dtype: plc.DataType, stream: Stream) -> plc.Column:
-    """Return an empty column for a pylibcudf dtype."""
-    return plc.column_factories.make_empty_column(dtype, stream=stream)
-
-
-def _single_key_ordering_partitioning(
+def _range_partitioning_from_requests(
     context: Context,
     policy: RangeOverlapPolicy,
-    endpoint_rows: plc.Table,
-    num_partitions: int,
-    stream: Stream,
+    requests: RangeRequests,
 ) -> Partitioning | None:
-    """Build ordering metadata from all-gathered chunk endpoint rows."""
-    if num_partitions < 2:
+    """Build rank-level ordering metadata from all-gathered range requests."""
+    if len(requests.row_counts) < 2 or not all(requests.has_request):
         return None
-    boundaries, strict = _extract_boundaries_from_endpoint_rows(
-        endpoint_rows,
-        num_partitions,
-        stream,
+    if any(value is None for value in requests.first_values):
+        return None
+    if any(value is None for value in requests.last_values):
+        return None
+    stream = context.br().stream_pool.get_stream()
+    boundaries = plc.Table(
+        [
+            plc.concatenate.concatenate(
+                [
+                    _single_ordering_value_column(
+                        value,
+                        policy.index_dtype,
+                        stream=stream,
+                        br=context.br(),
+                    )
+                    for value in requests.first_values[1:]
+                ],
+                stream=stream,
+            )
+        ]
+    )
+    strict = all(
+        requests.last_values[rank] != requests.first_values[rank + 1]
+        for rank in range(len(requests.row_counts) - 1)
     )
     return Partitioning(
         inter_rank=OrderScheme(
@@ -1041,70 +985,6 @@ def _merge_learned_inter_rank(
     if existing is None:
         return learned
     return Partitioning(inter_rank=learned.inter_rank, local=existing.local)
-
-
-def _range_endpoint_chunk(
-    context: Context,
-    summary: RangeInputSummary,
-    policy: RangeOverlapPolicy,
-    stream: Stream,
-) -> TableChunk:
-    """Return local endpoint rows for ordering-metadata extraction."""
-    table = (
-        summary.endpoint_rows
-        if summary.endpoint_rows is not None
-        else plc.Table([_empty_column(policy.index_dtype, stream)])
-    )
-    return TableChunk.from_pylibcudf_table(
-        table,
-        stream,
-        exclusive_view=True,
-        br=context.br(),
-    )
-
-
-async def _gather_range_partitioning(
-    context: Context,
-    comm: Communicator,
-    ir_context: IRExecutionContext,
-    summary: RangeInputSummary,
-    policy: RangeOverlapPolicy,
-    *,
-    collective_id: int,
-) -> Partitioning | None:
-    """Gather chunk endpoints and derive output ordering metadata."""
-    stream = context.br().stream_pool.get_stream()
-    if policy.observed_streams:
-        join_cuda_streams(
-            downstreams=(stream,),
-            upstreams=tuple(policy.observed_streams),
-        )
-    ag = AllGatherManager(context, comm, collective_id)
-    with ag.inserting() as inserter:
-        await inserter.insert(
-            comm.rank,
-            _range_endpoint_chunk(context, summary, policy, stream),
-        )
-    endpoint_rows = await ag.extract_concatenated(
-        stream,
-        ordered=True,
-        ir_context=ir_context,
-    )
-    num_partitions = endpoint_rows.num_rows() // 2
-    if endpoint_rows.num_rows() != num_partitions * 2:
-        raise RuntimeError(
-            "Range rolling gathered an invalid number of endpoint rows: "
-            f"{endpoint_rows.num_rows()}"
-        )
-    if num_partitions == 0:
-        return None
-    return _single_key_ordering_partitioning(
-        context,
-        policy,
-        endpoint_rows,
-        num_partitions,
-        stream,
-    )
 
 
 def _range_request_chunk(
@@ -1215,35 +1095,32 @@ async def _gather_range_requests(
         else None
         for rank in range(comm.nranks)
     )
-    lower_values = tuple(
-        _minimum_requested_value(
-            first_values[rank],
-            raw_lower_values[rank],
-            has_request=has_request[rank],
-        )
-        for rank in range(comm.nranks)
-    )
-    upper_values = tuple(
-        _maximum_requested_value(
-            last_values[rank],
-            raw_upper_values[rank],
-            has_request=has_request[rank],
-        )
-        for rank in range(comm.nranks)
-    )
+    lower_values: list[Any | None] = []
+    upper_values: list[Any | None] = []
+    for rank in range(comm.nranks):
+        first = first_values[rank]
+        last = last_values[rank]
+        lower = raw_lower_values[rank]
+        upper = raw_upper_values[rank]
+        if (
+            not has_request[rank]
+            or first is None
+            or last is None
+            or lower is None
+            or upper is None
+        ):
+            lower_values.append(None)
+            upper_values.append(None)
+        else:
+            lower_values.append(first if first <= lower else lower)
+            upper_values.append(last if last >= upper else upper)
     return RangeRequests(
         row_counts=row_counts,
         has_request=has_request,
-        lower_values=lower_values,
-        upper_values=upper_values,
+        lower_values=tuple(lower_values),
+        upper_values=tuple(upper_values),
         first_values=first_values,
         last_values=last_values,
-        lower_column=lower_column,
-        upper_column=upper_column,
-        first_column=first_column,
-        last_column=last_column,
-        stream=stream,
-        table=table,
     )
 
 
@@ -1260,24 +1137,6 @@ def _request_host_value(
         stream=stream,
         br=br,
     )
-
-
-def _minimum_requested_value(
-    left: Any | None, right: Any | None, *, has_request: bool
-) -> Any | None:
-    """Return the lower of two requested values, or null for an empty request."""
-    if not has_request or left is None or right is None:
-        return None
-    return left if left <= right else right
-
-
-def _maximum_requested_value(
-    left: Any | None, right: Any | None, *, has_request: bool
-) -> Any | None:
-    """Return the upper of two requested values, or null for an empty request."""
-    if not has_request or left is None or right is None:
-        return None
-    return left if left >= right else right
 
 
 def _validate_global_range_order(
@@ -1363,17 +1222,14 @@ def _range_remote_destinations(
     )
 
 
-async def _range_request_sends(
-    context: Context,
-    source: BufferedChunkSource,
+def _range_request_sends(
     summary: RangeInputSummary,
     requests: RangeRequests,
     destinations: Sequence[int],
-    policy: RangeOverlapPolicy,
     *,
     row_offset: int,
 ) -> list[ResolvedGhostSend]:
-    """Resolve remote range requests to exact local row slices."""
+    """Resolve remote range requests to local candidate chunks."""
     sends: list[ResolvedGhostSend] = []
     for destination in destinations:
         request_lower = requests.lower_values[destination]
@@ -1383,51 +1239,13 @@ async def _range_request_sends(
         for chunk in summary.chunk_bounds:
             if chunk.last < request_lower or chunk.first > request_upper:
                 continue
-            async for buffered in source.iter_region_chunks(
-                chunk.row_start + row_offset,
-                chunk.row_stop + row_offset,
-            ):
-                index_column = buffered.chunk.table_view().columns()[policy.index]
-                if index_column.type() != policy.index_dtype:
-                    index_column = plc.unary.cast(
-                        index_column,
-                        policy.index_dtype,
-                        stream=buffered.chunk.stream,
-                    )
-                lower = _single_ordering_value_column(
-                    request_lower,
-                    policy.index_dtype,
-                    buffered.chunk.stream,
-                    context.br(),
+            sends.append(
+                ResolvedGhostSend(
+                    destination,
+                    chunk.row_start + row_offset,
+                    chunk.row_stop + row_offset,
                 )
-                upper = _single_ordering_value_column(
-                    request_upper,
-                    policy.index_dtype,
-                    buffered.chunk.stream,
-                    context.br(),
-                )
-                start = _search_in_chunk(
-                    index_column,
-                    lower,
-                    plc.search.lower_bound,
-                    buffered.chunk.stream,
-                    context.br(),
-                )
-                stop = _search_in_chunk(
-                    index_column,
-                    upper,
-                    plc.search.upper_bound,
-                    buffered.chunk.stream,
-                    context.br(),
-                )
-                if start < stop:
-                    sends.append(
-                        ResolvedGhostSend(
-                            destination,
-                            buffered.row_start + start,
-                            buffered.row_start + stop,
-                        )
-                    )
+            )
     return sends
 
 
@@ -1457,7 +1275,7 @@ async def _fill_staged_future(
     chunks: AsyncIterator[StagedChunk[BufferedChunkT]],
     current: BufferedChunkT,
     future: list[StagedChunk[BufferedChunkT]],
-    policy: RollingPolicy[BufferedChunkT],
+    policy: _RollingPolicy[BufferedChunkT],
 ) -> bool:
     """Read staged chunks until current has enough leading context."""
     while not policy.has_complete_future(
@@ -1475,7 +1293,7 @@ async def _fill_staged_future(
 async def _local_staged_chunks(
     context: Context,
     ch_in: Channel[TableChunk],
-    policy: RollingPolicy[BufferedChunkT],
+    policy: _RollingPolicy[BufferedChunkT],
 ) -> AsyncIterator[StagedChunk[BufferedChunkT]]:
     """Yield a single-rank input channel as owned staged chunks."""
     row_offset = 0
@@ -1496,7 +1314,7 @@ async def execute_rolling_policy(
     ir_context: IRExecutionContext,
     ch_out: Channel[TableChunk],
     rolling_input: RollingInput[BufferedChunkT],
-    policy: RollingPolicy[BufferedChunkT],
+    policy: _RollingPolicy[BufferedChunkT],
     tracer: ActorTracer | None,
 ) -> None:
     """Evaluate owned staged chunks with any required ghost context."""
@@ -1511,52 +1329,49 @@ async def execute_rolling_policy(
         policy.validate_cursor(context, cursor)
         if not owned:
             history.append(cursor)
-        elif cursor.num_rows == 0:
-            result = await evaluate_available_chunk(
-                context,
-                cursor.chunk,
-                ir,
-                ir_context=ir_context,
-            )
-            if tracer is not None:
-                tracer.add_chunk(chunk=result)
-            output_sequence_number = (
-                staged.output_sequence_number
-                if staged.output_sequence_number is not None
-                else next_output_sequence_number
-            )
-            await ch_out.send(context, Message(output_sequence_number, result))
-            next_output_sequence_number = output_sequence_number + 1
         else:
-            history = policy.evict_history(history, cursor, context)
-            release_before = policy.release_cached_before(history, cursor, context)
-            rolling_input.release_cached_before(release_before)
-            if not input_exhausted:
-                input_exhausted = await _fill_staged_future(
+            if cursor.num_rows == 0:
+                result = await evaluate_available_chunk(
                     context,
-                    chunks,
-                    cursor,
-                    future,
-                    policy,
+                    cursor.chunk,
+                    ir,
+                    ir_context=ir_context,
                 )
-            result = await policy.evaluate_cursor(
-                context,
-                ir,
-                ir_context,
-                cursor,
-                history=history,
-                future=[item.chunk for item in future],
-            )
-            if tracer is not None:
-                tracer.add_chunk(chunk=result)
+            else:
+                history = policy.evict_history(history, cursor, context)
+                release_before = policy.release_cached_before(history, cursor, context)
+                rolling_input.release_cached_before(release_before)
+                if not input_exhausted:
+                    input_exhausted = await _fill_staged_future(
+                        context,
+                        chunks,
+                        cursor,
+                        future,
+                        policy,
+                    )
+                result = await policy.evaluate_cursor(
+                    context,
+                    ir,
+                    ir_context,
+                    cursor,
+                    history=history,
+                    future=[item.chunk for item in future],
+                )
             output_sequence_number = (
                 staged.output_sequence_number
                 if staged.output_sequence_number is not None
                 else next_output_sequence_number
             )
-            await ch_out.send(context, Message(output_sequence_number, result))
+            await send_chunk(
+                context,
+                ch_out,
+                result,
+                output_sequence_number,
+                tracer=tracer,
+            )
             next_output_sequence_number = output_sequence_number + 1
-            history.append(cursor)
+            if cursor.num_rows != 0:
+                history.append(cursor)
 
         if future:
             staged = future.pop(0)
@@ -1566,36 +1381,41 @@ async def execute_rolling_policy(
     await ch_out.drain(context)
 
 
-async def _fixed_size_context_chunks(
+async def _context_chunks(
     result: RowExchangeResult,
     output_span: RowRange,
-) -> AsyncIterator[StagedChunk[BufferedChunk]]:
-    """Yield ghost and owned chunks in global row order for fixed-size rolling."""
+    prepare_chunk: Callable[[BufferedChunk], Awaitable[BufferedChunkT]],
+    *,
+    label: str,
+) -> AsyncIterator[StagedChunk[BufferedChunkT]]:
+    """Yield ghost and owned chunks in global row order."""
     output_start, output_stop = output_span
     ghost_iter = result.ghost_source.iter_chunks()
-    first_right_ghost: BufferedChunk | None = None
+    first_right_ghost: BufferedChunkT | None = None
     async for chunk in ghost_iter:
-        if chunk.row_stop <= output_start:
-            yield StagedChunk(chunk, owned=False)
-        elif chunk.row_start >= output_stop:
-            first_right_ghost = chunk
+        prepared = await prepare_chunk(chunk)
+        if prepared.row_stop <= output_start:
+            yield StagedChunk(prepared, owned=False)
+        elif prepared.row_start >= output_stop:
+            first_right_ghost = prepared
             break
         else:
             raise RuntimeError(
-                "Fixed-size rolling received a ghost chunk that overlaps owned rows"
+                f"{label} rolling received a ghost chunk that overlaps owned rows"
             )
     async for chunk in result.iter_local_owned(
         include_empty_chunks=True,
     ):
-        yield StagedChunk(chunk, owned=True)
+        yield StagedChunk(await prepare_chunk(chunk), owned=True)
     if first_right_ghost is not None:
         yield StagedChunk(first_right_ghost, owned=False)
     async for chunk in ghost_iter:
-        if chunk.row_start < output_stop:
+        prepared = await prepare_chunk(chunk)
+        if prepared.row_start < output_stop:
             raise RuntimeError(
-                "Fixed-size rolling received a ghost chunk that overlaps owned rows"
+                f"{label} rolling received a ghost chunk that overlaps owned rows"
             )
-        yield StagedChunk(chunk, owned=False)
+        yield StagedChunk(prepared, owned=False)
 
 
 async def prepare_fixed_size_multirank_input(
@@ -1624,27 +1444,46 @@ async def prepare_fixed_size_multirank_input(
             local_rows=local_rows,
             collective_id=collective_id,
         )
-        plan = _fixed_size_exchange_plan(row_counts, policy)
+        row_starts = _row_starts(row_counts)
+        source_spans = tuple(
+            (row_starts[i], row_starts[i + 1]) for i in range(len(row_counts))
+        )
+        ghost_requests = _fixed_size_ghost_requests(source_spans, policy)
+        output_span = source_spans[comm.rank]
+        sends, expected_sources, destinations = _fixed_size_exchange_routing(
+            comm.rank, source_spans, ghost_requests
+        )
 
-        local_start, _ = plan.source_span(comm.rank)
-        local_source.set_row_start_offset(local_start)
+        local_source.set_row_start_offset(output_span[0])
 
-        exchange_result = await RowExchange(
+        exchange_result = await exchange_resolved_ghost_slices(
             context,
             comm,
             ir_context,
-            plan,
-            collective_id,
-        ).exchange(local_source)
+            local_source,
+            local_owned_intervals=(output_span,)
+            if output_span[0] < output_span[1]
+            else (),
+            local_empty_span=output_span,
+            sends=sends,
+            expected_sources=expected_sources,
+            candidate_destinations=destinations,
+            collective_id=collective_id,
+        )
 
         def cleanup() -> None:
             exchange_result.ghost_source.clear()
             local_source.clear()
 
+        async def prepare_chunk(chunk: BufferedChunk) -> BufferedChunk:
+            return chunk
+
         return RollingInput(
-            _fixed_size_context_chunks(
+            _context_chunks(
                 exchange_result,
-                plan.source_span(comm.rank),
+                output_span,
+                prepare_chunk,
+                label="Fixed-size",
             ),
             release_sources=(
                 exchange_result.local_source,
@@ -1655,61 +1494,6 @@ async def prepare_fixed_size_multirank_input(
     except BaseException:
         local_source.clear()
         raise
-
-
-async def _range_context_chunks(
-    context: Context,
-    result: RowExchangeResult,
-    output_span: RowRange,
-    policy: RangeOverlapPolicy,
-) -> AsyncIterator[StagedChunk[RangeBufferedChunk]]:
-    """Yield range ghosts and owned chunks in global row order."""
-    output_start, output_stop = output_span
-    ghost_iter = result.ghost_source.iter_chunks()
-    first_right_ghost: RangeBufferedChunk | None = None
-    async for chunk in ghost_iter:
-        prepared = await policy.prepare_table_chunk(
-            context,
-            chunk.sequence_number,
-            chunk.chunk,
-            row_offset=chunk.row_start,
-        )
-        policy.observe(prepared)
-        if prepared.row_stop <= output_start:
-            yield StagedChunk(prepared, owned=False)
-        elif prepared.row_start >= output_stop:
-            first_right_ghost = prepared
-            break
-        else:
-            raise RuntimeError(
-                "Range rolling received a ghost chunk that overlaps owned rows"
-            )
-    async for chunk in result.iter_local_owned(
-        include_empty_chunks=True,
-    ):
-        prepared = await policy.prepare_table_chunk(
-            context,
-            chunk.sequence_number,
-            chunk.chunk,
-            row_offset=chunk.row_start,
-        )
-        policy.observe(prepared)
-        yield StagedChunk(prepared, owned=True)
-    if first_right_ghost is not None:
-        yield StagedChunk(first_right_ghost, owned=False)
-    async for chunk in ghost_iter:
-        prepared = await policy.prepare_table_chunk(
-            context,
-            chunk.sequence_number,
-            chunk.chunk,
-            row_offset=chunk.row_start,
-        )
-        policy.observe(prepared)
-        if prepared.row_start < output_stop:
-            raise RuntimeError(
-                "Range rolling received a ghost chunk that overlaps owned rows"
-            )
-        yield StagedChunk(prepared, owned=False)
 
 
 async def prepare_range_multirank_input(
@@ -1741,17 +1525,10 @@ async def prepare_range_multirank_input(
             collective_id=collective_id,
         )
         _validate_global_range_order(requests, policy)
-        # The request all-gather, optional endpoint all-gather, and sparse
-        # exchange are sequential, so they can share one collective ID.
+        # The request all-gather and sparse exchange are sequential, so they
+        # can share one collective ID.
         partitioning = (
-            await _gather_range_partitioning(
-                context,
-                comm,
-                ir_context,
-                summary,
-                policy,
-                collective_id=collective_id,
-            )
+            _range_partitioning_from_requests(context, policy, requests)
             if derive_partitioning
             else None
         )
@@ -1761,13 +1538,10 @@ async def prepare_range_multirank_input(
 
         remote_sources = _range_remote_sources(comm, requests)
         remote_destinations = _range_remote_destinations(comm, summary, requests)
-        sends = await _range_request_sends(
-            context,
-            local_source,
+        sends = _range_request_sends(
             summary,
             requests,
             remote_destinations,
-            policy,
             row_offset=output_span[0],
         )
         exchange_result = await exchange_resolved_ghost_slices(
@@ -1789,12 +1563,22 @@ async def prepare_range_multirank_input(
             exchange_result.ghost_source.clear()
             local_source.clear()
 
-        return RollingInput(
-            _range_context_chunks(
+        async def prepare_chunk(chunk: BufferedChunk) -> RangeBufferedChunk:
+            prepared = await policy.prepare_table_chunk(
                 context,
+                chunk.sequence_number,
+                chunk.chunk,
+                row_offset=chunk.row_start,
+            )
+            policy.observe(prepared)
+            return prepared
+
+        return RollingInput(
+            _context_chunks(
                 exchange_result,
                 output_span,
-                policy,
+                prepare_chunk,
+                label="Range",
             ),
             release_sources=(
                 exchange_result.local_source,
@@ -1814,7 +1598,7 @@ async def prepare_rolling_input(
     ir: Rolling | FixedSizeRolling,
     ir_context: IRExecutionContext,
     ch_in: Channel[TableChunk],
-    policy: RollingPolicy[Any],
+    policy: _RollingPolicy[Any],
     metadata_in: ChannelMetadata,
     *,
     collective_id: int,
@@ -1858,7 +1642,7 @@ async def prepare_rolling_manager(
 ) -> RollingManager[Any]:
     """Prepare the rolling policy and input with one cleanup owner."""
     if isinstance(ir, Rolling):
-        policy: RollingPolicy[Any] = RangeOverlapPolicy.from_ir(
+        policy: _RollingPolicy[Any] = RangeOverlapPolicy.from_ir(
             ir, context.br().stream_pool.get_stream()
         )
     else:
@@ -1910,7 +1694,7 @@ async def rolling_actor(
             metadata_in,
             collective_id=collective_id,
         )
-        async with manager:
+        with manager:
             input_partitioning = _merge_learned_inter_rank(
                 metadata_in.partitioning,
                 manager.rolling_input.partitioning,

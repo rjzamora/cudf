@@ -23,6 +23,7 @@ from rapidsmpf.streaming.core.message import Message
 
 from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.streaming.actor_graph.collectives.allgather import AllGatherManager
+from cudf_polars.streaming.actor_graph.utils import RandomAccessChunkStore
 from cudf_polars.utils.cuda_stream import stream_ordered_after
 
 if TYPE_CHECKING:
@@ -84,17 +85,15 @@ class BufferedChunkSource:
 
     def __init__(self, context: Context) -> None:
         self._context = context
-        self._store = context.spillable_messages()
+        self._store = RandomAccessChunkStore(context)
         self._records: list[StoredBufferedChunk] = []
-        self._cache: dict[int, BufferedChunk] = {}
-        self._extracted: set[int] = set()
         self._release_index = 0
         self._row_start_offset = 0
 
     def insert(self, chunk: BufferedChunk) -> None:
         """Insert a chunk into the spillable source."""
-        if self._cache or self._extracted:
-            raise RuntimeError("Cannot insert after materializing buffered chunks")
+        if self._release_index != 0:
+            raise RuntimeError("Cannot insert after releasing buffered chunks")
         if self._records and chunk.row_start < self._records[-1].row_stop:
             raise RuntimeError("Buffered chunks must be inserted in row-span order")
         mid = self._store.insert(Message(chunk.sequence_number, chunk.chunk))
@@ -109,18 +108,14 @@ class BufferedChunkSource:
 
     def set_row_start_offset(self, offset: int) -> None:
         """Shift all stored row spans by a global row-start offset."""
-        if self._cache or self._extracted:
-            raise RuntimeError("Cannot shift buffered chunks after materialization")
+        if self._release_index != 0:
+            raise RuntimeError("Cannot shift buffered chunks after releasing them")
         self._row_start_offset = offset
 
     def clear(self) -> None:
         """Discard all stored and materialized chunks."""
-        for record in self._records:
-            if record.mid not in self._extracted:
-                self._store.extract(mid=record.mid)
+        self._store.clear()
         self._records.clear()
-        self._cache.clear()
-        self._extracted.clear()
         self._release_index = 0
         self._row_start_offset = 0
 
@@ -130,9 +125,7 @@ class BufferedChunkSource:
             record = self._records[self._release_index]
             if self._row_stop(record) > row_stop:
                 break
-            if self._cache.pop(record.mid, None) is None:
-                self._store.extract(mid=record.mid)
-                self._extracted.add(record.mid)
+            self._store.release(record.mid)
             self._release_index += 1
 
     def _row_start(self, record: StoredBufferedChunk) -> int:
@@ -143,19 +136,12 @@ class BufferedChunkSource:
 
     async def _chunk_for(self, record: StoredBufferedChunk) -> BufferedChunk:
         """Return an available buffered chunk for ``record``."""
-        if (cached := self._cache.get(record.mid)) is not None:
-            return cached
-        if record.mid in self._extracted:
-            raise RuntimeError(
-                "Requested buffered chunk after it was released from cache"
-            )
-        msg = self._store.extract(mid=record.mid)
+        msg = self._store.extract(record.mid)
         if msg.sequence_number != record.sequence_number:
             raise RuntimeError(
                 "Buffered chunk metadata/message sequence mismatch: "
                 f"{record.sequence_number} != {msg.sequence_number}"
             )
-        self._extracted.add(record.mid)
         chunk = TableChunk.from_message(msg, br=self._context.br())
         nrows, _ = chunk.shape
         if nrows != record.num_rows:
@@ -170,14 +156,12 @@ class BufferedChunkSource:
             net_memory_delta=0,
         )
         with opaque_memory_usage(extra):
-            buffered = BufferedChunk(
+            return BufferedChunk(
                 record.sequence_number,
                 chunk,
                 self._row_start(record),
                 record.num_rows,
             )
-        self._cache[record.mid] = buffered
-        return buffered
 
     async def iter_region_chunks(
         self,
@@ -249,6 +233,19 @@ class BufferedChunkSource:
     ) -> BufferedChunk:
         """Return one stored chunk slice."""
         _validate_row_range(row_start, row_stop)
+        record_start = self._row_start(record)
+        if copy_result:
+            msg = await self._store.copy(
+                record.mid,
+                start=row_start - record_start,
+                stop=row_stop - record_start,
+            )
+            return BufferedChunk(
+                -1,
+                TableChunk.from_message(msg, br=self._context.br()),
+                row_start,
+                row_stop - row_start,
+            )
         buffered = await self._chunk_for(record)
         full_chunk = row_start == buffered.row_start and row_stop == buffered.row_stop
         if full_chunk:
@@ -264,18 +261,7 @@ class BufferedChunkSource:
                 exclusive_view=False,
                 br=self._context.br(),
             )
-        if copy_result:
-            reservation = await self._context.memory(MemoryType.DEVICE).reserve_or_wait(
-                chunk.data_alloc_size(), net_memory_delta=0
-            )
-            with opaque_memory_usage(reservation):
-                chunk = TableChunk.from_pylibcudf_table(
-                    chunk.table_view().copy(chunk.stream, self._context.br().device_mr),
-                    chunk.stream,
-                    exclusive_view=True,
-                    br=self._context.br(),
-                )
-        if full_chunk and not copy_result:
+        if full_chunk:
             return replace(buffered, sequence_number=-1)
         return BufferedChunk(-1, chunk, row_start, chunk.shape[0])
 
@@ -313,146 +299,12 @@ class RowExchangeResult:
 
 
 @dataclass(frozen=True)
-class RowExchangePlan:
-    """
-    Row-offset routing plan for ghost slice exchange.
-
-    ``source_spans`` describe the rows owned by each source rank.
-    ``ghost_requests`` describe extra source rows needed by each rank for local
-    evaluation. Output ownership is unchanged by this primitive.
-    """
-
-    source_spans: tuple[RowRange, ...]
-    ghost_requests: tuple[tuple[RowRange, ...], ...]
-
-    @classmethod
-    def from_spans(
-        cls,
-        source_spans: Sequence[RowRange],
-        ghost_requests: Sequence[Sequence[RowRange]],
-    ) -> RowExchangePlan:
-        """Build a row exchange plan from explicit row spans."""
-        plan = cls(
-            tuple(source_spans),
-            tuple(tuple(_merge_intervals(requests)) for requests in ghost_requests),
-        )
-        plan.validate()
-        return plan
-
-    def validate(self) -> None:
-        """Validate row-span shape and monotonicity."""
-        if len(self.ghost_requests) != len(self.source_spans):
-            raise ValueError(
-                "RowExchangePlan ghost request count must match source span count: "
-                f"{len(self.ghost_requests)} != {len(self.source_spans)}"
-            )
-        _validate_plan_spans("source", self.source_spans)
-        total_rows = self.total_rows
-        for rank, requests in enumerate(self.ghost_requests):
-            for start, stop in requests:
-                if start < 0 or stop < start or stop > total_rows:
-                    raise ValueError(
-                        "Invalid RowExchangePlan ghost request for rank "
-                        f"{rank}: [{start}, {stop}) outside [0, {total_rows})"
-                    )
-
-    @property
-    def total_rows(self) -> int:
-        """Total rows in the source stream."""
-        if not self.source_spans:
-            return 0
-        return self.source_spans[-1][1]
-
-    def source_span(self, rank: int) -> RowRange:
-        """Return the source rows owned by ``rank``."""
-        return self.source_spans[rank]
-
-    def ghost_intervals_from_source(
-        self, source_rank: int, destination_rank: int
-    ) -> tuple[RowRange, ...]:
-        """Return source-owned row intervals needed as destination ghosts."""
-        return tuple(
-            _intersections(
-                self.source_spans[source_rank],
-                self.ghost_requests[destination_rank],
-            )
-        )
-
-    def remote_ghost_sources(self, rank: int) -> tuple[int, ...]:
-        """Return remote ranks that provide ghosts to ``rank``."""
-        return tuple(
-            source_rank
-            for source_rank in range(len(self.source_spans))
-            if source_rank != rank
-            and self.ghost_intervals_from_source(source_rank, rank)
-        )
-
-    def remote_ghost_destinations(self, rank: int) -> tuple[int, ...]:
-        """Return remote ranks that need ghosts from ``rank``."""
-        return tuple(
-            destination_rank
-            for destination_rank in range(len(self.source_spans))
-            if destination_rank != rank
-            and self.ghost_intervals_from_source(rank, destination_rank)
-        )
-
-
-@dataclass(frozen=True)
 class ResolvedGhostSend:
     """One resolved ghost row slice owed to another rank."""
 
     destination: int
     start: int
     stop: int
-
-
-class RowExchange:
-    """Sparse exchange of ghost row slices for one local rank."""
-
-    def __init__(
-        self,
-        context: Context,
-        comm: Communicator,
-        ir_context: IRExecutionContext,
-        plan: RowExchangePlan,
-        collective_id: int,
-    ) -> None:
-        self.context = context
-        self.comm = comm
-        self.ir_context = ir_context
-        self.plan = plan
-        self.plan.validate()
-        if len(self.plan.source_spans) != comm.nranks:
-            raise ValueError(
-                "RowExchangePlan rank count must match communicator size: "
-                f"{len(self.plan.source_spans)} != {comm.nranks}"
-            )
-        self.collective_id = collective_id
-
-    async def exchange(self, local_source: BufferedChunkSource) -> RowExchangeResult:
-        """Exchange ghost rows and return local output context."""
-        sends: list[ResolvedGhostSend] = []
-        for dst in self.plan.remote_ghost_destinations(self.comm.rank):
-            sends.extend(
-                ResolvedGhostSend(dst, start, stop)
-                for start, stop in self.plan.ghost_intervals_from_source(
-                    self.comm.rank, dst
-                )
-            )
-        local_span = self.plan.source_span(self.comm.rank)
-        local_owned = (local_span,) if local_span[0] < local_span[1] else ()
-        return await exchange_resolved_ghost_slices(
-            self.context,
-            self.comm,
-            self.ir_context,
-            local_source,
-            local_owned_intervals=local_owned,
-            local_empty_span=local_span,
-            sends=sends,
-            expected_sources=self.plan.remote_ghost_sources(self.comm.rank),
-            candidate_destinations=self.plan.remote_ghost_destinations(self.comm.rank),
-            collective_id=self.collective_id,
-        )
 
 
 def _check_metadata_data_payload_pairs(src: int, pieces: Sequence[PackedData]) -> None:
@@ -596,56 +448,6 @@ def _empty_chunk_in_span(row_start: int, start: int, stop: int) -> bool:
     return start <= row_start <= stop
 
 
-def _range_intersection(left: RowRange, right: RowRange) -> RowRange | None:
-    """Return the non-empty intersection of two row ranges."""
-    start = max(left[0], right[0])
-    stop = min(left[1], right[1])
-    if start < stop:
-        return start, stop
-    return None
-
-
-def _validate_plan_spans(name: str, spans: Sequence[RowRange]) -> None:
-    """Validate monotone contiguous plan spans."""
-    previous_stop = 0
-    for rank, (start, stop) in enumerate(spans):
-        if start < 0 or stop < start:
-            raise ValueError(
-                f"Invalid RowExchangePlan {name} span for rank {rank}: "
-                f"[{start}, {stop})"
-            )
-        if start != previous_stop:
-            raise ValueError(
-                f"RowExchangePlan {name} spans must be contiguous: rank {rank} "
-                f"starts at {start}, expected {previous_stop}"
-            )
-        previous_stop = stop
-
-
-def _intersections(span: RowRange, requests: Sequence[RowRange]) -> list[RowRange]:
-    """Return sorted intersections between one source span and many requests."""
-    intervals = [
-        interval
-        for request in requests
-        if (interval := _range_intersection(span, request)) is not None
-    ]
-    return _merge_intervals(intervals)
-
-
-def _merge_intervals(intervals: Sequence[RowRange]) -> list[RowRange]:
-    """Return sorted non-empty intervals with overlaps merged."""
-    merged: list[RowRange] = []
-    for start, stop in sorted(intervals):
-        if start >= stop:
-            continue
-        if not merged or start > merged[-1][1]:
-            merged.append((start, stop))
-        else:
-            previous_start, previous_stop = merged[-1]
-            merged[-1] = (previous_start, max(previous_stop, stop))
-    return merged
-
-
 def _validate_row_range(row_start: int, row_stop: int) -> None:
     """Validate one half-open row range."""
     if row_start >= row_stop:
@@ -657,12 +459,8 @@ async def extract_region_chunks(
     input_chunks: Sequence[BufferedChunk],
     row_start: int,
     row_stop: int,
-    *,
-    ir_context: IRExecutionContext,
-    copy_result: bool = False,
 ) -> list[BufferedChunk]:
     """Slice buffered chunks intersecting a complete global row range."""
-    del ir_context
     _validate_row_range(row_start, row_stop)
     result: list[BufferedChunk] = []
     expected_start = row_start
@@ -693,20 +491,9 @@ async def extract_region_chunks(
                     exclusive_view=False,
                     br=context.br(),
                 )
-            if copy_result:
-                reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
-                    chunk.data_alloc_size(), net_memory_delta=0
-                )
-                with opaque_memory_usage(reservation):
-                    chunk = TableChunk.from_pylibcudf_table(
-                        chunk.table_view().copy(chunk.stream, context.br().device_mr),
-                        chunk.stream,
-                        exclusive_view=True,
-                        br=context.br(),
-                    )
             result.append(
                 replace(buf, sequence_number=-1)
-                if full_chunk and not copy_result
+                if full_chunk
                 else BufferedChunk(-1, chunk, start, chunk.shape[0])
             )
             expected_start = stop
@@ -725,7 +512,6 @@ async def extract_region(
     row_stop: int,
     *,
     ir_context: IRExecutionContext,
-    copy_result: bool = False,
 ) -> TableChunk:
     """Return one chunk containing a complete global row range."""
     buffered = await extract_region_chunks(
@@ -733,8 +519,6 @@ async def extract_region(
         input_chunks,
         row_start,
         row_stop,
-        ir_context=ir_context,
-        copy_result=copy_result,
     )
     chunks = [chunk.chunk for chunk in buffered]
     if len(chunks) == 1:
