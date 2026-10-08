@@ -45,6 +45,7 @@ from cudf_polars.dsl.expr import Cast, Col, NamedExpr, TemporalFunction
 from cudf_polars.dsl.ir import (
     Filter,
     GroupBy,
+    HConcat,
     HStack,
     Join,
     Projection,
@@ -60,6 +61,7 @@ from cudf_polars.streaming.actor_graph.tracing import (
     record_channel_metrics,
     send_chunk,
 )
+from cudf_polars.streaming.rolling import FixedSizeRolling
 from cudf_polars.streaming.utils import _concat
 from cudf_polars.utils.dtypes import make_empty_column
 
@@ -153,7 +155,7 @@ def _matching_order_scheme(
         )
     ]
     if matches:
-        # Prefer the most specific matching ordering; equal-length ties
+        # Prefer the most specific matching ordering. Equal-length ties
         # keep the original metadata order.
         i, ordering = max(matches, key=lambda match: len(match[1].keys))
         return OrderScheme(
@@ -781,7 +783,7 @@ def maybe_remap_partitioning(
             inter_rank=_remap_scheme_select(ir, partitioning.inter_rank, context),
             local=_remap_scheme_select(ir, partitioning.local, context),
         )
-    if isinstance(ir, Rolling):
+    if isinstance(ir, (Rolling, FixedSizeRolling)):
         return Partitioning(
             inter_rank=_remap_scheme_bindings(ir, partitioning.inter_rank),
             local=_remap_scheme_bindings(ir, partitioning.local),
@@ -793,7 +795,7 @@ def maybe_remap_partitioning(
             ),
             local=_remap_scheme_simple(ir, partitioning.local, ir.children[0]),
         )
-    if isinstance(ir, (Join, Projection, Filter)):
+    if isinstance(ir, (HConcat, Join, Projection, Filter)):
         child = child_ir if child_ir is not None else ir.children[0]
         return Partitioning(
             inter_rank=_remap_scheme_simple(ir, partitioning.inter_rank, child),
@@ -954,7 +956,7 @@ async def evaluate_chunk(
     *irs: IR,
     ir_context: IRExecutionContext,
     ordering_metadata: OrderingMetadata | None = None,
-    available: bool = False,
+    already_available: bool = False,
 ) -> TableChunk:
     """
     Make chunk available, reserve memory, and evaluate.
@@ -973,18 +975,19 @@ async def evaluate_chunk(
     ordering_metadata
         Optional precomputed ordering metadata to synthesize local DataFrame
         metadata from during the first evaluation.
-    available
-        If true, ``chunk`` is already available on device and the caller needs
-        to retain ownership of it. In this case, this helper does not call
-        ``make_table_chunks_available_or_wait`` and only reserves memory for
-        evaluation.
+    already_available
+        If true, ``chunk`` must already be available on device. The caller
+        keeps ownership of the input chunk, so this helper only reserves memory
+        for evaluation.
 
     Returns
     -------
     The resulting table chunk after evaluation.
     """
     assert len(irs) > 0, "Expected at least one IR node"
-    if available:
+    if already_available:
+        if not chunk.is_available():
+            raise ValueError("already_available=True requires an available TableChunk")
         reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
             chunk.data_alloc_size(), net_memory_delta=0
         )

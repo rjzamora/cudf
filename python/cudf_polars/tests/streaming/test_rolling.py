@@ -28,7 +28,7 @@ from cudf_polars.utils.versions import POLARS_VERSION_LT_136, POLARS_VERSION_LT_
 POLARS_LT_136_EMPTY_SUM_XFAIL = pytest.mark.xfail(
     POLARS_VERSION_LT_136,
     reason=(
-        "Polars 1.35 returns null for sum over these empty rolling windows; "
+        "Polars 1.35 returns null for sum over these empty rolling windows. "
         "newer Polars returns 0."
     ),
 )
@@ -60,7 +60,8 @@ def test_rolling_datetime(engine):
         .lazy()
     )
     q = df.with_columns(pl.sum("a").rolling(index_column="dt", period="2d"))
-    # HStack may redirect to Select before fallback; message differs by Polars IR / version.
+    # HStack may redirect to Select before fallback. The message differs by
+    # Polars IR and version.
     with warns_on_spmd(
         engine,
         UserWarning,
@@ -106,6 +107,47 @@ def test_rolling_preserves_index_ordering_metadata(spmd_engine_factory) -> None:
         df.sort("orderby")
         .rolling("orderby", period="3i")
         .agg(sum_values=pl.col("values").sum())
+    )
+    ir = Translator(q._ldf.visit(), engine).translate_ir()
+    metadata_collector = evaluate_logical_plan(
+        ir, ConfigOptions.from_polars_engine(engine), collect_metadata=True
+    )[1]
+    assert metadata_collector is not None
+    assert len(metadata_collector) == 1
+
+    metadata = metadata_collector[0]
+    assert metadata.partitioning is not None
+    assert isinstance(metadata.partitioning.inter_rank, OrderScheme)
+    assert metadata.partitioning.local == "inherit"
+    (ordering,) = metadata.partitioning.inter_rank.orderings
+    assert tuple(key.column_index for key in ordering.keys) == (0,)
+    assert ordering.strict_boundaries is True
+
+
+@pytest.mark.skipif(
+    not hasattr(plrs._expr_nodes, "RollingFunction"),
+    reason="RollingFunction not available in this polars version",
+)
+def test_fixed_size_rolling_preserves_passthrough_ordering_metadata(
+    spmd_engine_factory,
+) -> None:
+    engine = spmd_engine_factory(
+        StreamingOptions(
+            max_rows_per_partition=2,
+            dynamic_planning=None,
+            fallback_mode="raise",
+            raise_on_fail=True,
+        )
+    )
+    df = pl.LazyFrame(
+        {
+            "orderby": [1, 2, 3, 4, 5, 6],
+            "values": [10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+        }
+    )
+    q = df.sort("orderby").select(
+        "orderby",
+        pl.col("values").rolling_mean(window_size=3).alias("mean_values"),
     )
     ir = Translator(q._ldf.visit(), engine).translate_ir()
     metadata_collector = evaluate_logical_plan(
@@ -705,7 +747,7 @@ def test_over_in_filter_unsupported(request, streaming_engine_factory) -> None:
     ).filter(pl.len().over("k") == 2)
     if not isinstance(engine, SPMDEngine):
         # On Dask/Ray the fallback warning fires on worker processes and is
-        # invisible to ``pytest.warns``; the multi-rank fallback also
+        # invisible to ``pytest.warns``. The multi-rank fallback also
         # doesn't preserve row order.
         request.applymarker(
             pytest.mark.xfail(

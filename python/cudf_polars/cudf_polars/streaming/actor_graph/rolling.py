@@ -126,6 +126,7 @@ class RollingManager:
             chunk = await self.policy.prepare_chunk(
                 self.context, msg, row_offset=row_offset
             )
+            self.policy.validate_cursor(self.context, chunk)
             self.policy.observe(chunk)
             row_offset = chunk.row_stop
             yield chunk
@@ -172,14 +173,13 @@ class RollingManager:
         chunks = self.input_chunks()
         cursor = await self._next_chunk(chunks)
         while cursor is not None:
-            self.policy.validate_cursor(self.context, cursor)
             if cursor.num_rows == 0:
                 result = await evaluate_chunk(
                     self.context,
                     cursor.chunk,
                     self.ir,
                     ir_context=self.ir_context,
-                    available=True,
+                    already_available=True,
                 )
             else:
                 history = self.policy.evict_history(history, cursor, self.context)
@@ -197,7 +197,13 @@ class RollingManager:
                     history=history,
                     future=future,
                 )
-                history.append(cursor)
+                retained = await self.policy.history_chunk(
+                    self.context,
+                    cursor,
+                    ir_context=self.ir_context,
+                )
+                if retained is not None:
+                    history.append(retained)
 
             await send_chunk(
                 self.context, ch_out, result, cursor.sequence_number, tracer=tracer
@@ -236,6 +242,17 @@ class _RollingPolicy(Generic[BufferedChunkT]):
         context: Context,
     ) -> bool:
         raise NotImplementedError
+
+    async def history_chunk(
+        self,
+        context: Context,
+        cursor: BufferedChunkT,
+        *,
+        ir_context: IRExecutionContext,
+    ) -> BufferedChunkT | None:
+        """Return the cursor rows that future cursors may need."""
+        del context, ir_context
+        return cursor
 
     async def evaluate_cursor(
         self,
@@ -326,6 +343,14 @@ class _RollingPolicy(Generic[BufferedChunkT]):
         ghost_stop: int,
     ) -> TableChunk:
         """Evaluate a cursor chunk with surrounding ghost rows."""
+        if ghost_start == cursor.row_start and ghost_stop == cursor.row_stop:
+            return await evaluate_chunk(
+                context,
+                cursor.chunk,
+                ir,
+                ir_context=ir_context,
+                already_available=True,
+            )
         ghosted_chunk = await self._extract_region(
             context, chunks, ghost_start, ghost_stop, ir_context=ir_context
         )
@@ -334,7 +359,7 @@ class _RollingPolicy(Generic[BufferedChunkT]):
             ghosted_chunk,
             ir,
             ir_context=ir_context,
-            available=True,
+            already_available=True,
         )
         (table,) = plc.copying.slice(
             result.table_view(),
@@ -410,16 +435,19 @@ class RangeOverlapPolicy(_RollingPolicy[RangeBufferedChunk]):
         index: plc.Column,
         row: int,
         offset: plc.Scalar,
+        dtype: plc.DataType,
         stream: Stream,
         br: BufferResource,
     ) -> plc.Column:
         """Return ``index[row] + offset`` as a single-row device column."""
         (endpoint,) = plc.copying.slice(index, [row, row + 1], stream=stream)
+        if endpoint.type() != dtype:
+            endpoint = plc.unary.cast(endpoint, dtype, stream=stream)
         return plc.binaryop.binary_operation(
             endpoint,
             offset,
             plc.binaryop.BinaryOperator.ADD,
-            index.type(),
+            dtype,
             stream=stream,
             mr=br.device_mr,
         )
@@ -463,15 +491,16 @@ class RangeOverlapPolicy(_RollingPolicy[RangeBufferedChunk]):
         return cls._host_ordering_value(value, stream=stream, br=br)
 
     @staticmethod
-    def _global_insertion_row(
+    async def _global_insertion_row(
         chunks: Sequence[RangeBufferedChunk],
         needle: plc.Column,
         needle_value: Any,
         find: Callable[..., plc.Column],
         *,
         upper_bound: bool,
+        dtype: plc.DataType,
+        context: Context,
         needle_stream: Stream,
-        br: BufferResource,
     ) -> int:
         """Return the globally indexed insertion row of a needle in some chunks."""
         assert len(chunks) > 0
@@ -487,21 +516,45 @@ class RangeOverlapPolicy(_RollingPolicy[RangeBufferedChunk]):
                 continue
             stream = chunk.chunk.stream
             join_cuda_streams(downstreams=[stream], upstreams=[needle_stream])
-            # Since this returns a python integer, the work queued on search stream
-            # is complete, so we don't need to join back to the search and needle
-            # streams.
-            insertion_point: int = (
-                find(  # type: ignore[assignment]
-                    plc.Table([chunk.overlap.index_column]),
-                    plc.Table([needle]),
-                    [plc.types.Order.ASCENDING],
-                    [plc.types.NullOrder.AFTER],
-                    stream=stream,
-                    mr=br.device_mr,
+            index_column = chunk.overlap.index_column
+            if index_column.type() != dtype:
+                reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
+                    chunk.num_rows * 8, net_memory_delta=0
                 )
-                .to_scalar(stream=stream)
-                .to_py(stream=stream)
-            )
+                with opaque_memory_usage(reservation):
+                    index_column = plc.unary.cast(index_column, dtype, stream=stream)
+                    # Since this returns a python integer, the work queued on
+                    # search stream is complete, so we don't need to join back
+                    # to the search and needle streams.
+                    insertion_value = (
+                        find(
+                            plc.Table([index_column]),
+                            plc.Table([needle]),
+                            [plc.types.Order.ASCENDING],
+                            [plc.types.NullOrder.AFTER],
+                            stream=stream,
+                            mr=context.br().device_mr,
+                        )
+                        .to_scalar(stream=stream)
+                        .to_py(stream=stream)
+                    )
+                    assert isinstance(insertion_value, int)
+                    insertion_point = insertion_value
+            else:
+                insertion_value = (
+                    find(
+                        plc.Table([index_column]),
+                        plc.Table([needle]),
+                        [plc.types.Order.ASCENDING],
+                        [plc.types.NullOrder.AFTER],
+                        stream=stream,
+                        mr=context.br().device_mr,
+                    )
+                    .to_scalar(stream=stream)
+                    .to_py(stream=stream)
+                )
+                assert isinstance(insertion_value, int)
+                insertion_point = insertion_value
             if insertion_point < chunk.num_rows:
                 return chunk.row_start + insertion_point
         # Needle is later than all the chunks we know about.
@@ -554,46 +607,54 @@ class RangeOverlapPolicy(_RollingPolicy[RangeBufferedChunk]):
         chunk, extra = await make_table_chunks_available_or_wait(
             context,
             chunk,
-            # TODO: Only reserve if needing to cast index column.
-            reserve_extra=nrows * 8,
+            reserve_extra=32,
             net_memory_delta=0,
         )
         with opaque_memory_usage(extra):
             index_column = chunk.table_view().columns()[self.index]
-            if index_column.type() != self.index_dtype:
-                index_column = plc.unary.cast(
-                    index_column, self.index_dtype, stream=chunk.stream
-                )
             self.validate_index_column(index_column, chunk.stream)
-        if nrows == 0:
-            overlap = RangeOverlap(
-                index_column, index_column, index_column, None, None, None, None
-            )
-        else:
-            join_cuda_streams(downstreams=(chunk.stream,), upstreams=(self.stream,))
-            lower_bound = self._index_with_offset(
-                index_column, 0, self.lower, chunk.stream, context.br()
-            )
-            upper_bound = self._index_with_offset(
-                index_column, nrows - 1, self.upper, chunk.stream, context.br()
-            )
-            overlap = RangeOverlap(
-                index_column,
-                lower_bound,
-                upper_bound,
-                self._host_ordering_value_at(
-                    index_column, 0, stream=chunk.stream, br=context.br()
-                ),
-                self._host_ordering_value_at(
-                    index_column, nrows - 1, stream=chunk.stream, br=context.br()
-                ),
-                self._host_ordering_value(
-                    lower_bound, stream=chunk.stream, br=context.br()
-                ),
-                self._host_ordering_value(
-                    upper_bound, stream=chunk.stream, br=context.br()
-                ),
-            )
+            if nrows == 0:
+                overlap = RangeOverlap(
+                    index_column, index_column, index_column, None, None, None, None
+                )
+            else:
+                join_cuda_streams(downstreams=(chunk.stream,), upstreams=(self.stream,))
+                lower_bound = self._index_with_offset(
+                    index_column,
+                    0,
+                    self.lower,
+                    self.index_dtype,
+                    chunk.stream,
+                    context.br(),
+                )
+                upper_bound = self._index_with_offset(
+                    index_column,
+                    nrows - 1,
+                    self.upper,
+                    self.index_dtype,
+                    chunk.stream,
+                    context.br(),
+                )
+                overlap = RangeOverlap(
+                    index_column,
+                    lower_bound,
+                    upper_bound,
+                    self._host_ordering_value_at(
+                        index_column, 0, stream=chunk.stream, br=context.br()
+                    ),
+                    self._host_ordering_value_at(
+                        index_column,
+                        nrows - 1,
+                        stream=chunk.stream,
+                        br=context.br(),
+                    ),
+                    self._host_ordering_value(
+                        lower_bound, stream=chunk.stream, br=context.br()
+                    ),
+                    self._host_ordering_value(
+                        upper_bound, stream=chunk.stream, br=context.br()
+                    ),
+                )
         return RangeBufferedChunk(
             msg.sequence_number, chunk, row_offset, nrows, overlap
         )
@@ -652,23 +713,25 @@ class RangeOverlapPolicy(_RollingPolicy[RangeBufferedChunk]):
         chunks = [*history, cursor, *future]
         assert cursor.overlap.lower_bound is not None
         assert cursor.overlap.upper_bound is not None
-        ghost_start = self._global_insertion_row(
+        ghost_start = await self._global_insertion_row(
             chunks,
             cursor.overlap.lower_bound_column,
             cursor.overlap.lower_bound,
             self.find_start,
             upper_bound=not self.start_closed,
+            dtype=self.index_dtype,
+            context=context,
             needle_stream=cursor.chunk.stream,
-            br=context.br(),
         )
-        ghost_stop = self._global_insertion_row(
+        ghost_stop = await self._global_insertion_row(
             chunks,
             cursor.overlap.upper_bound_column,
             cursor.overlap.upper_bound,
             self.find_end,
             upper_bound=self.end_closed,
+            dtype=self.index_dtype,
+            context=context,
             needle_stream=cursor.chunk.stream,
-            br=context.br(),
         )
         # We must extract at least the whole of the current cursor chunk.
         ghost_start = min(cursor.row_start, ghost_start)
@@ -701,11 +764,9 @@ class RowCountOverlapPolicy(_RollingPolicy[BufferedChunk]):
         """Convert a message to an available chunk with row-span metadata."""
         chunk = TableChunk.from_message(msg, br=context.br())
         nrows, _ = chunk.shape
-        chunk, extra = await make_table_chunks_available_or_wait(
+        chunk, _ = await make_table_chunks_available_or_wait(
             context, chunk, reserve_extra=0, net_memory_delta=0
         )
-        with opaque_memory_usage(extra):
-            pass
         return BufferedChunk(msg.sequence_number, chunk, row_offset, nrows)
 
     def evict_history(
@@ -728,6 +789,44 @@ class RowCountOverlapPolicy(_RollingPolicy[BufferedChunk]):
         """Return whether latest contains enough leading rows."""
         del context
         return latest.row_stop >= current.row_stop + self.following
+
+    async def history_chunk(
+        self,
+        context: Context,
+        cursor: BufferedChunk,
+        *,
+        ir_context: IRExecutionContext,
+    ) -> BufferedChunk | None:
+        """Keep only emitted rows that a future fixed-size window can use."""
+        del ir_context
+        if self.preceding == 0 or cursor.num_rows == 0:
+            return None
+        start = max(cursor.row_start, cursor.row_stop - self.preceding)
+        if start == cursor.row_start:
+            return cursor
+
+        stream = cursor.chunk.stream
+        (table,) = plc.copying.slice(
+            cursor.chunk.table_view(),
+            [start - cursor.row_start, cursor.num_rows],
+            stream=stream,
+        )
+        reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
+            cursor.chunk.data_alloc_size(), net_memory_delta=0
+        )
+        with opaque_memory_usage(reservation):
+            table = table.copy(stream=stream, mr=context.br().device_mr)
+        return BufferedChunk(
+            cursor.sequence_number,
+            TableChunk.from_pylibcudf_table(
+                table,
+                stream,
+                exclusive_view=True,
+                br=context.br(),
+            ),
+            start,
+            cursor.row_stop - start,
+        )
 
     async def evaluate_cursor(
         self,
@@ -811,7 +910,7 @@ async def rolling_actor(
                 chunk,
                 ir,
                 ir_context=ir_context,
-                available=True,
+                already_available=True,
             )
             await send_chunk(context, ch_out, result, 0, tracer=tracer)
             await ch_out.drain(context)

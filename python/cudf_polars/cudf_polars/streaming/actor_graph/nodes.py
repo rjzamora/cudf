@@ -18,7 +18,7 @@ from rapidsmpf.streaming.core.actor import define_actor
 from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.core.spillable_messages import SpillableMessages
 
-from cudf_polars.dsl.ir import IR, Empty, Join
+from cudf_polars.dsl.ir import IR, Empty, HConcat, Join
 from cudf_polars.streaming.actor_graph.dispatch import (
     generate_ir_sub_network,
     ir_context_for_node,
@@ -154,7 +154,8 @@ async def default_node_multi(
         Tuple of input Channel[TableChunk]s.
     partitioning_index
         Index of the input channel to preserve partitioning information for.
-        If None, no partitioning information is preserved.
+        For HConcat, None means the first remappable input is used. Other
+        multi-input nodes preserve no partitioning when this is None.
     """
     async with shutdown_on_error(
         context,
@@ -173,22 +174,37 @@ async def default_node_multi(
         child_ordering_metadatas = [
             _leading_order_keys(md_child) for md_child in child_metadatas
         ]
-        for idx, md_child in enumerate(child_metadatas):
+        candidate_partitioning_indices: tuple[int, ...] | range
+        if partitioning_index is not None:
+            candidate_partitioning_indices = (partitioning_index,)
+        elif isinstance(ir, HConcat):
+            candidate_partitioning_indices = range(len(child_metadatas))
+        else:
+            candidate_partitioning_indices = ()
+
+        for md_child in child_metadatas:
             # Use simple "max" rule to determine counts.
             local_count = max(md_child.local_count, local_count)
             # Set "duplicated" to False as soon as we
             # find a non-duplicated child.
             duplicated = duplicated and md_child.duplicated
-            if idx == partitioning_index:
-                # Remap partitioning from child schema to output schema
-                partitioning = maybe_remap_partitioning(
-                    ir,
-                    md_child.partitioning,
-                    child_ir=ir.children[idx],
-                    context=context,
-                )
-                if not _preserves_local_order(ir, partitioning_index):
+        for idx in candidate_partitioning_indices:
+            md_child = child_metadatas[idx]
+            # Remap partitioning from child schema to output schema.
+            partitioning = maybe_remap_partitioning(
+                ir,
+                md_child.partitioning,
+                child_ir=ir.children[idx],
+                context=context,
+            )
+            if partitioning is not None:
+                if idx == partitioning_index:
+                    local_order_index = partitioning_index
+                else:
+                    local_order_index = idx
+                if not _preserves_local_order(ir, local_order_index):
                     partitioning = clear_local_ordering(partitioning)
+                break
         metadata = ChannelMetadata(
             local_count=local_count,
             partitioning=partitioning,
