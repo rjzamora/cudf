@@ -4,18 +4,105 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
-from cudf_polars.dsl.ir import Rolling
+from cudf_polars.dsl import expr
+from cudf_polars.dsl.ir import IR, Rolling, Select
+from cudf_polars.dsl.tracing import log_do_evaluate, nvtx_annotate_cudf_polars
+from cudf_polars.dsl.utils.column_domain import ColumnBinding, column_domain_bindings
 from cudf_polars.streaming.base import PartitionInfo
 from cudf_polars.streaming.dispatch import lower_ir_node
 from cudf_polars.streaming.utils import _lower_ir_fallback
 
 if TYPE_CHECKING:
-    from collections.abc import MutableMapping
+    from collections.abc import MutableMapping, Sequence
 
-    from cudf_polars.dsl.ir import IR
+    from cudf_polars.containers import DataFrame
+    from cudf_polars.dsl.ir import IRExecutionContext
     from cudf_polars.streaming.dispatch import LowerIRTransformer
+    from cudf_polars.typing import Schema
+
+
+class FixedSizeRolling(IR):
+    """Evaluate fixed-size rolling expressions with row-count overlap."""
+
+    __slots__ = ("exprs", "following_overlap", "preceding_overlap", "should_broadcast")
+    _non_child: ClassVar[tuple[str, ...]] = (
+        "schema",
+        "exprs",
+        "should_broadcast",
+        "preceding_overlap",
+        "following_overlap",
+    )
+    _n_non_child_args: ClassVar[int] = 2
+    _preserves_output_order: ClassVar[bool] = True
+    exprs: tuple[expr.NamedExpr, ...]
+    should_broadcast: bool
+    preceding_overlap: int
+    following_overlap: int
+
+    def __init__(
+        self,
+        schema: Schema,
+        exprs: Sequence[expr.NamedExpr],
+        should_broadcast: bool,  # noqa: FBT001
+        preceding_overlap: int,
+        following_overlap: int,
+        df: IR,
+    ) -> None:
+        self.schema = schema
+        self.exprs = tuple(exprs)
+        self.should_broadcast = should_broadcast
+        self.preceding_overlap = preceding_overlap
+        self.following_overlap = following_overlap
+        self.children = (df,)
+        # Fixed-size rolling is only special for streaming chunk overlap.
+        # Once evaluated against one table, this is just a normal Select.
+        self._non_child_args = (self.exprs, should_broadcast)
+
+    @classmethod
+    @log_do_evaluate
+    @nvtx_annotate_cudf_polars(message="FixedSizeRolling")
+    def do_evaluate(
+        cls,
+        exprs: tuple[expr.NamedExpr, ...],
+        should_broadcast: bool,  # noqa: FBT001
+        df: DataFrame,
+        *,
+        context: IRExecutionContext,
+    ) -> DataFrame:
+        """Evaluate fixed-size rolling expressions against df."""
+        return Select.do_evaluate(exprs, should_broadcast, df, context=context)
+
+
+@lower_ir_node.register(FixedSizeRolling)
+def _(
+    ir: FixedSizeRolling, rec: LowerIRTransformer
+) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    """Lower fixed-size rolling expressions for streaming execution."""
+    (child,) = ir.children
+    child, partition_info = rec(child)
+    new_node = ir.reconstruct([child])
+    partition_info[new_node] = PartitionInfo(count=partition_info[child].count)
+    return new_node, partition_info
+
+
+@column_domain_bindings.register(FixedSizeRolling)
+def _(node: FixedSizeRolling) -> dict[str, ColumnBinding]:
+    """Return direct passthrough bindings for fixed-size rolling outputs."""
+    return {
+        item.name: ColumnBinding(0, item.value.name)
+        for item in node.exprs
+        if isinstance(item.value, expr.Col)
+    }
+
+
+@column_domain_bindings.register(Rolling)
+def _(node: Rolling) -> dict[str, ColumnBinding]:
+    """Return the rolling index column binding when it is passed through."""
+    if isinstance(node.index.value, expr.Col):
+        return {node.index.name: ColumnBinding(0, node.index.value.name)}
+    return {}
 
 
 @lower_ir_node.register(Rolling)

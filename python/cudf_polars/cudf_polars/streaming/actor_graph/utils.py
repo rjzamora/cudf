@@ -48,6 +48,7 @@ from cudf_polars.dsl.ir import (
     HStack,
     Join,
     Projection,
+    Rolling,
     Select,
 )
 from cudf_polars.dsl.tracing import Scope
@@ -686,6 +687,45 @@ def _remap_scheme_simple(
     return scheme  # None or "inherit" passes through unchanged
 
 
+def _remap_scheme_bindings(ir: IR, scheme: PartitioningScheme) -> PartitioningScheme:
+    old_to_new_names: defaultdict[str, dict[str, None]] = defaultdict(dict)
+    for output_name, source in column_domain_bindings(ir).items():
+        if source.child_index == 0:
+            old_to_new_names[source.name][output_name] = None
+
+    child = ir.children[0]
+    if isinstance(scheme, HashScheme):
+        old_key_names = indices_to_names(scheme.column_indices, child.schema)
+        if set(old_key_names).issubset(set(old_to_new_names)):
+            new_indices = names_to_indices(
+                tuple(
+                    _preferred_target_name(name, old_to_new_names[name])
+                    for name in old_key_names
+                ),
+                ir.schema,
+            )
+            return HashScheme(new_indices, scheme.modulus)
+        return None
+    if isinstance(scheme, OrderScheme):
+        new_orderings: list[Ordering] = []
+        for ordering in scheme.orderings:
+            old_key_names = indices_to_names(ordering.column_indices, child.schema)
+            if not set(old_key_names).issubset(set(old_to_new_names)):
+                continue
+            new_indices = names_to_indices(
+                tuple(
+                    _preferred_target_name(name, old_to_new_names[name])
+                    for name in old_key_names
+                ),
+                ir.schema,
+            )
+            new_orderings.append(_update_ordering_indices(ordering, new_indices))
+        if new_orderings:
+            return OrderScheme(new_orderings)
+        return None
+    return scheme
+
+
 def _hstack_to_select(hstack: HStack) -> Select:
     """Translate HStack to the equivalent Select node."""
     col_map = {ne.name: ne for ne in hstack.columns}
@@ -740,6 +780,11 @@ def maybe_remap_partitioning(
         return Partitioning(
             inter_rank=_remap_scheme_select(ir, partitioning.inter_rank, context),
             local=_remap_scheme_select(ir, partitioning.local, context),
+        )
+    if isinstance(ir, Rolling):
+        return Partitioning(
+            inter_rank=_remap_scheme_bindings(ir, partitioning.inter_rank),
+            local=_remap_scheme_bindings(ir, partitioning.local),
         )
     if isinstance(ir, GroupBy):
         return Partitioning(
@@ -909,6 +954,7 @@ async def evaluate_chunk(
     *irs: IR,
     ir_context: IRExecutionContext,
     ordering_metadata: OrderingMetadata | None = None,
+    available: bool = False,
 ) -> TableChunk:
     """
     Make chunk available, reserve memory, and evaluate.
@@ -927,19 +973,29 @@ async def evaluate_chunk(
     ordering_metadata
         Optional precomputed ordering metadata to synthesize local DataFrame
         metadata from during the first evaluation.
+    available
+        If true, ``chunk`` is already available on device and the caller needs
+        to retain ownership of it. In this case, this helper does not call
+        ``make_table_chunks_available_or_wait`` and only reserves memory for
+        evaluation.
 
     Returns
     -------
     The resulting table chunk after evaluation.
     """
     assert len(irs) > 0, "Expected at least one IR node"
-    chunk, extra = await make_table_chunks_available_or_wait(
-        context,
-        chunk,
-        reserve_extra=chunk.data_alloc_size(),
-        net_memory_delta=0,
-    )
-    with opaque_memory_usage(extra):
+    if available:
+        reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
+            chunk.data_alloc_size(), net_memory_delta=0
+        )
+    else:
+        chunk, reservation = await make_table_chunks_available_or_wait(
+            context,
+            chunk,
+            reserve_extra=chunk.data_alloc_size(),
+            net_memory_delta=0,
+        )
+    with opaque_memory_usage(reservation):
         for single_ir in irs:
             chunk = await ir_context.to_thread(
                 _evaluate_chunk_sync,

@@ -8,15 +8,21 @@ import datetime as dt
 import pytest
 
 import polars as pl
+from polars import polars as plrs  # type: ignore[attr-defined]
 from polars.testing import assert_frame_equal
 
+from cudf_streaming.channel_metadata import OrderScheme
+
+from cudf_polars import Translator
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.engine.spmd import SPMDEngine
+from cudf_polars.streaming.actor_graph.core import evaluate_logical_plan
 from cudf_polars.testing.asserts import (
     assert_gpu_result_equal,
     assert_ir_translation_raises,
 )
 from cudf_polars.testing.engine_utils import warns_on_spmd
+from cudf_polars.utils.config import ConfigOptions
 from cudf_polars.utils.versions import POLARS_VERSION_LT_136, POLARS_VERSION_LT_139
 
 POLARS_LT_136_EMPTY_SUM_XFAIL = pytest.mark.xfail(
@@ -79,6 +85,42 @@ def test_rolling_integer_period(engine, closed) -> None:
     )
 
     assert_gpu_result_equal(q, engine=engine)
+
+
+def test_rolling_preserves_index_ordering_metadata(spmd_engine_factory) -> None:
+    engine = spmd_engine_factory(
+        StreamingOptions(
+            max_rows_per_partition=2,
+            dynamic_planning=None,
+            fallback_mode="raise",
+            raise_on_fail=True,
+        )
+    )
+    df = pl.LazyFrame(
+        {
+            "orderby": [1, 2, 3, 4, 5, 6],
+            "values": [10, 20, 30, 40, 50, 60],
+        }
+    )
+    q = (
+        df.sort("orderby")
+        .rolling("orderby", period="3i")
+        .agg(sum_values=pl.col("values").sum())
+    )
+    ir = Translator(q._ldf.visit(), engine).translate_ir()
+    metadata_collector = evaluate_logical_plan(
+        ir, ConfigOptions.from_polars_engine(engine), collect_metadata=True
+    )[1]
+    assert metadata_collector is not None
+    assert len(metadata_collector) == 1
+
+    metadata = metadata_collector[0]
+    assert metadata.partitioning is not None
+    assert isinstance(metadata.partitioning.inter_rank, OrderScheme)
+    assert metadata.partitioning.local == "inherit"
+    (ordering,) = metadata.partitioning.inter_rank.orderings
+    assert tuple(key.column_index for key in ordering.keys) == (0,)
+    assert ordering.strict_boundaries is True
 
 
 @pytest.mark.parametrize(
@@ -151,6 +193,18 @@ def test_rolling_unsorted_across_chunks_raises(
         )
     ):
         q.collect(engine=engine)
+
+
+@pytest.mark.skipif(
+    not hasattr(plrs._expr_nodes, "RollingFunction"),
+    reason="RollingFunction not available in this polars version",
+)
+@pytest.mark.parametrize("center", [False, True])
+def test_fixed_size_rolling_mean(engine, center) -> None:
+    df = pl.LazyFrame({"x": [1.0, 2.0, 4.0, 8.0, 16.0]})
+    q = df.select(pl.col("x").rolling_mean(window_size=3, center=center))
+
+    assert_gpu_result_equal(q, engine=engine)
 
 
 @pytest.mark.parametrize(
