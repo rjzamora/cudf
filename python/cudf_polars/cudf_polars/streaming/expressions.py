@@ -149,7 +149,7 @@ def select(
     return columns, new_ir, partition_info
 
 
-def _fixed_size_rolling_overlap(exprs: Sequence[Expr]) -> tuple[int, int]:
+def _common_fixed_size_rolling_overlap(exprs: Sequence[Expr]) -> tuple[int, int]:
     """Return the row-count overlap required by fixed-size rolling exprs."""
     preceding = following = 0
     for node in traversal(exprs):
@@ -168,7 +168,7 @@ def fixed_size_rolling_select(
 ) -> tuple[list[Col], IR, MutableMapping[IR, PartitionInfo]]:
     """Select fixed-size rolling expressions using row-count overlap."""
     named_exprs = [NamedExpr(next(names), expr) for expr in exprs]
-    preceding, following = _fixed_size_rolling_overlap(exprs)
+    preceding, following = _common_fixed_size_rolling_overlap(exprs)
     new_ir = FixedSizeRolling(
         {ne.name: ne.value.dtype for ne in named_exprs},
         named_exprs,

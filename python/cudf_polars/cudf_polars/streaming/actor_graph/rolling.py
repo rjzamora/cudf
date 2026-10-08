@@ -599,6 +599,23 @@ class RollingInput(Generic[BufferedChunkT]):
             source.release_cached_before(row_stop)
 
 
+@dataclass
+class RollingManager(Generic[BufferedChunkT]):
+    """Prepared rolling policy and input, with shared cleanup."""
+
+    policy: RollingPolicy[BufferedChunkT]
+    rolling_input: RollingInput[BufferedChunkT]
+
+    async def __aenter__(self) -> RollingManager[BufferedChunkT]:
+        """Return the prepared rolling context."""
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        """Release prepared input and policy-owned resources."""
+        self.rolling_input.close()
+        self.policy.close()
+
+
 def index_with_offset(
     index: plc.Column,
     row: int,
@@ -1348,7 +1365,6 @@ def _range_remote_destinations(
 
 async def _range_request_sends(
     context: Context,
-    ir_context: IRExecutionContext,
     source: BufferedChunkSource,
     summary: RangeInputSummary,
     requests: RangeRequests,
@@ -1370,7 +1386,6 @@ async def _range_request_sends(
             async for buffered in source.iter_region_chunks(
                 chunk.row_start + row_offset,
                 chunk.row_stop + row_offset,
-                ir_context=ir_context,
             ):
                 index_column = buffered.chunk.table_view().columns()[policy.index]
                 if index_column.type() != policy.index_dtype:
@@ -1475,7 +1490,7 @@ async def _local_staged_chunks(
         yield StagedChunk(chunk, owned=True, output_sequence_number=msg.sequence_number)
 
 
-async def _evaluate_staged_rolling(
+async def execute_rolling_policy(
     context: Context,
     ir: IR,
     ir_context: IRExecutionContext,
@@ -1551,45 +1566,13 @@ async def _evaluate_staged_rolling(
     await ch_out.drain(context)
 
 
-def prepare_local_rolling_input(
-    context: Context,
-    ch_in: Channel[TableChunk],
-    policy: RollingPolicy[BufferedChunkT],
-) -> RollingInput[BufferedChunkT]:
-    """Prepare a rolling input that reads the original channel directly."""
-    return RollingInput(_local_staged_chunks(context, ch_in, policy))
-
-
-async def execute_rolling_policy(
-    context: Context,
-    ir: IR,
-    ir_context: IRExecutionContext,
-    ch_out: Channel[TableChunk],
-    rolling_input: RollingInput[BufferedChunkT],
-    policy: RollingPolicy[BufferedChunkT],
-    tracer: ActorTracer | None,
-) -> None:
-    """Evaluate one rolling policy over prepared input chunks."""
-    await _evaluate_staged_rolling(
-        context,
-        ir,
-        ir_context,
-        ch_out,
-        rolling_input,
-        policy,
-        tracer,
-    )
-
-
 async def _fixed_size_context_chunks(
     result: RowExchangeResult,
     output_span: RowRange,
-    *,
-    ir_context: IRExecutionContext,
 ) -> AsyncIterator[StagedChunk[BufferedChunk]]:
     """Yield ghost and owned chunks in global row order for fixed-size rolling."""
     output_start, output_stop = output_span
-    ghost_iter = result.iter_ghosts(ir_context=ir_context)
+    ghost_iter = result.ghost_source.iter_chunks()
     first_right_ghost: BufferedChunk | None = None
     async for chunk in ghost_iter:
         if chunk.row_stop <= output_start:
@@ -1602,7 +1585,6 @@ async def _fixed_size_context_chunks(
                 "Fixed-size rolling received a ghost chunk that overlaps owned rows"
             )
     async for chunk in result.iter_local_owned(
-        ir_context=ir_context,
         include_empty_chunks=True,
     ):
         yield StagedChunk(chunk, owned=True)
@@ -1656,14 +1638,13 @@ async def prepare_fixed_size_multirank_input(
         ).exchange(local_source)
 
         def cleanup() -> None:
-            exchange_result.clear_received()
+            exchange_result.ghost_source.clear()
             local_source.clear()
 
         return RollingInput(
             _fixed_size_context_chunks(
                 exchange_result,
                 plan.source_span(comm.rank),
-                ir_context=ir_context,
             ),
             release_sources=(
                 exchange_result.local_source,
@@ -1681,12 +1662,10 @@ async def _range_context_chunks(
     result: RowExchangeResult,
     output_span: RowRange,
     policy: RangeOverlapPolicy,
-    *,
-    ir_context: IRExecutionContext,
 ) -> AsyncIterator[StagedChunk[RangeBufferedChunk]]:
     """Yield range ghosts and owned chunks in global row order."""
     output_start, output_stop = output_span
-    ghost_iter = result.iter_ghosts(ir_context=ir_context)
+    ghost_iter = result.ghost_source.iter_chunks()
     first_right_ghost: RangeBufferedChunk | None = None
     async for chunk in ghost_iter:
         prepared = await policy.prepare_table_chunk(
@@ -1706,7 +1685,6 @@ async def _range_context_chunks(
                 "Range rolling received a ghost chunk that overlaps owned rows"
             )
     async for chunk in result.iter_local_owned(
-        ir_context=ir_context,
         include_empty_chunks=True,
     ):
         prepared = await policy.prepare_table_chunk(
@@ -1785,7 +1763,6 @@ async def prepare_range_multirank_input(
         remote_destinations = _range_remote_destinations(comm, summary, requests)
         sends = await _range_request_sends(
             context,
-            ir_context,
             local_source,
             summary,
             requests,
@@ -1809,7 +1786,7 @@ async def prepare_range_multirank_input(
         )
 
         def cleanup() -> None:
-            exchange_result.clear_received()
+            exchange_result.ghost_source.clear()
             local_source.clear()
 
         return RollingInput(
@@ -1818,7 +1795,6 @@ async def prepare_range_multirank_input(
                 exchange_result,
                 output_span,
                 policy,
-                ir_context=ir_context,
             ),
             release_sources=(
                 exchange_result.local_source,
@@ -1845,7 +1821,7 @@ async def prepare_rolling_input(
 ) -> RollingInput[Any]:
     """Prepare rank-agnostic input chunks for a rolling operation."""
     if comm.nranks == 1 or metadata_in.duplicated:
-        return prepare_local_rolling_input(context, ch_in, policy)
+        return RollingInput(_local_staged_chunks(context, ch_in, policy))
     if isinstance(ir, Rolling):
         assert isinstance(policy, RangeOverlapPolicy)
         return await prepare_range_multirank_input(
@@ -1870,6 +1846,41 @@ async def prepare_rolling_input(
     )
 
 
+async def prepare_rolling_manager(
+    context: Context,
+    comm: Communicator,
+    ir: Rolling | FixedSizeRolling,
+    ir_context: IRExecutionContext,
+    ch_in: Channel[TableChunk],
+    metadata_in: ChannelMetadata,
+    *,
+    collective_id: int,
+) -> RollingManager[Any]:
+    """Prepare the rolling policy and input with one cleanup owner."""
+    if isinstance(ir, Rolling):
+        policy: RollingPolicy[Any] = RangeOverlapPolicy.from_ir(
+            ir, context.br().stream_pool.get_stream()
+        )
+    else:
+        policy = RowCountOverlapPolicy(ir.preceding_overlap, ir.following_overlap)
+
+    try:
+        rolling_input = await prepare_rolling_input(
+            context,
+            comm,
+            ir,
+            ir_context,
+            ch_in,
+            policy,
+            metadata_in,
+            collective_id=collective_id,
+        )
+    except BaseException:
+        policy.close()
+        raise
+    return RollingManager(policy, rolling_input)
+
+
 @define_actor()
 async def rolling_actor(
     context: Context,
@@ -1890,31 +1901,19 @@ async def rolling_actor(
         ir_context=ir_context,
     ) as tracer:
         metadata_in = await recv_metadata(ch_in, context)
-        if isinstance(ir, Rolling):
-            policy: RollingPolicy[Any] = RangeOverlapPolicy.from_ir(
-                ir, context.br().stream_pool.get_stream()
-            )
-        else:
-            policy = RowCountOverlapPolicy(ir.preceding_overlap, ir.following_overlap)
-
-        try:
-            rolling_input = await prepare_rolling_input(
-                context,
-                comm,
-                ir,
-                ir_context,
-                ch_in,
-                policy,
-                metadata_in,
-                collective_id=collective_id,
-            )
-        except BaseException:
-            policy.close()
-            raise
-        try:
+        manager = await prepare_rolling_manager(
+            context,
+            comm,
+            ir,
+            ir_context,
+            ch_in,
+            metadata_in,
+            collective_id=collective_id,
+        )
+        async with manager:
             input_partitioning = _merge_learned_inter_rank(
                 metadata_in.partitioning,
-                rolling_input.partitioning,
+                manager.rolling_input.partitioning,
             )
             partitioning = maybe_remap_partitioning(
                 ir, input_partitioning, context=context
@@ -1936,13 +1935,10 @@ async def rolling_actor(
                 ir,
                 ir_context,
                 ch_out,
-                rolling_input,
-                policy,
+                manager.rolling_input,
+                manager.policy,
                 tracer,
             )
-        finally:
-            rolling_input.close()
-            policy.close()
 
 
 def generate_rolling_sub_network(

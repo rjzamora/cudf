@@ -184,12 +184,10 @@ class BufferedChunkSource:
         row_start: int,
         row_stop: int,
         *,
-        ir_context: IRExecutionContext,
         copy_result: bool = False,
         include_empty_in_span: RowRange | None = None,
     ) -> AsyncIterator[BufferedChunk]:
         """Yield chunks intersecting a complete global row range."""
-        del ir_context
         if row_start > row_stop:
             raise ValueError(f"Invalid row range [{row_start}, {row_stop})")
         expected_start = row_start
@@ -227,14 +225,8 @@ class BufferedChunkSource:
                 f"[{row_start}, {row_stop})"
             )
 
-    async def iter_chunks(
-        self,
-        *,
-        ir_context: IRExecutionContext,
-        copy_result: bool = False,
-    ) -> AsyncIterator[BufferedChunk]:
+    async def iter_chunks(self) -> AsyncIterator[BufferedChunk]:
         """Yield all stored chunks in row-span order."""
-        del ir_context
         for record in self._records:
             start = self._row_start(record)
             stop = self._row_stop(record)
@@ -245,7 +237,6 @@ class BufferedChunkSource:
                     start,
                     stop,
                     record=record,
-                    copy_result=copy_result,
                 )
 
     async def extract_chunk_slice(
@@ -298,14 +289,9 @@ class RowExchangeResult:
     local_owned_intervals: tuple[RowRange, ...]
     local_empty_span: RowRange | None
 
-    def clear_received(self) -> None:
-        """Discard rows received from remote ranks."""
-        self.ghost_source.clear()
-
     async def iter_local_owned(
         self,
         *,
-        ir_context: IRExecutionContext,
         include_empty_chunks: bool = False,
     ) -> AsyncIterator[BufferedChunk]:
         """Yield locally owned chunks directly from the spillable source."""
@@ -313,28 +299,17 @@ class RowExchangeResult:
             async for chunk in self.local_source.iter_region_chunks(
                 start,
                 stop,
-                ir_context=ir_context,
                 include_empty_in_span=(start, stop) if include_empty_chunks else None,
             ):
                 yield chunk
         if self.local_empty_span is not None and not self.local_owned_intervals:
             async for chunk in self.local_source.iter_region_chunks(
                 *self.local_empty_span,
-                ir_context=ir_context,
                 include_empty_in_span=self.local_empty_span
                 if include_empty_chunks
                 else None,
             ):
                 yield chunk
-
-    async def iter_ghosts(
-        self,
-        *,
-        ir_context: IRExecutionContext,
-    ) -> AsyncIterator[BufferedChunk]:
-        """Yield ghost chunks received from remote ranks."""
-        async for chunk in self.ghost_source.iter_chunks(ir_context=ir_context):
-            yield chunk
 
 
 @dataclass(frozen=True)
@@ -521,9 +496,7 @@ async def exchange_resolved_ghost_slices(
     insert_finished = False
     try:
         for send in sorted(sends, key=lambda item: (item.destination, item.start)):
-            await _send_resolved_slice(
-                context, ir_context, exchange, local_source, send
-            )
+            await _send_resolved_slice(context, exchange, local_source, send)
     finally:
         await exchange.insert_finished(context)
         insert_finished = True
@@ -557,7 +530,6 @@ async def exchange_resolved_ghost_slices(
 
 async def _send_resolved_slice(
     context: Context,
-    ir_context: IRExecutionContext,
     exchange: SparseAlltoall,
     local_source: BufferedChunkSource,
     send: ResolvedGhostSend,
@@ -568,7 +540,6 @@ async def _send_resolved_slice(
     async for chunk in local_source.iter_region_chunks(
         send.start,
         send.stop,
-        ir_context=ir_context,
         copy_result=True,
     ):
         metadata = _slice_metadata_chunk(context, chunk.row_start, chunk.row_stop)
