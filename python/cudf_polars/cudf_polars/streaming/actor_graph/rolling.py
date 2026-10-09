@@ -101,7 +101,7 @@ class RollingManager:
     policy: _RollingPolicy[Any] = field(init=False)
 
     def __post_init__(self) -> None:
-        """Create the overlap policy for the rolling node."""
+        """Choose the policy for this rolling node."""
         if isinstance(self.ir, Rolling):
             self.policy = RangeOverlapPolicy.from_ir(
                 self.ir, self.ir_context.get_cuda_stream()
@@ -112,7 +112,7 @@ class RollingManager:
             )
 
     def __enter__(self) -> RollingManager:
-        """Return the prepared rolling context."""
+        """Enter the rolling manager context."""
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -133,7 +133,6 @@ class RollingManager:
 
     @staticmethod
     async def _next_chunk(chunks: AsyncIterator[Any]) -> Any | None:
-        """Return the next chunk, or ``None`` when exhausted."""
         try:
             return await anext(chunks)
         except StopAsyncIteration:
@@ -141,7 +140,6 @@ class RollingManager:
 
     @staticmethod
     def _latest_nonempty_chunk(current: Any, future: list[Any]) -> Any:
-        """Return the latest non-empty chunk among current and future."""
         for chunk in reversed(future):
             if chunk.num_rows != 0:
                 return chunk
@@ -366,8 +364,13 @@ class _RollingPolicy(Generic[BufferedChunkT]):
             [cursor.row_start - ghost_start, cursor.row_stop - ghost_start],
             stream=result.stream,
         )
+        reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
+            result.data_alloc_size(), net_memory_delta=0
+        )
+        with opaque_memory_usage(reservation):
+            table = table.copy(result.stream, context.br().device_mr)
         return TableChunk.from_pylibcudf_table(
-            table.copy(result.stream, context.br().device_mr),
+            table,
             result.stream,
             exclusive_view=True,
             br=context.br(),
