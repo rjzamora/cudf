@@ -179,6 +179,7 @@ def decompose_select(
             select_ir.schema,
             True,  # noqa: FBT003
             False,  # noqa: FBT003
+            True,  # noqa: FBT003
             *selections,
         )
         partition_info[new_ir] = PartitionInfo(
@@ -354,6 +355,7 @@ def _fuse_simple_reductions(
             hconcat_schema,
             True,  # noqa: FBT003
             False,  # noqa: FBT003
+            True,  # noqa: FBT003
             *new_decomposed_select_irs,
         )
         count = max(pi[c].count for c in new_decomposed_select_irs)

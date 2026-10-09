@@ -68,7 +68,7 @@ if TYPE_CHECKING:
 def _preserves_local_order(ir: IR, child_index: int | None = None) -> bool:
     """Return True when this IR node preserves advertised local row order."""
     if isinstance(ir, HConcat):
-        return True
+        return ir.streaming_safe
     if isinstance(ir, Join) and child_index is not None:
         side: Literal["left", "right"] = "left" if child_index == 0 else "right"
         return join_preserves_side_order(ir.options[5], side)
@@ -133,7 +133,7 @@ def resolve_hconcat_partitioning(
     context: Context,
 ) -> Partitioning | None:
     """Merge compatible child partitioning metadata for internal HConcat."""
-    if not isinstance(ir, HConcat) or not ir.should_broadcast:
+    if not isinstance(ir, HConcat) or not ir.streaming_safe:
         return None
 
     indices = [
@@ -704,7 +704,7 @@ def _(
                 tuple(channels[c].reserve_output_slot() for c in ir.children),
                 partitioning_resolver=(
                     resolve_hconcat_partitioning
-                    if isinstance(ir, HConcat) and ir.should_broadcast
+                    if isinstance(ir, HConcat) and ir.streaming_safe
                     else None
                 ),
             )
