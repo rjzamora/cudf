@@ -44,7 +44,10 @@ from cudf_polars.streaming.actor_graph.dispatch import (
     ir_context_for_node,
 )
 from cudf_polars.streaming.actor_graph.join_planning import JoinPlanningState
-from cudf_polars.streaming.actor_graph.nodes import default_node_multi
+from cudf_polars.streaming.actor_graph.nodes import (
+    PreserveChildPartitioning,
+    default_node_multi,
+)
 from cudf_polars.streaming.actor_graph.prefilter import (
     JoinPrefilterExecution,
     add_bloom_prefilter,
@@ -2108,7 +2111,7 @@ def _(
                     channels[left].reserve_output_slot(),
                     channels[right].reserve_output_slot(),
                 ),
-                partitioning_index=partitioning_index,
+                partitioning_resolver=PreserveChildPartitioning(partitioning_index),
             )
         ]
         return actors, channels
