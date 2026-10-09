@@ -484,6 +484,8 @@ def _decompose_expr_node(
             names=names,
         )
     elif isinstance(expr, FixedSizeRollingWindow):
+        # TODO: Batch sibling fixed-size rolling expressions that share an
+        # input IR so they can reuse one overlap pass.
         columns, input_ir, partition_info = fixed_size_rolling_select(
             [expr],
             input_ir,
