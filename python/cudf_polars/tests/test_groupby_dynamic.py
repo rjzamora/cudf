@@ -84,16 +84,6 @@ def _aggs() -> list[pl.Expr]:
     ]
 
 
-def _first_last_fallback(engine: pl.GPUEngine):
-    """Streaming group-bys run first/last aggregations on one partition."""
-    return warns_on_spmd(
-        engine,
-        UserWarning,
-        match="Failed to decompose groupby aggs for multiple partitions",
-        when=get_blocksize_mode(engine) == "medium",
-    )
-
-
 @pytest.mark.parametrize(
     "every", ["7m", "10m", "1h", "90m", "36h", "1d", "3d", "1w", "2w"]
 )
@@ -247,8 +237,7 @@ def test_first_last(
         pl.col("v").last().alias("v_last"),
         pl.col("t").first().alias("t_first"),
     )
-    with _first_last_fallback(engine):
-        assert_gpu_result_equal(q, engine=engine)
+    assert_gpu_result_equal(q, engine=engine)
 
 
 def test_no_aggregations(engine: pl.GPUEngine, short_frame: pl.LazyFrame) -> None:
@@ -325,6 +314,15 @@ def test_streaming(
     assert_gpu_result_equal(q, engine=engine)
 
 
+def test_right_closed_partition_boundary(engine: pl.GPUEngine) -> None:
+    q = (
+        pl.LazyFrame({"t": range(8), "v": range(8)})
+        .group_by_dynamic("t", every="2i", closed="right")
+        .agg(pl.col("v").sum())
+    )
+    assert_gpu_result_equal(q, engine=engine)
+
+
 @pytest.fixture(scope="module")
 def quotes() -> pl.LazyFrame:
     rng = random.Random(3)
@@ -385,8 +383,7 @@ def test_taq_ohlc(engine: pl.GPUEngine, quotes: pl.LazyFrame, every: str) -> Non
         pl.col("bid").last().alias("c"),
         pl.col("bsize").sum().alias("s"),
     )
-    with _first_last_fallback(engine):
-        assert_gpu_result_equal(q, engine=engine)
+    assert_gpu_result_equal(q, engine=engine)
 
 
 _UNSORTED = (pl.exceptions.InvalidOperationError, "is not sorted")
@@ -427,7 +424,9 @@ def test_invalid_index_raises(
     with pytest.raises(exception, match=match):
         q.collect(engine="in-memory")
     if is_streaming_engine(engine):
-        with pytest.RaisesGroup(pytest.RaisesExc(exception, match=match)):
+        with pytest.RaisesGroup(
+            pytest.RaisesExc(exception, match=match), flatten_subgroups=True
+        ):
             q.collect(engine=engine)
     else:
         with pytest.raises(exception, match=match):
@@ -446,15 +445,13 @@ def test_invalid_index_raises(
     ],
     ids=["keys-nulls-first", "keys-nulls-last", "interleaved", "interleaved-two-keys"],
 )
-def test_sorted_within_groups(
-    in_memory_engine: pl.GPUEngine, t: list, keys: dict
-) -> None:
+def test_sorted_within_groups(engine: pl.GPUEngine, t: list, keys: dict) -> None:
     q = (
         pl.LazyFrame({"t": t, **keys, "v": range(len(t))})
         .group_by_dynamic("t", every="2i", group_by=list(keys))
         .agg(pl.col("v").sum(), pl.col("v").first().alias("first"))
     )
-    assert_gpu_result_equal(q, engine=in_memory_engine)
+    assert_gpu_result_equal(q, engine=engine)
 
 
 @pytest.mark.parametrize(

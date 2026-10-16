@@ -245,6 +245,10 @@ class DynamicWindowStart(Expr):
         index, *keys = (child.evaluate(df, context=context) for child in self.children)
         stream = df.stream
         self._validate(index, keys, stream)
+        return self.evaluate_index(index, stream)
+
+    def evaluate_index(self, index: Column, stream: Stream) -> Column:
+        """Calculate window starts for a validated index column."""
         dtype = self.dtype.plc_type
         shift = self.offset + (1 if self.closed == "right" else 0)
         if self.offset == 0 and shift == 0 and plc.traits.is_timestamp(dtype):
@@ -261,6 +265,14 @@ class DynamicWindowStart(Expr):
             start = _from_ticks(_add_ticks(ticks, self.offset, stream), dtype, stream)
         # Window starts are non-decreasing in the index.
         return Column(start, dtype=self.dtype).sorted_like(index)
+
+    def evaluate_partition_boundaries(self, index: Column, stream: Stream) -> Column:
+        """Calculate the first index value in each window."""
+        starts = self.evaluate_index(index, stream)
+        if self.closed == "left":
+            return starts
+        ticks = _add_ticks(_to_ticks(starts.obj, stream), 1, stream)
+        return Column(_from_ticks(ticks, self.dtype.plc_type, stream), dtype=self.dtype)
 
 
 class DynamicWindowEnd(Expr):

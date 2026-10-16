@@ -12,6 +12,7 @@ import cudf_polars.streaming.actor_graph.collectives.sort
 # ``@generate_ir_sub_network.register(...)`` handlers at import time so the
 # dispatch table is populated before any query is evaluated.
 import cudf_polars.streaming.actor_graph.groupby
+import cudf_polars.streaming.actor_graph.groupby_dynamic
 import cudf_polars.streaming.actor_graph.hint_sorted
 import cudf_polars.streaming.actor_graph.io
 import cudf_polars.streaming.actor_graph.join

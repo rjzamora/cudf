@@ -17,6 +17,7 @@ import polars as pl
 import cudf_polars.streaming.distinct
 import cudf_polars.streaming.filter_hint
 import cudf_polars.streaming.groupby
+import cudf_polars.streaming.groupby_dynamic
 import cudf_polars.streaming.io
 import cudf_polars.streaming.join
 import cudf_polars.streaming.rolling

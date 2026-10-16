@@ -108,6 +108,7 @@ __all__ = [
     "ErrorNode",
     "Filter",
     "GroupBy",
+    "GroupByDynamic",
     "HConcat",
     "HStack",
     "IRExecutionContext",
@@ -2965,6 +2966,83 @@ def _apply_casts(df: DataFrame, casts: dict[str, DataType]) -> DataFrame:
         else:
             columns.append(col.astype(target, stream=df.stream))
     return DataFrame(columns, stream=df.stream)
+
+
+class GroupByDynamic(GroupBy):
+    """Perform a dynamic groupby after materializing its window-start key."""
+
+    __slots__ = ("group_keys", "start")
+    _non_child = (
+        "schema",
+        "start",
+        "group_keys",
+        "agg_requests",
+        "zlice",
+    )
+    _n_non_child_args = 5
+    start: expr.NamedExpr
+    """Expression producing the hidden window-start key."""
+    group_keys: tuple[expr.NamedExpr, ...]
+    """Grouping keys other than the window start."""
+
+    def __init__(
+        self,
+        schema: Schema,
+        start: expr.NamedExpr,
+        keys: Sequence[expr.NamedExpr],
+        agg_requests: Sequence[expr.NamedExpr],
+        zlice: Zlice | None,
+        df: IR,
+    ):
+        self.start = start
+        self.group_keys = tuple(keys)
+        super().__init__(
+            schema,
+            [
+                expr.NamedExpr(start.name, expr.Col(start.value.dtype, start.name)),
+                *keys,
+            ],
+            agg_requests,
+            True,  # noqa: FBT003
+            zlice,
+            df,
+        )
+        self._non_child_args = (
+            schema,
+            start,
+            self.group_keys,
+            self.agg_requests,
+            zlice,
+        )
+
+    @classmethod
+    @log_do_evaluate
+    @nvtx_annotate_cudf_polars(message="GroupByDynamic")
+    def do_evaluate(
+        cls,
+        schema: Schema,
+        start: expr.NamedExpr,
+        keys: Sequence[expr.NamedExpr],
+        agg_requests: Sequence[expr.NamedExpr],
+        zlice: Zlice | None,
+        df: DataFrame,
+        *,
+        context: IRExecutionContext,
+    ) -> DataFrame:
+        """Evaluate the window-start key and grouped aggregations."""
+        df = df.with_columns([start.evaluate(df)], stream=df.stream)
+        return GroupBy.do_evaluate(
+            schema,
+            [
+                expr.NamedExpr(start.name, expr.Col(start.value.dtype, start.name)),
+                *keys,
+            ],
+            agg_requests,
+            True,  # noqa: FBT003
+            zlice,
+            df,
+            context=context,
+        )
 
 
 class ConditionalJoin(IR):

@@ -23,7 +23,7 @@ from cudf_polars.dsl.expressions.dynamic import (
     DynamicWindowEnd,
     DynamicWindowStart,
 )
-from cudf_polars.dsl.utils.groupby import rewrite_groupby
+from cudf_polars.dsl.utils.aggregations import apply_pre_evaluation
 from cudf_polars.dsl.utils.naming import unique_names
 
 if TYPE_CHECKING:
@@ -224,19 +224,13 @@ def rewrite_groupby_dynamic(
         expr.Col(index_dtype, index_name),
         *(k.value for k in keys),
     )
-    with_start = ir.HStack(
-        {**inp.schema, start_name: key_dtype},
-        [expr.NamedExpr(start_name, start)],
-        True,  # noqa: FBT003
-        inp,
-    )
     start_col = expr.Col(key_dtype, start_name)
     narrow_start = DynamicWindowEnd(index_dtype, 0, 0, start_col)
 
     end = DynamicWindowEnd(index_dtype, window.months, window.ticks, start_col)
     group_aggs = list(aggs)
-    group_schema = {k.name: k.value.dtype for k in keys}
-    group_schema[start_name] = key_dtype
+    group_schema = {start_name: key_dtype}
+    group_schema.update((k.name, k.value.dtype) for k in keys)
     group_schema.update((agg.name, schema[agg.name]) for agg in aggs)
     label: expr.Expr
     if dynamic.label == "left":
@@ -261,14 +255,33 @@ def rewrite_groupby_dynamic(
         )
         group_schema[datapoint_name] = index_dtype
         label = expr.Col(index_dtype, datapoint_name)
-    grouped = rewrite_groupby(
-        group_schema,
-        [*keys, expr.NamedExpr(start_name, start_col)],
-        group_aggs,
-        False,  # noqa: FBT003
-        None,
-        with_start,
-    )
+    if group_aggs:
+        prepared_aggs, group_schema, apply_post_evaluation = apply_pre_evaluation(
+            group_schema,
+            [expr.NamedExpr(start_name, start_col), *keys],
+            group_aggs,
+            unique_names(group_schema),
+            ExecutionContext.GROUPBY,
+        )
+        grouped = apply_post_evaluation(
+            ir.GroupByDynamic(
+                group_schema,
+                expr.NamedExpr(start_name, start),
+                keys,
+                prepared_aggs,
+                None,
+                inp,
+            )
+        )
+    else:
+        grouped = ir.GroupByDynamic(
+            group_schema,
+            expr.NamedExpr(start_name, start),
+            keys,
+            (),
+            None,
+            inp,
+        )
 
     sort_by = [expr.NamedExpr(k.name, expr.Col(k.value.dtype, k.name)) for k in keys]
     ordered = ir.Sort(

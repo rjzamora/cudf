@@ -14,6 +14,7 @@ from cudf_polars.dsl.ir import (
     CallbackSink,
     Distinct,
     GroupBy,
+    GroupByDynamic,
     Rolling,
     Sort,
 )
@@ -102,6 +103,7 @@ class ReserveOpIDs:
             CallbackSink,
             Shuffle,
             Join,
+            GroupByDynamic,
             HintSorted,
             Repartition,
             StreamingSink,
@@ -145,7 +147,9 @@ class ReserveOpIDs:
         # Reserve IDs and map nodes to a list of IDs
         with _collective_id_vacancy_lock:
             for node in self.collective_nodes:
-                if (
+                if isinstance(node, GroupByDynamic):
+                    self.collective_id_map[node] = [_get_new_collective_id_unsafe()]
+                elif (
                     isinstance(node, (GroupBy, Distinct))
                     and self.dynamic_planning_enabled
                 ):

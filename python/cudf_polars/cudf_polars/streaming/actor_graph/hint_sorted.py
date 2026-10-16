@@ -80,6 +80,7 @@ async def hint_sorted_actor(
             ch_out,
             _hint_sorted_order_keys(ir),
             collective_id,
+            validate=False,
         )
 
 
