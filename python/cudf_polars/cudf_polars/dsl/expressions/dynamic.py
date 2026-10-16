@@ -245,6 +245,10 @@ class DynamicWindowStart(Expr):
         index, *keys = (child.evaluate(df, context=context) for child in self.children)
         stream = df.stream
         self._validate(index, keys, stream)
+        return self.evaluate_index(index, stream)
+
+    def evaluate_index(self, index: Column, stream: Stream) -> Column:
+        """Evaluate window starts for an already-validated index column."""
         dtype = self.dtype.plc_type
         shift = self.offset + (1 if self.closed == "right" else 0)
         if self.offset == 0 and shift == 0 and plc.traits.is_timestamp(dtype):

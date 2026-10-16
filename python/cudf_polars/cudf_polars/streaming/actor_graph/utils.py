@@ -38,6 +38,7 @@ from rapidsmpf.streaming.core.message import Message
 
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.expr import Cast, Col, NamedExpr, TemporalFunction
+from cudf_polars.dsl.expressions.dynamic import DynamicWindowStart
 from cudf_polars.dsl.ir import (
     Filter,
     GroupBy,
@@ -508,9 +509,15 @@ def _ordering_derivation(ne: NamedExpr) -> tuple[str, bool] | None:
     """
     Return derivation metadata for supported one-column ordering derivations.
 
-    This is intentionally narrow for now: only temporal truncation is recognized.
+    This is intentionally narrow for now: only window truncation is recognized.
     """
     source_name = _truncate_source_name(ne.value)
+    if (
+        source_name is None
+        and isinstance(ne.value, DynamicWindowStart)
+        and isinstance(ne.value.children[0], Col)
+    ):
+        source_name = ne.value.children[0].name
     if source_name is None:
         return None
     # Truncated boundaries may be non-strict.
@@ -562,7 +569,12 @@ def _derived_ordering(
         [child_schema[name] for name in old_key_names],
         stream,
     )
-    column = ne.evaluate(boundary_df)
+    if isinstance(ne.value, DynamicWindowStart):
+        source = ne.value.children[0]
+        assert isinstance(source, Col)
+        column = ne.value.evaluate_index(source.evaluate(boundary_df), stream)
+    else:
+        column = ne.evaluate(boundary_df)
     boundary_columns = [
         *boundary_chunk.table_view().columns()[:source_position],
         column.obj,

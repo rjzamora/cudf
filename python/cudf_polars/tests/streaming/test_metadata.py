@@ -23,6 +23,7 @@ from cudf_streaming.table_chunk import TableChunk
 from cudf_polars import Translator
 from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.dsl import expr
+from cudf_polars.dsl.expressions.dynamic import DynamicWindowStart
 from cudf_polars.dsl.ir import (
     GroupBy,
     HConcat,
@@ -1017,6 +1018,49 @@ def test_remap_partitioning_order_scheme_adds_truncated_ordering(
         boundaries.stream,
     ).to_polars()
     assert boundary_df["ts_bucket"].to_list() == expected
+
+
+def test_remap_partitioning_adds_dynamic_window_ordering(spmd_engine):
+    engine = pl.GPUEngine(executor="in-memory", raise_on_fail=True)
+    translated = Translator(
+        pl.LazyFrame({"time": [1], "value": [1]})
+        .group_by_dynamic("time", every="10i")
+        .agg(pl.col("value").sum())
+        ._ldf.visit(),
+        engine,
+    ).translate_ir()
+    hstack = next(
+        node
+        for node in traversal([translated])
+        if isinstance(node, HStack)
+        and any(isinstance(ne.value, DynamicWindowStart) for ne in node.columns)
+    )
+    part = Partitioning(
+        inter_rank=_make_order_scheme(
+            spmd_engine.context,
+            key_indices=(0,),
+            values=(12, 23),
+            strict=True,
+        ),
+        local="inherit",
+    )
+
+    result = maybe_remap_partitioning(hstack, part, context=spmd_engine.context)
+
+    assert result is not None
+    assert isinstance(result.inter_rank, OrderScheme)
+    original, derived = result.inter_rank.orderings
+    assert original.strict_boundaries
+    assert not derived.strict_boundaries
+    boundaries = derived.get_boundaries(spmd_engine.context.br())
+    (window_index,) = derived.column_indices
+    boundary_df = DataFrame.from_table(
+        boundaries.table_view(),
+        ["window"],
+        [tuple(hstack.schema.values())[window_index]],
+        boundaries.stream,
+    ).to_polars()
+    assert boundary_df["window"].to_list() == [10, 20]
 
 
 def test_remap_partitioning_order_scheme_truncates_prefix_key(spmd_engine):

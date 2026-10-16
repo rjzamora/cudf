@@ -235,8 +235,8 @@ def rewrite_groupby_dynamic(
 
     end = DynamicWindowEnd(index_dtype, window.months, window.ticks, start_col)
     group_aggs = list(aggs)
-    group_schema = {k.name: k.value.dtype for k in keys}
-    group_schema[start_name] = key_dtype
+    group_schema = {start_name: key_dtype}
+    group_schema.update((k.name, k.value.dtype) for k in keys)
     group_schema.update((agg.name, schema[agg.name]) for agg in aggs)
     label: expr.Expr
     if dynamic.label == "left":
@@ -263,7 +263,7 @@ def rewrite_groupby_dynamic(
         label = expr.Col(index_dtype, datapoint_name)
     grouped = rewrite_groupby(
         group_schema,
-        [*keys, expr.NamedExpr(start_name, start_col)],
+        [expr.NamedExpr(start_name, start_col), *keys],
         group_aggs,
         False,  # noqa: FBT003
         None,
