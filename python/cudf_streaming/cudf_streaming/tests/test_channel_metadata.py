@@ -250,6 +250,53 @@ def test_order_scheme_get_boundaries(context: Context) -> None:
     )
 
 
+def test_ordering_domain_bounds(context: Context) -> None:
+    """Ordering exposes and removes optional domain bounds."""
+    keys = [OrderKey(0, plc.types.Order.ASCENDING, plc.types.NullOrder.BEFORE)]
+    boundaries = _make_boundaries(
+        context,
+        plc.Table(
+            [
+                plc.Column.from_iterable_of_py(
+                    [100], plc.DataType(plc.TypeId.INT64)
+                )
+            ]
+        ),
+    )
+    bounds = _make_boundaries(
+        context,
+        plc.Table(
+            [
+                plc.Column.from_iterable_of_py(
+                    [0, 200], plc.DataType(plc.TypeId.INT64)
+                )
+            ]
+        ),
+    )
+    ordering = Ordering(keys, boundaries, domain_bounds=bounds)
+
+    got = ordering.get_domain_bounds(context.br())
+    assert got is not None
+    assert got.table_view().num_rows() == 2
+    assert (
+        plc.copying.get_element(got.table_view().columns()[0], 0).to_py() == 0
+    )
+    assert (
+        plc.copying.get_element(got.table_view().columns()[0], 1).to_py()
+        == 200
+    )
+    assert (
+        ordering.without_domain_bounds().get_domain_bounds(context.br())
+        is None
+    )
+    assert (
+        _two_key_order_scheme(context)
+        .orderings[0]
+        .get_domain_bounds(context.br())
+        is None
+    )
+
+
 def test_ordering_with_keys(context: Context) -> None:
     """with_keys shares boundaries and updates column indices."""
     o1 = _two_key_order_scheme(context)

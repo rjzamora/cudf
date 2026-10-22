@@ -19,7 +19,7 @@ from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
 from cudf_polars.dsl.utils.naming import names_to_indices
 from cudf_polars.streaming.actor_graph.collectives.allgather import AllGatherManager
 from cudf_polars.streaming.actor_graph.collectives.ordering import (
-    _extract_boundaries_from_endpoint_rows as _extract_ordering_boundaries,
+    _extract_boundaries_and_bounds,
 )
 from cudf_polars.streaming.io import ParquetScanTask
 from cudf_polars.streaming.partitioning_requests import OrderPartitioningRequest
@@ -286,15 +286,11 @@ def _partitioning_from_task_bounds(
         ):
             continue
 
-        if global_chunk_count < 2:
-            ordering_boundaries = plc.Table(
-                [plc.Column.from_iterable_of_py([], column.type(), stream=stream)]
-            )
-            strict = True
-        else:
-            ordering_boundaries, strict = _extract_ordering_boundaries(
-                candidate_bounds, global_chunk_count, stream
-            )
+        if global_chunk_count < 1:
+            continue
+        ordering_boundaries, domain_bounds, strict = _extract_boundaries_and_bounds(
+            candidate_bounds, global_chunk_count, stream
+        )
         return Partitioning(
             inter_rank=OrderScheme(
                 [
@@ -302,6 +298,12 @@ def _partitioning_from_task_bounds(
                         [key],
                         TableChunk.from_pylibcudf_table(
                             ordering_boundaries,
+                            stream,
+                            exclusive_view=True,
+                            br=context.br(),
+                        ),
+                        domain_bounds=TableChunk.from_pylibcudf_table(
+                            domain_bounds,
                             stream,
                             exclusive_view=True,
                             br=context.br(),

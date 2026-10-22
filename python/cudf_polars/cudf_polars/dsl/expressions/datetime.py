@@ -555,6 +555,29 @@ class _TruncatePlan(NamedTuple):
     """Whether a Date is truncated, on a millisecond timeline."""
 
 
+def _truncate_ordering_lower_bound(plan: _TruncatePlan, dtype: DataType) -> int:
+    """Return the smallest raw input for which truncation cannot wrap."""
+    minimum = -(2**31) if plan.on_date else -(2**63)
+    if plan.method is _TruncateMethod.IDENTITY:
+        return minimum
+    if plan.method is _TruncateMethod.FLOOR_DATETIMES:
+        frequency_ns = next(
+            value
+            for value, frequency, _ in _ROUNDING_FREQUENCIES
+            if int(frequency) == plan.every
+        )
+        offset = frequency_ns // _TIMESTAMP_TICK_NANOSECONDS[dtype.id()] - 1
+    elif plan.method is _TruncateMethod.MONTHLY:
+        offset = 31 * plan.every * (1 if plan.on_date else plan.day)
+    else:
+        offset = plan.every - 1
+        if plan.method is _TruncateMethod.WEEKLY:
+            offset = max(offset, 4 * plan.day)
+        if plan.on_date:
+            offset = (offset + plan.day - 1) // plan.day
+    return minimum + offset
+
+
 def _parse_duration_string(every: str) -> tuple[int, int, int, int] | None:
     """
     Parse a non-negative polars duration string.

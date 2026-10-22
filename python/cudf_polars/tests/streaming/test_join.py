@@ -13,9 +13,11 @@ import polars as pl
 
 import pylibcudf as plc
 from cudf_streaming.channel_metadata import (
+    ChannelMetadata,
     OrderKey,
     OrderScheme,
     Ordering,
+    Partitioning,
 )
 from cudf_streaming.table_chunk import TableChunk
 
@@ -26,6 +28,7 @@ from cudf_polars.dsl.traversal import traversal
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.streaming.actor_graph.core import evaluate_logical_plan
 from cudf_polars.streaming.actor_graph.join import (
+    _forward_join_partitioning,
     _make_ordered_strategy,
     _ordered_join_decision,
     _use_pwise_join,
@@ -41,8 +44,6 @@ from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
 
 if TYPE_CHECKING:
     import concurrent.futures
-
-    from cudf_streaming.channel_metadata import ChannelMetadata
 
 
 @pytest.fixture
@@ -205,6 +206,7 @@ def _order_partitioning(
     *,
     order: plc.types.Order = plc.types.Order.ASCENDING,
     null_order: plc.types.NullOrder = plc.types.NullOrder.BEFORE,
+    domain_bounds: bool = False,
 ) -> NormalizedPartitioning:
     stream = spmd_engine.context.br().stream_pool.get_stream()
     table = DataFrame.from_polars(
@@ -217,12 +219,24 @@ def _order_partitioning(
         exclusive_view=False,
         br=spmd_engine.context.br(),
     )
+    bounds = None
+    if domain_bounds:
+        bounds = TableChunk.from_pylibcudf_table(
+            DataFrame.from_polars(
+                pl.DataFrame({f"k{i}": [0, 3] for i in key_indices}),
+                stream,
+            ).table,
+            stream,
+            exclusive_view=False,
+            br=spmd_engine.context.br(),
+        )
     return NormalizedPartitioning(
         OrderScheme(
             [
                 Ordering(
                     [OrderKey(index, order, null_order) for index in key_indices],
                     chunk,
+                    domain_bounds=bounds,
                     strict_boundaries=True,
                 )
             ]
@@ -280,17 +294,48 @@ def test_ordered_join_strategy_checks_order_key_semantics(spmd_engine):
     left = pl.LazyFrame({"k0": [1], "x": [2]})
     right = pl.LazyFrame({"k0": [1], "y": [3]})
     join_ir = _join_ir(left.join(right, on="k0", how="inner"))
-    left_partitioning = _order_partitioning(spmd_engine, (0,))
-    right_partitioning = _order_partitioning(spmd_engine, (0,))
+    left_partitioning = _order_partitioning(spmd_engine, (0,), domain_bounds=True)
+    right_partitioning = _order_partitioning(spmd_engine, (0,), domain_bounds=True)
     mismatched_right = _order_partitioning(
         spmd_engine, (0,), order=plc.types.Order.DESCENDING
     )
 
-    assert (
-        _make_ordered_strategy(join_ir, left_partitioning, right_partitioning)
-        is not None
-    )
+    strategy = _make_ordered_strategy(join_ir, left_partitioning, right_partitioning)
+    assert strategy is not None
+    for ordering in (
+        strategy.left_output_ordering,
+        strategy.right_output_ordering,
+        strategy.output_ordering,
+    ):
+        assert ordering.get_domain_bounds(spmd_engine.context.br()) is None
     assert _make_ordered_strategy(join_ir, left_partitioning, mismatched_right) is None
+
+
+def test_partitionwise_full_join_drops_domain_bounds(spmd_engine):
+    left = pl.LazyFrame({"k": [1], "x": [2]})
+    right = pl.LazyFrame({"k": [1], "y": [3]})
+    join_ir = _join_ir(left.join(right, on="k", how="full"))
+    normalized = _order_partitioning(spmd_engine, (0,), domain_bounds=True)
+    scheme = normalized.inter_rank_scheme
+    metadata = ChannelMetadata(
+        local_count=2,
+        partitioning=Partitioning(scheme, scheme),
+    )
+
+    result = _forward_join_partitioning(
+        join_ir,
+        [metadata, metadata],
+        spmd_engine.context,
+    )
+
+    assert result is not None
+    assert isinstance(result.inter_rank, OrderScheme)
+    assert (
+        result.inter_rank.orderings[0].get_domain_bounds(spmd_engine.context.br())
+        is None
+    )
+    assert isinstance(result.local, OrderScheme)
+    assert result.local.orderings[0].get_domain_bounds(spmd_engine.context.br()) is None
 
 
 @pytest.mark.parametrize(

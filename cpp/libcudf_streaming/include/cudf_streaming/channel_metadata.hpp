@@ -81,6 +81,13 @@ struct order_key {
  * `locally_ordered`: when true, rows within each partition at this level are ordered by
  * `keys`. When false, partitions are still ordered across partition boundaries, but row
  * order within a partition is not guaranteed.
+ *
+ * `domain_bounds`, when present, contains two conservative bounds for the complete
+ * ordered domain. The first row precedes or equals every data row and the second row
+ * follows or equals every data row according to the lexicographic ordering defined by
+ * `keys`. These are tuple bounds, not independent extrema for each column. Bounds need
+ * not be values observed in the data. Producers are responsible for their semantic
+ * validity.
  */
 struct ordering {
   std::vector<order_key> keys;              ///< Sort keys (column, order, null_order per entry).
@@ -89,6 +96,8 @@ struct ordering {
   bool strict_boundaries{false};
   /// See struct-level note on `locally_ordered` semantics.
   bool locally_ordered{true};
+  /// Optional two-row conservative bounds for the complete ordered domain.
+  std::shared_ptr<table_chunk> domain_bounds{};
 
   /// @brief Default constructor. Produces an invalid (empty) ordering.
   ordering() = default;
@@ -101,13 +110,16 @@ struct ordering {
    * partitions). Accepts a `unique_ptr<table_chunk>` via implicit conversion.
    * @param strict_boundaries See struct-level doc. Defaults to false.
    * @param locally_ordered See struct-level doc. Defaults to true.
+   * @param domain_bounds Optional two-row domain bounds. Defaults to null.
    * @throws std::invalid_argument if `keys` is empty, `boundaries` is null or not
-   * device-resident, or `keys.size() != boundaries->shape().second`.
+   * device-resident, key columns do not match the boundary columns, or domain bounds
+   * are present with an invalid shape, location, or column type.
    */
   ordering(std::vector<order_key> keys,
            std::shared_ptr<table_chunk> boundaries,
-           bool strict_boundaries = false,
-           bool locally_ordered   = true);
+           bool strict_boundaries                     = false,
+           bool locally_ordered                       = true,
+           std::shared_ptr<table_chunk> domain_bounds = nullptr);
 
   /**
    * @brief Return a new ordering with updated key column indices, sharing
@@ -115,10 +127,9 @@ struct ordering {
    *
    * @param new_keys Replacement sort keys; size must equal
    * `boundaries->shape().second`.
-   * @return A new ordering with `new_keys` and the same boundaries and
-   * ordering flags.
-   * @throws std::invalid_argument if `new_keys` is empty or size mismatches
-   * boundaries.
+   * @return A new ordering with `new_keys` and the same boundaries and ordering flags.
+   * Domain bounds are retained only when order and null-order properties are unchanged.
+   * @throws std::invalid_argument if `new_keys` is empty or size mismatches boundaries.
    */
   [[nodiscard]] ordering with_keys(std::vector<order_key> new_keys) const;
 
@@ -129,6 +140,13 @@ struct ordering {
    * @return A new ordering with the same keys, boundaries, and strictness.
    */
   [[nodiscard]] ordering with_locally_ordered(bool locally_ordered) const;
+
+  /**
+   * @brief Return a new ordering without domain bounds.
+   *
+   * @return A new ordering with the same keys, boundaries, and ordering flags.
+   */
+  [[nodiscard]] ordering without_domain_bounds() const;
 
   /**
    * @brief Check whether boundary values are aligned with another ordering.

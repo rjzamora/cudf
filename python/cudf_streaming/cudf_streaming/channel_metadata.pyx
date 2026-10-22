@@ -135,18 +135,28 @@ cdef class Ordering:
         object keys,
         TableChunk boundaries not None,
         *,
+        TableChunk domain_bounds = None,
         bint strict_boundaries = False,
         bint locally_ordered = True,
     ):
         cdef vector[cpp_OrderKey] cpp_keys
         for key in keys:
             cpp_keys.push_back((<OrderKey?>key)._handle)
-        self._handle = cpp_Ordering(
-            move(cpp_keys),
-            move(boundaries.release_handle()),
-            strict_boundaries,
-            locally_ordered,
-        )
+        if domain_bounds is None:
+            self._handle = cpp_Ordering(
+                move(cpp_keys),
+                move(boundaries.release_handle()),
+                strict_boundaries,
+                locally_ordered,
+            )
+        else:
+            self._handle = cpp_Ordering(
+                move(cpp_keys),
+                move(boundaries.release_handle()),
+                strict_boundaries,
+                locally_ordered,
+                move(domain_bounds.release_handle()),
+            )
 
     @staticmethod
     cdef Ordering from_cpp(cpp_Ordering ordering):
@@ -162,6 +172,7 @@ cdef class Ordering:
                 self._handle.boundaries,
                 True,
                 self._handle.locally_ordered,
+                self._handle.domain_bounds,
             )
         )
 
@@ -212,6 +223,19 @@ cdef class Ordering:
             tbl, stream, exclusive_view=False, br=br
         )
 
+    def get_domain_bounds(self, BufferResource br not None) -> TableChunk | None:
+        """Return conservative lexicographic bounds, or ``None``."""
+        cdef const cpp_TableChunk* chunk = self._handle.domain_bounds.get()
+        if chunk == NULL:
+            return None
+        cdef Stream stream = Stream._from_cudaStream_t(chunk.stream().get())
+        tbl = Table.from_table_view_of_arbitrary(
+            chunk.table_view(), owner=self, stream=stream
+        )
+        return TableChunk.from_pylibcudf_table(
+            tbl, stream, exclusive_view=False, br=br
+        )
+
     def with_keys(self, object new_keys) -> Ordering:
         """Return a new ``Ordering`` with updated key column indices."""
         cdef vector[cpp_OrderKey] cpp_keys
@@ -224,6 +248,10 @@ cdef class Ordering:
         return Ordering.from_cpp(
             self._handle.with_locally_ordered(locally_ordered)
         )
+
+    def without_domain_bounds(self) -> Ordering:
+        """Return a new ``Ordering`` without domain bounds."""
+        return Ordering.from_cpp(self._handle.without_domain_bounds())
 
     def boundaries_aligned_with(
         self, Ordering other not None, BufferResource br not None

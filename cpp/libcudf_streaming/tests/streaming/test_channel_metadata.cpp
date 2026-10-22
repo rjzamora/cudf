@@ -179,26 +179,65 @@ class StreamingChannelMetadataGPU : public ::testing::Test {
     cols.push_back(std::move(col));
     return std::make_shared<table_chunk>(std::make_unique<cudf::table>(std::move(cols)), stream);
   }
+
+  std::shared_ptr<table_chunk> make_chunk(cudf::data_type type, cudf::size_type size)
+  {
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(cudf::make_fixed_width_column(type, size, cudf::mask_state::UNALLOCATED));
+    return std::make_shared<table_chunk>(std::make_unique<cudf::table>(std::move(cols)), stream);
+  }
 };
 
 TEST_F(StreamingChannelMetadataGPU, OrderingReplaceKeys)
 {
   order_key k0{0, cudf::order::ASCENDING, cudf::null_order::BEFORE};
-  order_key k5{5, cudf::order::DESCENDING, cudf::null_order::AFTER};
+  order_key k5{5, cudf::order::ASCENDING, cudf::null_order::BEFORE};
+  order_key descending{5, cudf::order::DESCENDING, cudf::null_order::BEFORE};
 
   auto b      = make_chunk({100, 200});
-  ordering o1 = ordering({k0}, b);
+  auto bounds = make_chunk({0, 300});
+  ordering o1 = ordering({k0}, b, false, true, bounds);
   auto o2     = o1.with_keys({k5});
 
   EXPECT_EQ(o2.keys[0].column_index, 5);
-  EXPECT_EQ(o2.keys[0].order, cudf::order::DESCENDING);
+  EXPECT_EQ(o2.keys[0].order, cudf::order::ASCENDING);
   EXPECT_EQ(o2.strict_boundaries, o1.strict_boundaries);
   EXPECT_EQ(o2.locally_ordered, o1.locally_ordered);
   EXPECT_EQ(o2.boundaries->shape(), o1.boundaries->shape());
   EXPECT_EQ(o2.boundaries.get(), b.get());
+  EXPECT_EQ(o2.domain_bounds.get(), bounds.get());
   EXPECT_NE(o1.keys[0].column_index, o2.keys[0].column_index);
 
   EXPECT_THROW(static_cast<void>(o1.with_keys({k0, k5})), std::invalid_argument);
+  auto reversed = o1.with_keys({descending});
+  EXPECT_EQ(reversed.keys[0], descending);
+  EXPECT_EQ(reversed.domain_bounds, nullptr);
+}
+
+TEST_F(StreamingChannelMetadataGPU, OrderingDomainBounds)
+{
+  order_key k0{0, cudf::order::ASCENDING, cudf::null_order::BEFORE};
+  auto boundaries = make_chunk({100, 200});
+  auto bounds     = make_chunk({0, 300});
+
+  ordering bounded({k0}, boundaries, false, true, bounds);
+  EXPECT_EQ(bounded.domain_bounds.get(), bounds.get());
+
+  ordering unbounded({k0}, make_chunk({100, 200}));
+  EXPECT_EQ(unbounded.domain_bounds, nullptr);
+
+  EXPECT_THROW(
+    static_cast<void>(ordering({k0}, make_chunk({100, 200}), false, true, make_chunk({0}))),
+    std::invalid_argument);
+  EXPECT_THROW(
+    static_cast<void>(ordering({k0}, make_chunk({100, 200}), false, true, make_chunk({}))),
+    std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(ordering({k0},
+                                          make_chunk({100, 200}),
+                                          false,
+                                          true,
+                                          make_chunk(cudf::data_type{cudf::type_id::FLOAT32}, 2))),
+               std::invalid_argument);
 }
 
 TEST_F(StreamingChannelMetadataGPU, OrderingReplaceLocallyOrdered)
@@ -206,13 +245,15 @@ TEST_F(StreamingChannelMetadataGPU, OrderingReplaceLocallyOrdered)
   order_key k0{0, cudf::order::ASCENDING, cudf::null_order::BEFORE};
 
   auto b      = make_chunk({100, 200});
-  ordering o1 = ordering({k0}, b, /*strict_boundaries=*/true);
+  auto bounds = make_chunk({0, 300});
+  ordering o1 = ordering({k0}, b, /*strict_boundaries=*/true, true, bounds);
   auto o2     = o1.with_locally_ordered(false);
 
   EXPECT_EQ(o2.keys[0], o1.keys[0]);
   EXPECT_EQ(o2.strict_boundaries, o1.strict_boundaries);
   EXPECT_FALSE(o2.locally_ordered);
   EXPECT_EQ(o2.boundaries.get(), b.get());
+  EXPECT_EQ(o2.domain_bounds.get(), bounds.get());
 }
 
 TEST_F(StreamingChannelMetadataGPU, OrderSchemeMultipleOrderings)
@@ -257,6 +298,9 @@ TEST_F(StreamingChannelMetadataGPU, OrderingBoundariesAlignedWith)
 
   ordering o_diff({k0}, make_chunk({100, 300}));
   EXPECT_FALSE(o1.boundaries_aligned_with(o_diff, *br));
+
+  ordering o_bounds({k0}, make_chunk({100, 200}), false, true, make_chunk({0, 300}));
+  EXPECT_TRUE(o1.boundaries_aligned_with(o_bounds, *br));
 }
 
 TEST_F(StreamingChannelMetadataGPU, PartitioningSpecOrder)

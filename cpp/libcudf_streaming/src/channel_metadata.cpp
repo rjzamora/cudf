@@ -36,6 +36,23 @@ void validate_ordering(ordering const& ordering)
     ordering.keys.size() == static_cast<std::size_t>(ordering.boundaries->shape().second),
     "ordering: number of keys must match number of boundary columns",
     std::invalid_argument);
+  if (ordering.domain_bounds == nullptr) { return; }
+  RAPIDSMPF_EXPECTS(ordering.domain_bounds->is_available(),
+                    "ordering: domain bounds must be device-resident",
+                    std::invalid_argument);
+  RAPIDSMPF_EXPECTS(ordering.domain_bounds->shape().first == 2,
+                    "ordering: domain bounds must contain exactly two rows",
+                    std::invalid_argument);
+  RAPIDSMPF_EXPECTS(ordering.domain_bounds->shape().second == ordering.boundaries->shape().second,
+                    "ordering: domain bounds must match boundary columns",
+                    std::invalid_argument);
+  auto const boundaries = ordering.boundaries->table_view();
+  auto const bounds     = ordering.domain_bounds->table_view();
+  for (cudf::size_type i = 0; i < boundaries.num_columns(); ++i) {
+    RAPIDSMPF_EXPECTS(boundaries.column(i).type() == bounds.column(i).type(),
+                      "ordering: domain bounds must match boundary column types",
+                      std::invalid_argument);
+  }
 }
 
 }  // namespace
@@ -43,21 +60,38 @@ void validate_ordering(ordering const& ordering)
 ordering::ordering(std::vector<order_key> keys,
                    std::shared_ptr<table_chunk> boundaries,
                    bool strict_boundaries,
-                   bool locally_ordered)
+                   bool locally_ordered,
+                   std::shared_ptr<table_chunk> domain_bounds)
   : keys{std::move(keys)},
     boundaries{std::move(boundaries)},
     strict_boundaries{strict_boundaries},
-    locally_ordered{locally_ordered}
+    locally_ordered{locally_ordered},
+    domain_bounds{std::move(domain_bounds)}
 {
   validate_ordering(*this);
 }
 
 ordering ordering::with_keys(std::vector<order_key> new_keys) const
 {
-  return ordering{std::move(new_keys), boundaries, strict_boundaries, locally_ordered};
+  auto const preserves_comparator =
+    new_keys.size() == keys.size() &&
+    std::equal(
+      new_keys.begin(), new_keys.end(), keys.begin(), [](auto const& lhs, auto const& rhs) {
+        return lhs.order == rhs.order && lhs.null_order == rhs.null_order;
+      });
+  return ordering{std::move(new_keys),
+                  boundaries,
+                  strict_boundaries,
+                  locally_ordered,
+                  preserves_comparator ? domain_bounds : nullptr};
 }
 
 ordering ordering::with_locally_ordered(bool locally_ordered) const
+{
+  return ordering{keys, boundaries, strict_boundaries, locally_ordered, domain_bounds};
+}
+
+ordering ordering::without_domain_bounds() const
 {
   return ordering{keys, boundaries, strict_boundaries, locally_ordered};
 }

@@ -10,8 +10,11 @@ import pytest
 
 import polars as pl
 
+import pylibcudf as plc
+from cudf_streaming.channel_metadata import OrderKey, OrderScheme
+
 from cudf_polars import Translator
-from cudf_polars.containers import DataType
+from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.dsl.ir import (
     Empty,
     IRExecutionContext,
@@ -26,6 +29,9 @@ from cudf_polars.dsl.utils.io import (
 from cudf_polars.dsl.utils.per_path import PerPathValues
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.streaming.actor_graph.io import resolve_max_concurrent_io_tasks
+from cudf_polars.streaming.actor_graph.scan_ordering import (
+    _partitioning_from_task_bounds,
+)
 from cudf_polars.streaming.base import (
     DataSourceInfo,
     IOPartitionFlavor,
@@ -55,8 +61,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
     from typing import Any, Literal
-
-    import pylibcudf as plc
 
     import cudf_polars.engine.core
     from cudf_polars.engine.core import StreamingEngine
@@ -610,6 +614,31 @@ def test_attach_cached_parquet_metadata_resolves_row_groups(
         bounds = scan.get_task_bounds()
         row_groups.append(bounds.row_groups)
     assert row_groups == [[[0]], [[1]]]
+
+
+def test_partitioning_from_task_bounds_includes_domain_bounds(spmd_engine):
+    stream = spmd_engine.context.br().stream_pool.get_stream()
+    key = OrderKey(0, plc.types.Order.ASCENDING, plc.types.NullOrder.BEFORE)
+    bounds = DataFrame.from_polars(pl.DataFrame({"k": [1, 3]}), stream).table
+
+    result = _partitioning_from_task_bounds(
+        spmd_engine.context,
+        [("k", key)],
+        bounds,
+        global_chunk_count=1,
+        stream=stream,
+    )
+
+    assert result is not None
+    assert isinstance(result.inter_rank, OrderScheme)
+    (ordering,) = result.inter_rank.orderings
+    assert ordering.num_boundaries == 0
+    domain_bounds = ordering.get_domain_bounds(spmd_engine.context.br())
+    assert domain_bounds is not None
+    actual = DataFrame.from_table(
+        domain_bounds.table_view(), ["k"], [DataType(pl.Int64())], stream
+    ).to_polars()
+    assert actual["k"].to_list() == [1, 3]
 
 
 def test_attach_cached_parquet_metadata_uses_rank_local_tasks(

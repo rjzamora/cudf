@@ -137,10 +137,11 @@ def test_order_sensitive_execution_does_not_imply_output_order() -> None:
     assert not distinct.preserves_output_order
 
 
-def test_groupby_adjusts_truncated_ordering_with_maintain_order(
-    spmd_engine_factory,
+@pytest.mark.parametrize("use_hint", [False, True], ids=["sort", "set_sorted"])
+def test_groupby_truncated_ordering_with_maintain_order(
+    spmd_engine_factory, use_hint
 ) -> None:
-    """GroupBy can adjust an ordered prefix without tree-reducing."""
+    """GroupBy uses bounded truncated ordering when it is available."""
     engine = spmd_engine_factory(
         StreamingOptions(
             target_partition_size=64,
@@ -158,9 +159,9 @@ def test_groupby_adjusts_truncated_ordering_with_maintain_order(
             "value": range(32),
         }
     )
+    ordered = df.set_sorted("DateTime") if use_hint else df.sort("DateTime")
     q = (
-        df.sort("DateTime")
-        .with_columns(
+        ordered.with_columns(
             pl.col("DateTime")
             .cast(pl.Datetime("ns"))
             .dt.truncate("1us")
@@ -180,6 +181,10 @@ def test_groupby_adjusts_truncated_ordering_with_maintain_order(
     assert metadata_collector is not None
     assert len(metadata_collector) == 1
     metadata = metadata_collector[0]
+    if not use_hint:
+        assert metadata.partitioning is not None
+        assert metadata.partitioning.inter_rank is None
+        return
     assert metadata.partitioning is not None
     scheme = metadata.partitioning.inter_rank
     assert isinstance(scheme, OrderScheme)

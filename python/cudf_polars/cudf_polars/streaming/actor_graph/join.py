@@ -804,8 +804,12 @@ def _make_ordered_strategy(
     if not _ordering_prefix_matches(right_ordering, reference, right_key_indices):
         return None
 
-    left_output_ordering = _update_ordering_indices(reference, left_key_indices)
-    output_ordering = _update_ordering_indices(reference, output_key_indices)
+    left_output_ordering = _update_ordering_indices(
+        reference, left_key_indices
+    ).without_domain_bounds()
+    output_ordering = _update_ordering_indices(
+        reference, output_key_indices
+    ).without_domain_bounds()
     if not (
         left_ordering.locally_ordered
         and join_preserves_side_order(ir.options[5], "left")
@@ -824,9 +828,9 @@ def _make_ordered_strategy(
         left_input_ordering=left_ordering,
         right_input_ordering=right_ordering,
         left_output_ordering=left_output_ordering,
-        right_output_ordering=_update_ordering_indices(
-            reference, right_key_indices
-        ).with_locally_ordered(locally_ordered=False),
+        right_output_ordering=_update_ordering_indices(reference, right_key_indices)
+        .without_domain_bounds()
+        .with_locally_ordered(locally_ordered=False),
         output_ordering=output_ordering,
     )
 
@@ -2085,6 +2089,22 @@ def _forward_join_partitioning(
         child_ir=ir.children[child_index],
         context=context,
     )
+    if ir.options[0] == "Full" and partitioning is not None:
+        # Right-only keys can extend beyond bounds forwarded from the left input.
+        inter_rank = partitioning.inter_rank
+        local = partitioning.local
+        partitioning = Partitioning(
+            OrderScheme(
+                [ordering.without_domain_bounds() for ordering in inter_rank.orderings]
+            )
+            if isinstance(inter_rank, OrderScheme)
+            else inter_rank,
+            OrderScheme(
+                [ordering.without_domain_bounds() for ordering in local.orderings]
+            )
+            if isinstance(local, OrderScheme)
+            else local,
+        )
     if not join_preserves_side_order(ir.options[5], side):
         partitioning = clear_local_ordering(partitioning)
     return partitioning

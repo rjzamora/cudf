@@ -24,7 +24,6 @@ from cudf_streaming.channel_metadata import (
     HashScheme,
     OrderKey,
     OrderScheme,
-    Ordering,
     Partitioning,
 )
 from cudf_streaming.table_chunk import (
@@ -38,7 +37,7 @@ from rapidsmpf.streaming.coll.allgather import AllGather
 from rapidsmpf.streaming.core.message import Message
 
 from cudf_polars.containers import DataFrame
-from cudf_polars.dsl.expr import Cast, Col, NamedExpr, TemporalFunction
+from cudf_polars.dsl.expr import Col, NamedExpr
 from cudf_polars.dsl.ir import (
     Filter,
     GroupBy,
@@ -57,6 +56,7 @@ from cudf_polars.streaming.actor_graph.tracing import (
     record_channel_metrics,
     send_chunk,
 )
+from cudf_polars.streaming.ordering_derivation import OrderingDerivation
 from cudf_polars.streaming.utils import _concat
 from cudf_polars.utils.dtypes import make_empty_column
 
@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     import cudf_polars_quent as _quent
 
     from cudf_streaming import CardinalityEstimator
+    from cudf_streaming.channel_metadata import Ordering
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.memory.buffer_resource import BufferResource
     from rapidsmpf.streaming.core.channel import Channel
@@ -80,7 +81,6 @@ if TYPE_CHECKING:
     from rapidsmpf.streaming.core.spillable_messages import SpillableMessages
     from rmm.pylibrmm.stream import Stream
 
-    from cudf_polars.dsl.expr import Expr
     from cudf_polars.dsl.ir import IR, IRExecutionContext
     from cudf_polars.streaming.actor_graph.dispatch import SubNetGenerator
     from cudf_polars.typing import Schema
@@ -478,124 +478,6 @@ def join_preserves_side_order(
     return maintain_order.startswith(side)
 
 
-def _is_truncate_transparent_cast(expr: Cast) -> bool:
-    src_id = expr.children[0].dtype.id()
-    dst_id = expr.dtype.id()
-    if src_id == dst_id:
-        return True
-    return (
-        src_id == plc.TypeId.INT64 and dst_id == plc.TypeId.TIMESTAMP_NANOSECONDS
-    ) or (src_id == plc.TypeId.TIMESTAMP_NANOSECONDS and dst_id == plc.TypeId.INT64)
-
-
-def _unwrap_truncate_transparent_casts(expr: Expr) -> Expr:
-    while isinstance(expr, Cast) and _is_truncate_transparent_cast(expr):
-        (expr,) = expr.children
-    return expr
-
-
-def _truncate_source_name(expr: Expr) -> str | None:
-    expr = _unwrap_truncate_transparent_casts(expr)
-    if (
-        isinstance(expr, TemporalFunction)
-        and expr.name is TemporalFunction.Name.Truncate
-    ):
-        source = _unwrap_truncate_transparent_casts(expr.children[0])
-        if isinstance(source, Col):
-            return source.name
-    return None
-
-
-def _ordering_derivation(ne: NamedExpr) -> tuple[str, bool] | None:
-    """
-    Return derivation metadata for supported one-column ordering derivations.
-
-    This is intentionally narrow for now: only temporal truncation is recognized.
-    """
-    source_name = _truncate_source_name(ne.value)
-    if source_name is None:
-        return None
-    # Truncated boundaries may be non-strict.
-    return source_name, False
-
-
-def _derived_ordering(
-    ordering: Ordering,
-    ne: NamedExpr,
-    old_to_new_names: dict[str, dict[str, None]],
-    child_schema: Schema,
-    output_schema: Schema,
-    context: Context | None,
-) -> Ordering | None:
-    """Create an ordering for a supported derivation of one key."""
-    if context is None:
-        return None
-
-    derivation = _ordering_derivation(ne)
-    if derivation is None:
-        return None
-    source_name, strict_boundaries = derivation
-
-    old_key_names = indices_to_names(ordering.column_indices, child_schema)
-    try:
-        source_position = old_key_names.index(source_name)
-    except ValueError:
-        return None
-
-    prefix_names = old_key_names[:source_position]
-    if not set(prefix_names).issubset(set(old_to_new_names)):
-        return None
-
-    target_key_names = (
-        *(
-            _preferred_target_name(name, old_to_new_names[name])
-            for name in prefix_names
-        ),
-        ne.name,
-    )
-    new_indices = names_to_indices(target_key_names, output_schema)
-
-    br = context.br()
-    boundary_chunk = ordering.get_boundaries(br)
-    stream = boundary_chunk.stream
-    boundary_df = DataFrame.from_table(
-        boundary_chunk.table_view(),
-        old_key_names,
-        [child_schema[name] for name in old_key_names],
-        stream,
-    )
-    column = ne.evaluate(boundary_df)
-    boundary_columns = [
-        *boundary_chunk.table_view().columns()[:source_position],
-        column.obj,
-    ]
-    boundary_table = plc.concatenate.concatenate(
-        [plc.Table(boundary_columns)],
-        stream=stream,
-        mr=br.device_mr,
-    )
-    boundaries = TableChunk.from_pylibcudf_table(
-        boundary_table,
-        stream,
-        exclusive_view=True,
-        br=br,
-    )
-    keys = tuple(
-        OrderKey(idx, key.order, key.null_order)
-        for idx, key in zip(
-            new_indices,
-            (*ordering.keys[:source_position], ordering.keys[source_position]),
-            strict=True,
-        )
-    )
-    return Ordering(
-        keys,
-        boundaries,
-        strict_boundaries=strict_boundaries,
-        locally_ordered=ordering.locally_ordered,
-    )
-
-
 def _select_column_targets(select: Select) -> dict[str, dict[str, None]]:
     old_to_new_names: defaultdict[str, dict[str, None]] = defaultdict(dict)
     for output_name, source in column_domain_bindings(select).items():
@@ -649,13 +531,17 @@ def _remap_scheme_select(
                             )
                         )
             for ne in select.exprs:
-                derived = _derived_ordering(
-                    ordering,
-                    ne,
-                    old_to_new_names,
-                    select.children[0].schema,
-                    select.schema,
-                    context,
+                derived = (
+                    None
+                    if context is None
+                    else OrderingDerivation(
+                        ne,
+                        ordering,
+                        old_to_new_names,
+                        select.children[0].schema,
+                        select.schema,
+                        context,
+                    ).derive()
                 )
                 if derived is not None:
                     new_orderings.append(derived)

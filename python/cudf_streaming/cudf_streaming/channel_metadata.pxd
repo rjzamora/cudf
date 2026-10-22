@@ -44,17 +44,27 @@ cdef extern from "<cudf_streaming/channel_metadata.hpp>" \
             vector[cpp_OrderKey], unique_ptr[cpp_TableChunk], bool_t, bool_t
         ) except +ex_handler
         cpp_Ordering(
+            vector[cpp_OrderKey], unique_ptr[cpp_TableChunk], bool_t, bool_t,
+            unique_ptr[cpp_TableChunk]
+        ) except +ex_handler
+        cpp_Ordering(
             vector[cpp_OrderKey], shared_ptr[cpp_TableChunk], bool_t
         ) except +ex_handler
         cpp_Ordering(
             vector[cpp_OrderKey], shared_ptr[cpp_TableChunk], bool_t, bool_t
         ) except +ex_handler
+        cpp_Ordering(
+            vector[cpp_OrderKey], shared_ptr[cpp_TableChunk], bool_t, bool_t,
+            shared_ptr[cpp_TableChunk]
+        ) except +ex_handler
         vector[cpp_OrderKey] keys
         shared_ptr[cpp_TableChunk] boundaries
         bool_t strict_boundaries
         bool_t locally_ordered
+        shared_ptr[cpp_TableChunk] domain_bounds
         cpp_Ordering with_keys(vector[cpp_OrderKey]) except +ex_handler
         cpp_Ordering with_locally_ordered(bool_t) except +ex_handler
+        cpp_Ordering without_domain_bounds() except +ex_handler
         bool_t boundaries_aligned_with(
             const cpp_Ordering&, const cpp_BufferResource&
         ) except +ex_handler

@@ -556,6 +556,8 @@ def _make_ordering(
     *,
     key_indices=(0,),
     values=(100, 200),
+    domain_bounds=None,
+    order=plc.types.Order.ASCENDING,
     strict=False,
     locally_ordered=True,
 ):
@@ -566,11 +568,21 @@ def _make_ordering(
     chunk = TableChunk.from_pylibcudf_table(
         df.table, stream, exclusive_view=False, br=context.br()
     )
-    asc, before = plc.types.Order.ASCENDING, plc.types.NullOrder.BEFORE
-    keys = [OrderKey(i, asc, before) for i in key_indices]
+    before = plc.types.NullOrder.BEFORE
+    keys = [OrderKey(i, order, before) for i in key_indices]
+    bounds = None
+    if domain_bounds is not None:
+        bounds_df = DataFrame.from_polars(
+            pl.DataFrame({f"k{i}": list(domain_bounds) for i in key_indices}),
+            stream,
+        )
+        bounds = TableChunk.from_pylibcudf_table(
+            bounds_df.table, stream, exclusive_view=False, br=context.br()
+        )
     return Ordering(
         keys,
         chunk,
+        domain_bounds=bounds,
         strict_boundaries=strict,
         locally_ordered=locally_ordered,
     )
@@ -581,6 +593,8 @@ def _make_order_scheme(
     *,
     key_indices=(0,),
     values=(100, 200),
+    domain_bounds=None,
+    order=plc.types.Order.ASCENDING,
     strict=False,
     locally_ordered=True,
 ):
@@ -590,6 +604,8 @@ def _make_order_scheme(
                 context,
                 key_indices=key_indices,
                 values=values,
+                domain_bounds=domain_bounds,
+                order=order,
                 strict=strict,
                 locally_ordered=locally_ordered,
             )
@@ -642,6 +658,15 @@ def test_set_sorted_dataframe_extracts_ordering_boundaries(spmd_engine_factory):
         boundaries.stream,
     ).to_polars()
     assert boundary_df["k"].to_list() == [2, 3]
+    domain_bounds = ordering.get_domain_bounds(engine.context.br())
+    assert domain_bounds is not None
+    bounds_df = DataFrame.from_table(
+        domain_bounds.table_view(),
+        ["k"],
+        [DataType(pl.Int64())],
+        domain_bounds.stream,
+    ).to_polars()
+    assert bounds_df["k"].to_list() == [1, 3]
 
 
 def test_apply_ordering_metadata_marks_leading_key_only(spmd_engine) -> None:
@@ -963,19 +988,12 @@ def test_remap_partitioning_order_scheme_adds_alias_ordering(spmd_engine):
     assert [o.strict_boundaries for o in result.inter_rank.orderings] == [True, True]
 
 
-@pytest.mark.parametrize(
-    "frequency,expected",
-    [
-        ("1ms", [1_000_000, 2_000_000]),
-        ("1us", [1_234_000, 2_345_000]),
-    ],
-)
-def test_remap_partitioning_order_scheme_adds_truncated_ordering(
-    spmd_engine, frequency, expected
-):
-    engine = pl.GPUEngine(executor="in-memory", raise_on_fail=True)
+def _truncate_hstack(frequency: str, *, with_venue: bool = False) -> HStack:
+    data = {"DateTime": [1]}
+    if with_venue:
+        data = {"venue": [1], **data}
     hstack = Translator(
-        pl.LazyFrame({"DateTime": [1]})
+        pl.LazyFrame(data)
         .with_columns(
             pl.col("DateTime")
             .cast(pl.Datetime("ns"))
@@ -984,14 +1002,42 @@ def test_remap_partitioning_order_scheme_adds_truncated_ordering(
             .alias("ts_bucket")
         )
         ._ldf.visit(),
-        engine,
+        pl.GPUEngine(executor="in-memory", raise_on_fail=True),
     ).translate_ir()
     assert isinstance(hstack, HStack)
+    return hstack
+
+
+@pytest.mark.parametrize(
+    "frequency,expected_boundaries,expected_bounds",
+    [
+        ("1ms", [1_000_000, 2_000_000], [0, 3_000_000]),
+        ("1ns", [1_234_567, 2_345_678], [234_567, 3_345_678]),
+        ("1500us", [0, 1_500_000], [0, 3_000_000]),
+        (
+            "1w",
+            [-259_200_000_000_000, -259_200_000_000_000],
+            [-259_200_000_000_000, -259_200_000_000_000],
+        ),
+        ("1mo", [0, 0], [0, 0]),
+    ],
+)
+@pytest.mark.parametrize("descending", [False, True])
+def test_remap_partitioning_order_scheme_adds_truncated_ordering(
+    spmd_engine, frequency, expected_boundaries, expected_bounds, descending
+):
+    hstack = _truncate_hstack(frequency)
+    values = (2_345_678, 1_234_567) if descending else (1_234_567, 2_345_678)
+    domain_bounds = (3_345_678, 234_567) if descending else (234_567, 3_345_678)
     part = Partitioning(
         inter_rank=_make_order_scheme(
             spmd_engine.context,
             key_indices=(0,),
-            values=(1_234_567, 2_345_678),
+            values=values,
+            domain_bounds=domain_bounds,
+            order=(
+                plc.types.Order.DESCENDING if descending else plc.types.Order.ASCENDING
+            ),
             strict=True,
         ),
         local="inherit",
@@ -1012,20 +1058,28 @@ def test_remap_partitioning_order_scheme_adds_truncated_ordering(
         [hstack.schema["ts_bucket"]],
         boundaries.stream,
     ).to_polars()
-    assert boundary_df["ts_bucket"].to_list() == expected
+    assert boundary_df["ts_bucket"].to_list() == (
+        list(reversed(expected_boundaries)) if descending else expected_boundaries
+    )
+
+    domain_bounds = orderings[1].get_domain_bounds(spmd_engine.context.br())
+    assert domain_bounds is not None
+    bounds_df = DataFrame.from_table(
+        domain_bounds.table_view(),
+        ["ts_bucket"],
+        [hstack.schema["ts_bucket"]],
+        domain_bounds.stream,
+    ).to_polars()
+    assert bounds_df["ts_bucket"].to_list() == (
+        list(reversed(expected_bounds)) if descending else expected_bounds
+    )
 
 
-def test_remap_partitioning_order_scheme_truncates_prefix_key(spmd_engine):
+def test_remap_partitioning_order_scheme_adds_cast_ordering(spmd_engine):
     engine = pl.GPUEngine(executor="in-memory", raise_on_fail=True)
     hstack = Translator(
-        pl.LazyFrame({"venue": [1], "DateTime": [1]})
-        .with_columns(
-            pl.col("DateTime")
-            .cast(pl.Datetime("ns"))
-            .dt.truncate("1ms")
-            .cast(pl.Int64)
-            .alias("ts_bucket")
-        )
+        pl.LazyFrame({"timestamp": [1]})
+        .with_columns(pl.col("timestamp").cast(pl.Datetime("ns")).alias("datetime"))
         ._ldf.visit(),
         engine,
     ).translate_ir()
@@ -1033,8 +1087,65 @@ def test_remap_partitioning_order_scheme_truncates_prefix_key(spmd_engine):
     part = Partitioning(
         inter_rank=_make_order_scheme(
             spmd_engine.context,
-            key_indices=(0, 1),
             values=(1_234_567, 2_345_678),
+            domain_bounds=(234_567, 3_345_678),
+            strict=False,
+        ),
+        local="inherit",
+    )
+
+    result = maybe_remap_partitioning(hstack, part, context=spmd_engine.context)
+
+    assert result is not None
+    assert isinstance(result.inter_rank, OrderScheme)
+    orderings = result.inter_rank.orderings
+    assert [o.keys[0].column_index for o in orderings] == [0, 1]
+    assert not orderings[1].strict_boundaries
+    boundaries = orderings[1].get_boundaries(spmd_engine.context.br())
+    domain_bounds = orderings[1].get_domain_bounds(spmd_engine.context.br())
+    assert domain_bounds is not None
+    assert (
+        boundaries.table_view().columns()[0].type().id()
+        == plc.TypeId.TIMESTAMP_NANOSECONDS
+    )
+    assert (
+        domain_bounds.table_view().columns()[0].type().id()
+        == plc.TypeId.TIMESTAMP_NANOSECONDS
+    )
+    actual = DataFrame.from_table(
+        domain_bounds.table_view(),
+        ["datetime"],
+        [hstack.schema["datetime"]],
+        domain_bounds.stream,
+    ).to_polars()
+    assert actual["datetime"].cast(pl.Int64).to_list() == [234_567, 3_345_678]
+    actual = DataFrame.from_table(
+        boundaries.table_view(),
+        ["datetime"],
+        [hstack.schema["datetime"]],
+        boundaries.stream,
+    ).to_polars()
+    assert actual["datetime"].cast(pl.Int64).to_list() == [1_234_567, 2_345_678]
+
+
+@pytest.mark.parametrize(
+    "key_indices,expected",
+    [
+        ((0, 1), [(0, 1)]),
+        ((1, 0), [(1, 0), (2,)]),
+    ],
+    ids=["suffix", "leading"],
+)
+def test_remap_partitioning_order_scheme_truncates_composite_ordering(
+    spmd_engine, key_indices, expected
+):
+    hstack = _truncate_hstack("1ms", with_venue=True)
+    part = Partitioning(
+        inter_rank=_make_order_scheme(
+            spmd_engine.context,
+            key_indices=key_indices,
+            values=(1_234_567, 2_345_678),
+            domain_bounds=(234_567, 3_345_678),
             strict=True,
         ),
         local="inherit",
@@ -1047,39 +1158,60 @@ def test_remap_partitioning_order_scheme_truncates_prefix_key(spmd_engine):
     orderings = result.inter_rank.orderings
     assert [
         tuple(key.column_index for key in ordering.keys) for ordering in orderings
-    ] == [(0, 1), (0, 2)]
-    assert [o.strict_boundaries for o in orderings] == [True, False]
+    ] == expected
+    if key_indices == (1, 0):
+        derived_bounds = orderings[1].get_domain_bounds(spmd_engine.context.br())
+        assert derived_bounds is not None
+        actual = DataFrame.from_table(
+            derived_bounds.table_view(),
+            ["ts_bucket"],
+            [hstack.schema["ts_bucket"]],
+            derived_bounds.stream,
+        ).to_polars()
+        assert actual["ts_bucket"].to_list() == [0, 3_000_000]
 
-    boundaries = orderings[1].get_boundaries(spmd_engine.context.br())
-    boundary_df = DataFrame.from_table(
-        boundaries.table_view(),
-        ["venue", "ts_bucket"],
-        [hstack.schema["venue"], hstack.schema["ts_bucket"]],
-        boundaries.stream,
-    ).to_polars()
-    assert boundary_df["venue"].to_list() == [1_234_567, 2_345_678]
-    assert boundary_df["ts_bucket"].to_list() == [1_000_000, 2_000_000]
 
-
-def test_remap_partitioning_order_scheme_ignores_unordered_truncate(spmd_engine):
-    engine = pl.GPUEngine(executor="in-memory", raise_on_fail=True)
-    hstack = Translator(
-        pl.LazyFrame({"venue": [1], "DateTime": [1]})
-        .with_columns(
-            pl.col("DateTime")
-            .cast(pl.Datetime("ns"))
-            .dt.truncate("1ms")
-            .cast(pl.Int64)
-            .alias("ts_bucket")
-        )
-        ._ldf.visit(),
-        engine,
-    ).translate_ir()
-    assert isinstance(hstack, HStack)
+@pytest.mark.parametrize(
+    "frequency,upper_bound",
+    [
+        ("1ms", 0),
+        ("1m", 2**63 - 1),
+        ("1w", 2**63 - 1),
+        ("1mo", 2**63 - 1),
+    ],
+)
+@pytest.mark.parametrize("descending", [False, True])
+def test_remap_partitioning_order_scheme_rejects_wrapped_truncate(
+    spmd_engine, frequency, upper_bound, descending
+):
+    hstack = _truncate_hstack(frequency)
+    bounds = (upper_bound, -(2**63)) if descending else (-(2**63), upper_bound)
     part = Partitioning(
         inter_rank=_make_order_scheme(
             spmd_engine.context,
-            key_indices=(0,),
+            values=bounds,
+            domain_bounds=bounds,
+            order=(
+                plc.types.Order.DESCENDING if descending else plc.types.Order.ASCENDING
+            ),
+            strict=True,
+        ),
+        local="inherit",
+    )
+
+    result = maybe_remap_partitioning(hstack, part, context=spmd_engine.context)
+
+    assert result is not None
+    assert isinstance(result.inter_rank, OrderScheme)
+    assert [o.keys[0].column_index for o in result.inter_rank.orderings] == [0]
+
+
+def test_remap_partitioning_order_scheme_ignores_truncate_without_bounds(spmd_engine):
+    hstack = _truncate_hstack("1ms", with_venue=True)
+    part = Partitioning(
+        inter_rank=_make_order_scheme(
+            spmd_engine.context,
+            key_indices=(1,),
             strict=True,
         ),
         local="inherit",
@@ -1090,7 +1222,7 @@ def test_remap_partitioning_order_scheme_ignores_unordered_truncate(spmd_engine)
     assert result is not None
     assert isinstance(result.inter_rank, OrderScheme)
     orderings = result.inter_rank.orderings
-    assert [o.keys[0].column_index for o in orderings] == [0]
+    assert [o.keys[0].column_index for o in orderings] == [1]
     assert [o.strict_boundaries for o in orderings] == [True]
 
 

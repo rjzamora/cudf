@@ -273,6 +273,18 @@ def _boundary_values(context, ordering, name: str = "key") -> list[object]:
     )
 
 
+def _domain_bound_values(context, ordering, name: str = "key") -> list[object]:
+    chunk = ordering.get_domain_bounds(context.br())
+    assert chunk is not None
+    return (
+        DataFrame.from_table(
+            chunk.table_view(), [name], [DataType(pl.Int32())], stream=chunk.stream
+        )
+        .to_polars()[name]
+        .to_list()
+    )
+
+
 @pytest.mark.spmd
 @pytest.mark.parametrize("n_chunks", [2, 4])
 def test_extract_orderscheme_partitioning(spmd_engine, n_chunks) -> None:
@@ -301,6 +313,10 @@ def test_extract_orderscheme_partitioning(spmd_engine, n_chunks) -> None:
     # Verify actual boundary values: start of each partition except the first
     expected_keys = [i * n_rows for i in range(1, comm.nranks * n_chunks)]
     assert _boundary_values(context, ordering) == expected_keys
+    assert _domain_bound_values(context, ordering) == [
+        0,
+        comm.nranks * n_chunks * n_rows - 1,
+    ]
     assert _chunk_data(context, result, {"key": DataType(pl.Int32())}) == [
         {"key": list(range(key_start + i * n_rows, key_start + (i + 1) * n_rows))}
         for i in range(n_chunks)
@@ -343,6 +359,10 @@ def test_extract_orderscheme_partitioning_projects_order_keys(spmd_engine) -> No
     assert chunk.table_view().num_columns() == 1
     expected_keys = [i * n_rows for i in range(1, comm.nranks * n_chunks)]
     assert _boundary_values(context, ordering) == expected_keys
+    assert _domain_bound_values(context, ordering) == [
+        0,
+        comm.nranks * n_chunks * n_rows - 1,
+    ]
     assert _chunk_data(
         context,
         result,
@@ -483,6 +503,7 @@ def test_extract_orderscheme_partitioning_descending(spmd_engine) -> None:
     assert ordering.num_boundaries == 1
 
     assert _boundary_values(context, ordering) == [3]
+    assert _domain_bound_values(context, ordering) == [7, 0]
     assert _chunk_data(context, result, {"key": DataType(pl.Int32())}) == [
         {"key": [7, 6, 5, 4]},
         {"key": [3, 2, 1, 0]},

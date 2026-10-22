@@ -73,13 +73,13 @@ class OrderSchemePartitioningResult:
     """The consumed chunks, stored in replay order."""
 
 
-def _extract_boundaries_from_endpoint_rows(
+def _extract_boundaries_and_bounds(
     endpoint_key_rows: plc.Table,
     num_partitions: int,
     stream: Stream,
-) -> tuple[plc.Table, bool]:
+) -> tuple[plc.Table, plc.Table, bool]:
     """
-    Extract boundaries from alternating partition endpoint rows.
+    Extract partition boundaries and domain bounds from endpoint rows.
 
     Parameters
     ----------
@@ -93,8 +93,21 @@ def _extract_boundaries_from_endpoint_rows(
 
     Returns
     -------
-    The boundaries table and whether they are strict.
+    The partition boundaries, domain bounds, and whether the partition
+    boundaries are strict.
     """
+    domain_bounds = plc.concatenate.concatenate(
+        plc.copying.slice(
+            endpoint_key_rows,
+            [0, 1, 2 * num_partitions - 1, 2 * num_partitions],
+            stream=stream,
+        ),
+        stream=stream,
+    )
+    if num_partitions == 1:
+        (boundaries,) = plc.copying.slice(endpoint_key_rows, [0, 0], stream=stream)
+        return boundaries, domain_bounds, True
+
     # Boundaries are the first endpoint of all partitions except the first.
     # Strictness compares each partition end with the following partition start.
     previous_partition_ends = plc.concatenate.concatenate(
@@ -137,7 +150,7 @@ def _extract_boundaries_from_endpoint_rows(
         plc.DataType(plc.TypeId.BOOL8),
         stream=stream,
     ).to_py(stream=stream)
-    return next_partition_starts, strict
+    return next_partition_starts, domain_bounds, strict
 
 
 def _metadata_has_ordering(metadata: ChannelMetadata, keys: Sequence[OrderKey]) -> bool:
@@ -340,7 +353,7 @@ async def extract_orderscheme_partitioning(
         return OrderSchemePartitioningResult(None, chunks)
 
     # Extract boundaries and construct the Partitioning
-    boundaries, strict = _extract_boundaries_from_endpoint_rows(
+    boundaries, domain_bounds, strict = _extract_boundaries_and_bounds(
         endpoint_table, num_partitions, stream
     )
     del endpoint_table
@@ -350,7 +363,19 @@ async def extract_orderscheme_partitioning(
     return OrderSchemePartitioningResult(
         Partitioning(
             inter_rank=OrderScheme(
-                [Ordering(order_keys, boundaries_chunk, strict_boundaries=strict)]
+                [
+                    Ordering(
+                        order_keys,
+                        boundaries_chunk,
+                        domain_bounds=TableChunk.from_pylibcudf_table(
+                            domain_bounds,
+                            stream,
+                            exclusive_view=True,
+                            br=context.br(),
+                        ),
+                        strict_boundaries=strict,
+                    )
+                ]
             ),
             local="inherit",
         ),
