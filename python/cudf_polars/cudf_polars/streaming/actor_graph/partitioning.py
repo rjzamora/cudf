@@ -163,6 +163,40 @@ def is_row_ordered_by(
     )
 
 
+def is_globally_row_ordered_by(
+    partitioning: Partitioning | None,
+    order_keys: Sequence[OrderKey],
+) -> bool:
+    """Return whether row order and rank ranges prove global ordering."""
+    order_keys = tuple(order_keys)
+    if is_row_ordered_by(
+        partitioning,
+        order_keys,
+        scope=RowOrderingScope.GLOBAL,
+    ):
+        return True
+    if partitioning is None or not is_row_ordered_by(
+        partitioning,
+        order_keys,
+        scope=RowOrderingScope.RANK_LOCAL,
+    ):
+        return False
+    scheme = partitioning.inter_rank
+    if not isinstance(scheme, OrderScheme):
+        return False
+    return any(
+        (
+            len(ordering.keys) >= len(order_keys)
+            and ordering.keys[: len(order_keys)] == order_keys
+        )
+        or (
+            ordering.strict_boundaries
+            and ordering.keys == order_keys[: len(ordering.keys)]
+        )
+        for ordering in scheme.orderings
+    )
+
+
 def _deduplicate_row_orderings(
     orderings: Sequence[RowOrdering],
 ) -> tuple[RowOrdering, ...]:
@@ -613,9 +647,13 @@ class NormalizedPartitioning:
         return scheme.orderings[0] if isinstance(scheme, OrderScheme) else None
 
     def is_aligned_with(
-        self, other: NormalizedPartitioning, br: BufferResource
+        self,
+        other: NormalizedPartitioning,
+        br: BufferResource,
+        *,
+        level: PartitioningLevel = "flat",
     ) -> bool:
-        """True when both sides share identical inter-rank and local layouts."""
+        """True when both sides share the requested strict partition layout."""
 
         def schemes_aligned(
             lhs: PartitioningScheme,
@@ -633,6 +671,19 @@ class NormalizedPartitioning:
                 )
             return lhs == "inherit" and rhs == "inherit"
 
+        inter_rank_aligned = (
+            self.is_strictly_partitioned(level="inter_rank")
+            and other.is_strictly_partitioned(level="inter_rank")
+            and schemes_aligned(self.inter_rank_scheme, other.inter_rank_scheme)
+        )
+        if level == "inter_rank":
+            return inter_rank_aligned
+        if level == "local":
+            return (
+                self._scheme_is_strict(self.local_scheme)
+                and self._scheme_is_strict(other.local_scheme)
+                and schemes_aligned(self.local_scheme, other.local_scheme)
+            )
         local_schemes_strict = (
             self.local_scheme == "inherit" and other.local_scheme == "inherit"
         ) or (
@@ -640,10 +691,8 @@ class NormalizedPartitioning:
             and self._scheme_is_strict(other.local_scheme)
         )
         return (
-            self.is_strictly_partitioned(level="inter_rank")
-            and other.is_strictly_partitioned(level="inter_rank")
+            inter_rank_aligned
             and local_schemes_strict
-            and schemes_aligned(self.inter_rank_scheme, other.inter_rank_scheme)
             and schemes_aligned(self.local_scheme, other.local_scheme)
         )
 

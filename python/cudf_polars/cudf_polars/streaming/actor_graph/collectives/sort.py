@@ -49,7 +49,8 @@ from cudf_polars.streaming.actor_graph.nodes import (
 )
 from cudf_polars.streaming.actor_graph.partitioning import (
     NormalizedPartitioning,
-    is_row_ordered_by,
+    add_row_ordering,
+    is_globally_row_ordered_by,
     maybe_remap_partitioning,
     replace_row_orderings,
 )
@@ -526,14 +527,24 @@ async def sort_actor(
             return
 
         order_keys = sort_to_order_keys(ir)
-        if is_row_ordered_by(
+        if is_globally_row_ordered_by(
             metadata_in.partitioning,
             order_keys,
-            scope=RowOrderingScope.GLOBAL,
         ):
             if tracer is not None:
                 tracer.decision = "already_row_ordered"
-            await send_metadata(ch_out, context, metadata_in)
+            await send_metadata(
+                ch_out,
+                context,
+                ChannelMetadata(
+                    local_count=metadata_in.local_count,
+                    partitioning=add_row_ordering(
+                        metadata_in.partitioning or Partitioning(),
+                        RowOrdering(order_keys, RowOrderingScope.GLOBAL),
+                    ),
+                    duplicated=metadata_in.duplicated,
+                ),
+            )
             while (msg := await ch_in.recv(context)) is not None:
                 await ch_out.send(context, msg)
             await ch_out.drain(context)

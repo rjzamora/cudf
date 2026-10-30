@@ -127,7 +127,10 @@ def set_memory_resource(mr: rmm.mr.DeviceMemoryResource) -> Iterator[None]:
         rmm.mr.set_current_device_resource(old)
 
 
-async def gather_in_task_group(*coroutines: Coroutine[Any, Any, Any]) -> list[Any]:
+async def gather_in_task_group(
+    *coroutines: Coroutine[Any, Any, Any],
+    cleanup: Callable[[Any], None] | None = None,
+) -> list[Any]:
     """
     asyncio.gather-like API for running tasks in a asyncio.TaskGroup.
 
@@ -135,14 +138,25 @@ async def gather_in_task_group(*coroutines: Coroutine[Any, Any, Any]) -> list[An
     ----------
     coroutines
         Tasks to execute.
+    cleanup
+        Called on successful results if a sibling task fails.
 
     Returns
     -------
     list[Any]
         The results of the coroutines.
     """
-    async with asyncio.TaskGroup() as tg:
-        tasks = [tg.create_task(coro) for coro in coroutines]
+    tasks: list[asyncio.Task[Any]] = []
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tasks = [tg.create_task(coro) for coro in coroutines]
+    except BaseException:
+        if cleanup is not None:
+            for task in tasks:
+                if task.done() and not task.cancelled() and task.exception() is None:
+                    with contextlib.suppress(BaseException):
+                        cleanup(task.result())
+        raise
     return [task.result() for task in tasks]
 
 

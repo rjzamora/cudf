@@ -81,9 +81,18 @@ def build_hconcat_partitioning(
     inter_rank = _combine_hconcat_scheme(
         tuple(partitioning.inter_rank for partitioning in remapped)
     )
-    local = _combine_hconcat_scheme(
-        tuple(partitioning.local for partitioning in remapped)
-    )
+    local_schemes = tuple(partitioning.local for partitioning in remapped)
+    if local_schemes and all(scheme == "inherit" for scheme in local_schemes):
+        local: PartitioningScheme = "inherit"
+    else:
+        local = _combine_hconcat_scheme(
+            tuple(
+                partitioning.inter_rank
+                if partitioning.local == "inherit"
+                else partitioning.local
+                for partitioning in remapped
+            )
+        )
     row_orderings = tuple(
         ordering for partitioning in remapped for ordering in partitioning.row_orderings
     )

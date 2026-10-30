@@ -33,6 +33,7 @@ from cudf_polars.dsl.ir import (
 from cudf_polars.dsl.traversal import post_traversal
 from cudf_polars.dsl.utils.column_domain import column_domain_bindings
 from cudf_polars.streaming.hint_sorted import HintSorted
+from cudf_polars.streaming.join import supports_ordered_cursor_join
 from cudf_polars.utils.sorting import sort_order
 
 if TYPE_CHECKING:
@@ -162,7 +163,7 @@ def _join_child_order_requests(
     requests: tuple[PartitioningRequest, ...],
 ) -> list[tuple[IR, PartitioningRequest]]:
     """Push a join-key ordering request to both join inputs."""
-    if node.options[0] not in ("Inner", "Left") or node.options[5] != "none":
+    if not supports_ordered_cursor_join(node):
         return []
     left_names = _column_names(node.left_on)
     right_names = _column_names(node.right_on)

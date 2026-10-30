@@ -16,6 +16,8 @@ from polars.testing import assert_frame_equal
 
 import pylibcudf as plc
 from cudf_streaming.channel_metadata import (
+    OrderKey,
+    OrderScheme,
     RowOrderingScope,
 )
 from cudf_streaming.table_chunk import TableChunk
@@ -24,11 +26,19 @@ from cudf_polars import Translator
 from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.dsl import expr
 from cudf_polars.dsl.ir import Distinct, Empty, GroupBy
+from cudf_polars.engine.core import all_gather_host_data
 from cudf_polars.engine.options import StreamingOptions
+from cudf_polars.engine.spmd import allgather_polars_dataframe
 from cudf_polars.streaming.actor_graph import groupby as groupby_actor_graph
+from cudf_polars.streaming.actor_graph.collectives.common import reserve_op_id
+from cudf_polars.streaming.actor_graph.collectives.ordered import (
+    RankEndpoints,
+    endpoint_rows_equal,
+)
 from cudf_polars.streaming.actor_graph.collectives.shuffle import ShuffleManager
 from cudf_polars.streaming.actor_graph.core import evaluate_logical_plan
 from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.testing.io import make_partitioned_source
 from cudf_polars.utils.config import ConfigOptions
 
 
@@ -211,10 +221,218 @@ def test_groupby_uses_row_ordering_across_chunks(
     (metadata,) = metadata_collector
     assert metadata.local_count > 1
     assert metadata.partitioning is not None
-    assert metadata.partitioning.inter_rank is None
+    assert isinstance(metadata.partitioning.inter_rank, OrderScheme)
+    (ordering,) = metadata.partitioning.inter_rank.orderings
+    assert tuple(key.column_index for key in ordering.keys) == (0,)
     (row_ordering,) = metadata.partitioning.row_orderings
     assert row_ordering.scope == RowOrderingScope.GLOBAL
     assert tuple(key.column_index for key in row_ordering.order_keys) == (0, 1)
+
+
+def test_ordered_groupby_clamps_underestimated_output_count() -> None:
+    assert groupby_actor_graph._ordered_output_count(5, 2) == 4
+    assert groupby_actor_graph._ordered_output_count(2, 4) == 1
+
+
+def _share_source_path(spmd_engine, source) -> str:
+    """Share a rank-0 temporary path with every SPMD rank."""
+    path = str(source).encode() if spmd_engine.rank == 0 else b""
+    with reserve_op_id() as op_id:
+        return all_gather_host_data(
+            spmd_engine.comm,
+            spmd_engine.context.br(),
+            op_id,
+            path,
+        )[0].decode()
+
+
+def test_ordered_endpoint_nan_equivalence(spmd_engine) -> None:
+    """Treat adjacent NaN boundary keys as one group."""
+    stream = spmd_engine.context.br().stream_pool.get_stream()
+    endpoints = RankEndpoints(
+        plc.Table(
+            [
+                plc.Column.from_arrow(
+                    pl.Series("key", [float("nan"), float("nan")]),
+                    stream=stream,
+                )
+            ]
+        ),
+        (0,),
+        stream,
+    )
+    order_keys = (
+        OrderKey(
+            0,
+            plc.types.Order.ASCENDING,
+            plc.types.NullOrder.BEFORE,
+        ),
+    )
+
+    assert endpoint_rows_equal(endpoints, 0, 1, order_keys, stream)
+
+
+@pytest.mark.spmd
+def test_groupby_uses_row_ordering_across_ranks(
+    spmd_engine_factory,
+    tmp_path,
+) -> None:
+    """Combine one ordered group spanning every source rank."""
+    spmd_engine = spmd_engine_factory(
+        StreamingOptions(
+            max_rows_per_partition=2,
+            target_partition_size=1,
+            fallback_mode="raise",
+            raise_on_fail=True,
+        )
+    )
+    nranks = spmd_engine.comm.nranks
+    if nranks not in (2, 3):
+        pytest.skip("This test expects two or three ranks.")
+    source = tmp_path / "ordered-groupby"
+    if spmd_engine.rank == 0:
+        source.mkdir()
+        make_partitioned_source(
+            pl.DataFrame(
+                {
+                    "raw": range(6 * nranks),
+                    "value": range(6 * nranks),
+                }
+            ),
+            source,
+            "parquet",
+            n_files=2,
+            row_group_size=2,
+        )
+    source = _share_source_path(spmd_engine, source)
+    q = (
+        pl.scan_parquet(source)
+        .set_sorted("raw")
+        .with_columns(
+            pl.col("raw")
+            .cast(pl.Datetime("ns"))
+            .dt.truncate(f"{6 * nranks}ns")
+            .cast(pl.Int64)
+            .alias("key")
+        )
+        .group_by("key", maintain_order=True)
+        .agg(
+            pl.col("value").first().alias("first"),
+            pl.col("value").last().alias("last"),
+            pl.col("value").sum().alias("sum"),
+        )
+        .sort("key")
+    )
+    ir = Translator(q._ldf.visit(), spmd_engine).translate_ir()
+    with patch.object(
+        groupby_actor_graph,
+        "_distributed_ordered_reduce",
+        wraps=groupby_actor_graph._distributed_ordered_reduce,
+    ) as ordered_reduce:
+        result, metadata_collector = evaluate_logical_plan(
+            ir,
+            ConfigOptions.from_polars_engine(spmd_engine),
+            collect_metadata=True,
+        )
+    with reserve_op_id() as op_id:
+        rank_rows = tuple(
+            int(value)
+            for value in all_gather_host_data(
+                spmd_engine.comm,
+                spmd_engine.context.br(),
+                op_id,
+                str(result.height).encode(),
+            )
+        )
+    result = allgather_polars_dataframe(
+        engine=spmd_engine,
+        local_df=result,
+        op_id=0,
+    )
+    assert_frame_equal(q.collect(), result)
+    assert ordered_reduce.call_count == 1
+    assert rank_rows == (0,) * (nranks - 1) + (1,)
+    assert metadata_collector is not None
+    (metadata,) = metadata_collector
+    assert metadata.partitioning is not None
+    assert isinstance(metadata.partitioning.inter_rank, OrderScheme)
+    (ordering,) = metadata.partitioning.inter_rank.orderings
+    assert ordering.strict_boundaries
+    assert ordering.get_boundaries(spmd_engine.context.br()).shape[0] == nranks - 1
+
+
+@pytest.mark.spmd
+def test_groupby_moves_only_global_last_key_to_trailing_empty_rank(
+    spmd_engine_factory,
+    tmp_path,
+) -> None:
+    """Keep a shared interior key with its owning nonempty rank."""
+    engine = spmd_engine_factory(
+        StreamingOptions(
+            max_rows_per_partition=2,
+            target_partition_size=1,
+            fallback_mode="raise",
+            raise_on_fail=True,
+        )
+    )
+    if engine.comm.nranks != 4:
+        pytest.skip("This test expects exactly four ranks.")
+    source = tmp_path / "sparse-ordered-groupby"
+    layout = (([0, 0], True), ([0, 1], True), ([0], False), ([1], False))
+    if engine.rank == 0:
+        source.mkdir()
+        for partition, (keys, keep) in enumerate(layout):
+            pl.DataFrame(
+                {
+                    "key": pl.Series(keys, dtype=pl.Int64),
+                    "value": range(len(keys)),
+                    "keep": keep,
+                }
+            ).write_parquet(source / f"{partition}.parquet")
+    source = _share_source_path(engine, source)
+    q = (
+        pl.scan_parquet(source)
+        .filter(pl.col("keep"))
+        .drop("keep")
+        .set_sorted("key")
+        .group_by("key", maintain_order=True)
+        .agg(pl.col("value").sum())
+        .sort("key")
+    )
+    ir = Translator(q._ldf.visit(), engine).translate_ir()
+
+    result, metadata_collector = evaluate_logical_plan(
+        ir,
+        ConfigOptions.from_polars_engine(engine),
+        collect_metadata=True,
+    )
+    with reserve_op_id() as op_id:
+        rank_rows = tuple(
+            int(value)
+            for value in all_gather_host_data(
+                engine.comm,
+                engine.context.br(),
+                op_id,
+                str(result.height).encode(),
+            )
+        )
+    result = allgather_polars_dataframe(engine=engine, local_df=result, op_id=0)
+
+    assert_frame_equal(q.collect(), result)
+    assert rank_rows == (0, 1, 0, 1)
+    assert metadata_collector is not None
+    (metadata,) = metadata_collector
+    assert metadata.partitioning is not None
+    assert isinstance(metadata.partitioning.inter_rank, OrderScheme)
+    (ordering,) = metadata.partitioning.inter_rank.orderings
+    assert ordering.strict_boundaries
+    boundaries = ordering.get_boundaries(engine.context.br())
+    assert DataFrame.from_table(
+        boundaries.table_view(),
+        ["key"],
+        [DataType(pl.Int64())],
+        boundaries.stream,
+    ).to_polars()["key"].to_list() == [0, 1, 1]
 
 
 def test_groupby_dynamic_preserves_index_ordering(spmd_engine_factory) -> None:
@@ -242,7 +460,9 @@ def test_groupby_dynamic_preserves_index_ordering(spmd_engine_factory) -> None:
     assert len(metadata_collector) == 1
     metadata = metadata_collector[0]
     assert metadata.partitioning is not None
-    assert metadata.partitioning.inter_rank is None
+    assert isinstance(metadata.partitioning.inter_rank, OrderScheme)
+    (ordering,) = metadata.partitioning.inter_rank.orderings
+    assert tuple(key.column_index for key in ordering.keys) == (0,)
     (row_ordering,) = metadata.partitioning.row_orderings
     assert tuple(key.column_index for key in row_ordering.order_keys) == (0,)
     assert row_ordering.scope == RowOrderingScope.GLOBAL

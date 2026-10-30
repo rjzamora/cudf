@@ -154,19 +154,46 @@ def _with_extracted_ordering(
 
     existing = metadata.partitioning
     assert existing is not None
-    orderings: list[Ordering] = []
-    if isinstance(existing.inter_rank, OrderScheme):
-        orderings.extend(existing.inter_rank.orderings)
+    existing_inter_rank = (
+        existing.inter_rank.orderings
+        if isinstance(existing.inter_rank, OrderScheme)
+        else ()
+    )
 
     scheme = partitioning.inter_rank
-    if isinstance(scheme, OrderScheme):
-        orderings.extend(scheme.orderings)
+    extracted_inter_rank = scheme.orderings if isinstance(scheme, OrderScheme) else ()
+    orderings = (*existing_inter_rank, *extracted_inter_rank)
+
+    existing_local = (
+        existing_inter_rank
+        if existing.local == "inherit"
+        else (
+            existing.local.orderings if isinstance(existing.local, OrderScheme) else ()
+        )
+    )
+    extracted_local = (
+        extracted_inter_rank
+        if partitioning.local == "inherit"
+        else (
+            partitioning.local.orderings
+            if isinstance(partitioning.local, OrderScheme)
+            else ()
+        )
+    )
+    local_orderings = (*existing_local, *extracted_local)
+    local = (
+        "inherit"
+        if local_orderings == orderings
+        else OrderScheme(local_orderings)
+        if local_orderings
+        else None
+    )
 
     return ChannelMetadata(
         local_count=metadata.local_count,
         partitioning=Partitioning(
             OrderScheme(orderings),
-            partitioning.local,
+            local,
             row_orderings=existing.row_orderings,
         ),
         duplicated=metadata.duplicated,

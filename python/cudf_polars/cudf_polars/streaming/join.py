@@ -36,6 +36,15 @@ if TYPE_CHECKING:
     from cudf_polars.streaming.parallel import LowerIRTransformer
 
 
+def supports_ordered_cursor_join(ir: Join) -> bool:
+    """Return whether a join can use the row-ordered cursor implementation."""
+    return (
+        ir.options[0] in ("Inner", "Left")
+        and ir.options[2] is None
+        and ir.options[5] in ("none", "left")
+    )
+
+
 def _maybe_shuffle_frame(
     frame: IR,
     on: tuple[NamedExpr, ...],
