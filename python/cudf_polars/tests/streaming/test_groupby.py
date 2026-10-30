@@ -16,8 +16,6 @@ from polars.testing import assert_frame_equal
 
 import pylibcudf as plc
 from cudf_streaming.channel_metadata import (
-    OrderScheme,
-    RowOrdering,
     RowOrderingScope,
 )
 from cudf_streaming.table_chunk import TableChunk
@@ -95,25 +93,6 @@ def test_dynamic_groupby_strategy_avoids_row_limit_allgather(
     assert tracer.decision == "shuffle"
 
 
-@pytest.mark.parametrize(
-    "nranks,npartitions,expected",
-    [
-        (2, 5, [3, 2]),
-        (3, 5, [2, 2, 1]),
-        (4, 10, [3, 2, 3, 2]),
-    ],
-)
-def test_partition_count_for_rank_uses_contiguous_ownership(
-    nranks, npartitions, expected
-):
-    """GroupBy metadata uses the same uneven partition ownership as adjust_ordering."""
-    counts = [
-        groupby_actor_graph._partition_count_for_rank(rank, nranks, npartitions)
-        for rank in range(nranks)
-    ]
-    assert counts == expected
-
-
 def test_order_sensitive_execution_does_not_imply_output_order() -> None:
     schema = {"key": DataType(pl.Int64()), "value": DataType(pl.Int64())}
     key = expr.NamedExpr("key", expr.Col(schema["key"], "key"))
@@ -141,10 +120,10 @@ def test_order_sensitive_execution_does_not_imply_output_order() -> None:
     assert not distinct.preserves_output_order
 
 
-def test_groupby_adjusts_truncated_ordering_with_maintain_order(
+def test_groupby_maintain_order_falls_back_without_strict_partitioning(
     spmd_engine_factory,
 ) -> None:
-    """GroupBy can adjust an ordered prefix without tree-reducing."""
+    """A non-strict ordered prefix does not force ordered execution."""
     engine = spmd_engine_factory(
         StreamingOptions(
             target_partition_size=64,
@@ -182,18 +161,60 @@ def test_groupby_adjusts_truncated_ordering_with_maintain_order(
     assert_frame_equal(result, expected, check_row_order=False)
 
     assert metadata_collector is not None
-    assert len(metadata_collector) == 1
-    metadata = metadata_collector[0]
+    (metadata,) = metadata_collector
     assert metadata.partitioning is not None
-    scheme = metadata.partitioning.inter_rank
-    assert isinstance(scheme, OrderScheme)
-    assert metadata.partitioning.local == "inherit"
-    (ordering,) = scheme.orderings
-    assert tuple(key.column_index for key in ordering.keys) == (0,)
-    assert ordering.strict_boundaries is True
-    assert metadata.partitioning.row_orderings == (
-        RowOrdering(ordering.keys, RowOrderingScope.GLOBAL),
+    assert metadata.partitioning.inter_rank is None
+    assert metadata.partitioning.local is None
+    assert not metadata.partitioning.row_orderings
+
+
+@pytest.mark.parametrize("descending", [False, True])
+def test_groupby_uses_row_ordering_across_chunks(
+    spmd_engine_factory, descending
+) -> None:
+    engine = spmd_engine_factory(
+        StreamingOptions(
+            max_rows_per_partition=2,
+            target_partition_size=1,
+            fallback_mode="raise",
+            raise_on_fail=True,
+        )
     )
+    data = pl.DataFrame(
+        {
+            "a": [0, 0, 0, 0, 1, 1, 2, 2],
+            "b": [1, 0, 1, 0, 1, 0, 1, 0],
+            "value": range(8),
+        }
+    ).sort("a", descending=descending)
+    q = (
+        data.lazy()
+        .set_sorted("a", descending=descending)
+        .group_by("a", "b")
+        .agg(
+            pl.col("value").first().alias("first"),
+            pl.col("value").last().alias("last"),
+            pl.col("value").sum().alias("sum"),
+        )
+        .sort(["a", "b"], descending=[descending, False])
+    )
+
+    expected = q.collect()
+    ir = Translator(q._ldf.visit(), engine).translate_ir()
+    result, metadata_collector = evaluate_logical_plan(
+        ir,
+        ConfigOptions.from_polars_engine(engine),
+        collect_metadata=True,
+    )
+    assert_frame_equal(result, expected)
+    assert metadata_collector is not None
+    (metadata,) = metadata_collector
+    assert metadata.local_count > 1
+    assert metadata.partitioning is not None
+    assert metadata.partitioning.inter_rank is None
+    (row_ordering,) = metadata.partitioning.row_orderings
+    assert row_ordering.scope == RowOrderingScope.GLOBAL
+    assert tuple(key.column_index for key in row_ordering.order_keys) == (0, 1)
 
 
 def test_groupby_dynamic_preserves_index_ordering(spmd_engine_factory) -> None:
@@ -221,13 +242,10 @@ def test_groupby_dynamic_preserves_index_ordering(spmd_engine_factory) -> None:
     assert len(metadata_collector) == 1
     metadata = metadata_collector[0]
     assert metadata.partitioning is not None
-    assert isinstance(metadata.partitioning.inter_rank, OrderScheme)
-    (ordering,) = metadata.partitioning.inter_rank.orderings
-    assert tuple(key.column_index for key in ordering.keys) == (0,)
-    assert ordering.strict_boundaries is True
-    assert metadata.partitioning.row_orderings == (
-        RowOrdering(ordering.keys, RowOrderingScope.GLOBAL),
-    )
+    assert metadata.partitioning.inter_rank is None
+    (row_ordering,) = metadata.partitioning.row_orderings
+    assert tuple(key.column_index for key in row_ordering.order_keys) == (0,)
+    assert row_ordering.scope == RowOrderingScope.GLOBAL
 
 
 @pytest.mark.parametrize("keys", [("key",), ("key", "key2")])

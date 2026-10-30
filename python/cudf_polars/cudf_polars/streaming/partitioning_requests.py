@@ -132,9 +132,11 @@ def _direct_child_requests(ir: IR) -> list[tuple[IR, PartitioningRequest]]:
 def _propagated_child_requests(
     node: IR, requests: dict[IR, tuple[PartitioningRequest, ...]]
 ) -> list[tuple[IR, PartitioningRequest]]:
-    """Push compatible downstream requests through single-child operators."""
+    """Push compatible downstream requests through an operator."""
     child_requests: list[tuple[IR, PartitioningRequest]] = []
     node_requests = requests.get(node)
+    if node_requests is not None and isinstance(node, Join):
+        child_requests.extend(_join_child_order_requests(node, node_requests))
     if (
         node_requests is not None
         and len(node.children) == 1
@@ -153,6 +155,41 @@ def _propagated_child_requests(
             if (remapped := _remap_request(node_request, remapping)) is not None
         )
     return child_requests
+
+
+def _join_child_order_requests(
+    node: Join,
+    requests: tuple[PartitioningRequest, ...],
+) -> list[tuple[IR, PartitioningRequest]]:
+    """Push a join-key ordering request to both join inputs."""
+    if node.options[0] not in ("Inner", "Left") or node.options[5] != "none":
+        return []
+    left_names = _column_names(node.left_on)
+    right_names = _column_names(node.right_on)
+    if left_names is None or right_names is None:
+        return []
+
+    result: list[tuple[IR, PartitioningRequest]] = []
+    for request in requests:
+        if not isinstance(request, OrderPartitioningRequest):
+            continue
+        if tuple(key.name for key in request.keys) != left_names:
+            continue
+        result.append((node.children[0], request))
+        result.append(
+            (
+                node.children[1],
+                OrderPartitioningRequest(
+                    tuple(
+                        NamedOrderKey(name, key.order, key.null_order)
+                        for name, key in zip(right_names, request.keys, strict=True)
+                    ),
+                    strict_key_count=request.strict_key_count,
+                    source=request.source,
+                ),
+            )
+        )
+    return result
 
 
 def _merge_candidate_request(

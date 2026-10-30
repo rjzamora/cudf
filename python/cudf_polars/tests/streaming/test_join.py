@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 import polars as pl
+from polars.testing import assert_frame_equal
 
 import pylibcudf as plc
 from cudf_streaming.channel_metadata import (
@@ -32,7 +33,6 @@ from cudf_polars.streaming.actor_graph.core import evaluate_logical_plan
 from cudf_polars.streaming.actor_graph.join import (
     _forward_join_partitioning,
     _make_ordered_strategy,
-    _ordered_join_decision,
     _use_pwise_join,
 )
 from cudf_polars.streaming.actor_graph.partitioning import NormalizedPartitioning
@@ -270,6 +270,53 @@ def test_ordered_join_after_set_sorted_inputs(spmd_engine_factory):
     assert metadata.partitioning.row_orderings == ()
 
 
+@pytest.mark.parametrize("how", ["inner", "left"])
+@pytest.mark.parametrize("descending", [False, True])
+def test_row_ordered_join_across_chunks(spmd_engine_factory, how, descending) -> None:
+    engine = spmd_engine_factory(
+        StreamingOptions(
+            max_rows_per_partition=2,
+            target_partition_size=1,
+            broadcast_limit=1,
+            fallback_mode="raise",
+            raise_on_fail=True,
+        )
+    )
+    left_df = pl.DataFrame(
+        {
+            "k": [0, 0, 0, 1, 2, 2, 3],
+            "left_value": range(7),
+        }
+    ).sort("k", descending=descending)
+    right_df = pl.DataFrame(
+        {
+            "k": [0, 0, 1, 1, 2, 4],
+            "right_value": range(6),
+        }
+    ).sort("k", descending=descending)
+    left = left_df.lazy().set_sorted("k", descending=descending)
+    right = right_df.lazy().set_sorted("k", descending=descending)
+    q = left.join(right, on="k", how=how).sort("k", descending=descending)
+
+    expected = q.collect()
+    ir = Translator(q._ldf.visit(), engine).translate_ir()
+    result, metadata_collector = evaluate_logical_plan(
+        ir,
+        ConfigOptions.from_polars_engine(engine),
+        collect_metadata=True,
+    )
+    assert_frame_equal(result, expected, check_row_order=False)
+    assert result["k"].is_sorted(descending=descending)
+    assert metadata_collector is not None
+    (metadata,) = metadata_collector
+    assert metadata.local_count > 1
+    assert metadata.partitioning is not None
+    assert metadata.partitioning.inter_rank is None
+    (row_ordering,) = metadata.partitioning.row_orderings
+    assert row_ordering.scope == RowOrderingScope.GLOBAL
+    assert tuple(key.column_index for key in row_ordering.order_keys) == (0,)
+
+
 @pytest.mark.parametrize(
     "how,maintain_order,expected_column",
     [
@@ -348,25 +395,6 @@ def test_ordered_join_strategy_checks_order_key_semantics(spmd_engine):
         is not None
     )
     assert _make_ordered_strategy(join_ir, left_partitioning, mismatched_right) is None
-
-
-@pytest.mark.parametrize(
-    "left_aligned,right_aligned,expected",
-    [
-        (True, True, "ordered_aligned"),
-        (True, False, "ordered_adjust_right"),
-        (False, True, "ordered_adjust_left"),
-        (False, False, "ordered_adjust_both"),
-    ],
-)
-def test_ordered_join_decision(left_aligned, right_aligned, expected):
-    assert (
-        _ordered_join_decision(
-            left_aligned=left_aligned,
-            right_aligned=right_aligned,
-        )
-        == expected
-    )
 
 
 @pytest.mark.parametrize("how", ["right", "full"])

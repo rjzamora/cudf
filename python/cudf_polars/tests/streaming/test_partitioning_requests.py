@@ -191,6 +191,28 @@ def test_select_remaps_strict_partition_request() -> None:
     assert requests[right] == (StrictPartitioningRequest(("x",)),)
 
 
+def test_join_propagates_downstream_order_request() -> None:
+    left = make_groupby(make_scan("a"), "a")
+    right = make_groupby(make_scan("x"), "x")
+    join = Join(
+        {"a": I64},
+        (named_col("a"),),
+        (named_col("x"),),
+        ("Inner", False, None, "_right", True, "none"),
+        left,
+        right,
+    )
+
+    requests = collect_partitioning_requests(make_sort(join, "a"))
+
+    assert requests[left] == (
+        OrderPartitioningRequest((named_order_key("a"),), strict_key_count=1),
+    )
+    assert requests[right] == (
+        OrderPartitioningRequest((named_order_key("x"),), strict_key_count=1),
+    )
+
+
 def test_cross_join_does_not_create_strict_partition_request() -> None:
     left = make_scan("a")
     right = make_scan("x")

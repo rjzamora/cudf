@@ -15,6 +15,7 @@ from cudf_streaming.channel_metadata import (
     OrderKey,
     OrderScheme,
     Partitioning,
+    RowOrdering,
     RowOrderingScope,
 )
 from cudf_streaming.table_chunk import (
@@ -35,7 +36,10 @@ from cudf_polars.dsl.utils.naming import names_to_indices
 from cudf_polars.streaming.actor_graph.collectives.allgather import (
     AllGatherManager,
 )
-from cudf_polars.streaming.actor_graph.collectives.ordering import adjust_ordering
+from cudf_polars.streaming.actor_graph.collectives.ordered import (
+    select_demand_range,
+    split_trailing_run,
+)
 from cudf_polars.streaming.actor_graph.collectives.shuffle import (
     _global_shuffle,
     _key_column_indices,
@@ -69,6 +73,7 @@ from cudf_polars.streaming.actor_graph.utils import (
     TableSizeStats,
     allgather_reduce,
     chunk_to_frame,
+    concat_batch,
     empty_table_chunk,
     gather_in_task_group,
     process_children,
@@ -83,6 +88,7 @@ from cudf_polars.streaming.filter_hint import (
     JoinInputDomain,
     JoinWithPrefilter,
 )
+from cudf_polars.streaming.partitioning_requests import OrderPartitioningRequest
 from cudf_polars.streaming.repartition import Repartition
 from cudf_polars.streaming.utils import _concat, partition_range
 
@@ -109,6 +115,7 @@ if TYPE_CHECKING:
         Prefilter,
         PushdownFilterHint,
     )
+    from cudf_polars.streaming.partitioning_requests import PartitioningRequest
     from cudf_polars.utils.config import StreamingExecutor
 
 
@@ -178,41 +185,31 @@ class ShuffleJoinStrategy:
 
 @dataclass(frozen=True)
 class OrderedJoinStrategy:
-    """Align existing ordered partitioning before joining."""
+    """Join inputs that already share strict ordering boundaries."""
 
-    output_indices: tuple[int, ...]
-    """Output key-column indices for output metadata."""
-    left_indices: tuple[int, ...]
-    """Left input key-column indices."""
-    right_indices: tuple[int, ...]
-    """Right input key-column indices."""
-    left_keys: tuple[NamedExpr, ...]
-    """Left key expressions."""
-    right_keys: tuple[NamedExpr, ...]
-    """Right key expressions."""
     left_input_ordering: Ordering
     """Input ordering for the left side."""
     right_input_ordering: Ordering
     """Input ordering for the right side."""
-    left_output_ordering: Ordering
-    """Aligned output ordering for the left side."""
-    right_output_ordering: Ordering
-    """Aligned output ordering for the right side."""
     output_ordering: Ordering
     """Join-output ordering metadata."""
-    left_input_rows_ordered: bool
-    """Whether left input rows follow ``left_input_ordering``."""
-    right_input_rows_ordered: bool
-    """Whether right input rows follow ``right_input_ordering``."""
 
 
-type JoinStrategy = BroadcastJoinStrategy | ShuffleJoinStrategy | OrderedJoinStrategy
-type OrderedJoinDecision = Literal[
-    "ordered_aligned",
-    "ordered_adjust_left",
-    "ordered_adjust_right",
-    "ordered_adjust_both",
-]
+@dataclass(frozen=True)
+class IncrementalOrderedJoinStrategy:
+    """Incrementally join globally row-ordered inputs on one rank."""
+
+    output_order_keys: tuple[OrderKey, ...]
+    left_order_keys: tuple[OrderKey, ...]
+    right_order_keys: tuple[OrderKey, ...]
+
+
+type JoinStrategy = (
+    BroadcastJoinStrategy
+    | ShuffleJoinStrategy
+    | OrderedJoinStrategy
+    | IncrementalOrderedJoinStrategy
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -768,6 +765,26 @@ def _get_key_indices(
     )
 
 
+def _requested_join_order_keys(
+    ir: Join,
+    requests: tuple[PartitioningRequest, ...],
+) -> tuple[OrderKey, ...]:
+    """Return a downstream ordering request that exactly matches the join keys."""
+    _, _, output_indices, _, _ = _get_key_indices(ir, None)
+    columns = tuple(ir.schema)
+    output_names = tuple(columns[index] for index in output_indices)
+    for request in requests:
+        if not isinstance(request, OrderPartitioningRequest):
+            continue
+        if tuple(key.name for key in request.keys) != output_names:
+            continue
+        return tuple(
+            OrderKey(index, key.order, key.null_order)
+            for index, key in zip(output_indices, request.keys, strict=True)
+        )
+    return ()
+
+
 def _ordering_prefix_matches(
     ordering: Ordering,
     reference: Ordering,
@@ -791,11 +808,8 @@ def _make_ordered_strategy(
     ir: Join,
     left_partitioning: NormalizedPartitioning,
     right_partitioning: NormalizedPartitioning,
-    *,
-    left_input_rows_ordered: bool = False,
-    right_input_rows_ordered: bool = False,
 ) -> OrderedJoinStrategy | None:
-    """Make an ordered strategy when both sides can align to strict boundaries."""
+    """Make a strategy for inputs with compatible strict boundaries."""
     if ir.options[0] not in ("Inner", "Left", "Semi", "Anti"):
         return None
 
@@ -808,19 +822,17 @@ def _make_ordered_strategy(
 
     left_ordering = left_scheme.orderings[0]
     right_ordering = right_scheme.orderings[0]
-    # adjust_ordering needs a strict target partitioning. Prefer the left side
-    # for output metadata, then fall back to the right side if only it is strict.
-    reference = left_ordering if left_ordering.strict_boundaries else right_ordering
-    if not reference.strict_boundaries:
+    if not (left_ordering.strict_boundaries and right_ordering.strict_boundaries):
         return None
 
+    reference = left_ordering
     reference_key_count = len(reference.keys)
     (
         left_key_indices,
         right_key_indices,
         output_key_indices,
-        left_keys,
-        right_keys,
+        _,
+        _,
     ) = _get_key_indices(ir, reference_key_count)
     if not (
         len(left_key_indices)
@@ -834,22 +846,67 @@ def _make_ordered_strategy(
     if not _ordering_prefix_matches(right_ordering, reference, right_key_indices):
         return None
 
-    left_output_ordering = remap_ordering_keys(reference, left_key_indices)
     output_ordering = remap_ordering_keys(reference, output_key_indices)
     return OrderedJoinStrategy(
-        output_indices=output_key_indices,
-        left_indices=left_key_indices,
-        right_indices=right_key_indices,
-        left_keys=left_keys[:reference_key_count],
-        right_keys=right_keys[:reference_key_count],
         left_input_ordering=left_ordering,
         right_input_ordering=right_ordering,
-        left_output_ordering=left_output_ordering,
-        right_output_ordering=remap_ordering_keys(reference, right_key_indices),
         output_ordering=output_ordering,
-        left_input_rows_ordered=left_input_rows_ordered,
-        right_input_rows_ordered=right_input_rows_ordered,
     )
+
+
+def _make_incremental_ordered_strategy(
+    ir: Join,
+    left_metadata: ChannelMetadata,
+    right_metadata: ChannelMetadata,
+    requested_order_keys: tuple[OrderKey, ...],
+) -> IncrementalOrderedJoinStrategy | None:
+    """Return a single-rank strategy for globally row-ordered join keys."""
+    if ir.options[0] not in ("Inner", "Left") or ir.options[5] != "none":
+        return None
+    (
+        left_indices,
+        right_indices,
+        output_indices,
+        _,
+        _,
+    ) = _get_key_indices(ir, None)
+    if not (
+        left_indices and len(left_indices) == len(right_indices) == len(output_indices)
+    ):
+        return None
+
+    left_partitioning = left_metadata.partitioning
+    right_partitioning = right_metadata.partitioning
+    if left_partitioning is None or right_partitioning is None:
+        return None
+    for row_ordering in left_partitioning.row_orderings:
+        if row_ordering.scope != RowOrderingScope.GLOBAL or row_ordering.group_keys:
+            continue
+        left_keys = row_ordering.order_keys[: len(left_indices)]
+        if tuple(key.column_index for key in left_keys) != left_indices:
+            continue
+        right_keys = tuple(
+            OrderKey(index, key.order, key.null_order)
+            for index, key in zip(right_indices, left_keys, strict=True)
+        )
+        if not is_row_ordered_by(
+            right_partitioning,
+            right_keys,
+            scope=RowOrderingScope.GLOBAL,
+        ):
+            continue
+        output_keys = tuple(
+            OrderKey(index, key.order, key.null_order)
+            for index, key in zip(output_indices, left_keys, strict=True)
+        )
+        if output_keys != requested_order_keys:
+            continue
+        return IncrementalOrderedJoinStrategy(
+            output_order_keys=output_keys,
+            left_order_keys=left_keys,
+            right_order_keys=right_keys,
+        )
+    return None
 
 
 async def _join_chunks(
@@ -1046,65 +1103,24 @@ def _local_count_for_ordering(comm: Communicator, ordering: Ordering) -> int:
     return stop - start
 
 
-def _ordered_join_decision(
-    *, left_aligned: bool, right_aligned: bool
-) -> OrderedJoinDecision:
-    """Return the trace decision for ordered join-side alignment."""
-    if left_aligned and right_aligned:
-        return "ordered_aligned"
-    if left_aligned:
-        return "ordered_adjust_right"
-    if right_aligned:
-        return "ordered_adjust_left"
-    return "ordered_adjust_both"
-
-
-async def _adjust_ordered_join_side(
+def _ordered_join_is_aligned(
     context: Context,
     comm: Communicator,
-    schema_ir: IR,
-    ir_context: IRExecutionContext,
-    ch_out: Channel[TableChunk],
-    ch_in: Channel[TableChunk],
-    input_ordering: Ordering,
-    output_ordering: Ordering,
-    *,
-    input_rows_ordered: bool,
-    already_aligned: bool,
-    collective_id: int,
-) -> None:
-    """Send metadata, then align one join side to output_ordering."""
-    output_metadata = ChannelMetadata(
-        local_count=_local_count_for_ordering(comm, output_ordering),
-        partitioning=Partitioning(
-            OrderScheme([output_ordering]),
-            local="inherit",
-        ),
-        duplicated=False,
-    )
-    if already_aligned:
-        await replay_buffered_channel(
-            context,
-            ch_out,
-            ch_in,
-            ChunkStore(context),
-            output_metadata,
-            trace_ir=schema_ir,
-        )
-        return
-
-    await send_metadata(ch_out, context, output_metadata)
-    await adjust_ordering(
-        context,
-        comm,
-        schema_ir,
-        ir_context,
-        ch_out,
-        ch_in,
-        input_ordering,
-        output_ordering,
-        input_rows_ordered=input_rows_ordered,
-        collective_id=collective_id,
+    strategy: OrderedJoinStrategy,
+    left_partitioning: NormalizedPartitioning,
+    right_partitioning: NormalizedPartitioning,
+    left_metadata: ChannelMetadata,
+    right_metadata: ChannelMetadata,
+) -> bool:
+    """Return whether strict ordered inputs already share local partitions."""
+    return (
+        left_partitioning.local_scheme == "inherit"
+        and right_partitioning.local_scheme == "inherit"
+        and left_partitioning.is_aligned_with(right_partitioning, context.br())
+        and left_metadata.local_count
+        == _local_count_for_ordering(comm, strategy.left_input_ordering)
+        and right_metadata.local_count
+        == _local_count_for_ordering(comm, strategy.right_input_ordering)
     )
 
 
@@ -1117,17 +1133,10 @@ async def _ordered_join(
     ch_left: Channel[TableChunk],
     ch_right: Channel[TableChunk],
     strategy: OrderedJoinStrategy,
-    collective_ids: JoinCollectiveIds,
     *,
     tracer: ActorTracer | None,
 ) -> None:
-    """Align ordered inputs to common boundaries, then join partition-wise."""
-    left_boundaries_aligned = strategy.left_input_ordering.boundaries_aligned_with(
-        strategy.left_output_ordering, context.br()
-    )
-    right_boundaries_aligned = strategy.right_input_ordering.boundaries_aligned_with(
-        strategy.right_output_ordering, context.br()
-    )
+    """Join inputs that already share strict ordering boundaries."""
     metadata_out = ChannelMetadata(
         local_count=_local_count_for_ordering(comm, strategy.output_ordering),
         partitioning=Partitioning(
@@ -1137,73 +1146,174 @@ async def _ordered_join(
         duplicated=False,
     )
     await send_metadata(ch_out, context, metadata_out)
+    if tracer is not None:
+        tracer.decision = "ordered_aligned"
+    await _join_chunks(
+        context,
+        ir,
+        ir_context,
+        ch_out,
+        ch_left,
+        ch_right,
+        tracer=tracer,
+    )
 
-    left_metadata, right_metadata = await gather_in_task_group(
+
+async def _evaluate_incremental_join(
+    context: Context,
+    ir: Join,
+    ir_context: IRExecutionContext,
+    left_chunk: TableChunk,
+    right_chunk: TableChunk,
+) -> TableChunk:
+    """Join one left key range while preserving its row order."""
+    (left_chunk, right_chunk), _ = await make_table_chunks_available_or_wait(
+        context,
+        [left_chunk, right_chunk],
+        reserve_extra=0,
+        net_memory_delta=missing_net_memory_delta,
+    )
+    input_bytes = left_chunk.data_alloc_size() + right_chunk.data_alloc_size()
+    options = (*ir.options[:5], "left")
+    with opaque_memory_usage(
+        await reserve_memory(context, size=input_bytes, net_memory_delta=0)
+    ):
+        df = await ir_context.to_thread(
+            partial(
+                ir.do_evaluate,
+                ir.left_on,
+                ir.right_on,
+                options,
+                chunk_to_frame(left_chunk, ir.children[0]),
+                chunk_to_frame(right_chunk, ir.children[1]),
+                context=ir_context,
+            )
+        )
+    return TableChunk.from_pylibcudf_table(
+        df.table,
+        df.stream,
+        exclusive_view=True,
+        br=context.br(),
+    )
+
+
+async def _incremental_ordered_join(
+    context: Context,
+    ir: Join,
+    ir_context: IRExecutionContext,
+    ch_out: Channel[TableChunk],
+    ch_left: Channel[TableChunk],
+    ch_right: Channel[TableChunk],
+    strategy: IncrementalOrderedJoinStrategy,
+    *,
+    tracer: ActorTracer | None,
+) -> None:
+    """Incrementally join two globally row-ordered single-rank streams."""
+    left_metadata, _ = await gather_in_task_group(
         recv_metadata(ch_left, context),
         recv_metadata(ch_right, context),
     )
-    left_target_count = _local_count_for_ordering(comm, strategy.left_output_ordering)
-    right_target_count = _local_count_for_ordering(comm, strategy.right_output_ordering)
-    left_aligned = (
-        left_boundaries_aligned
-        and not left_metadata.duplicated
-        and left_metadata.local_count == left_target_count
+    metadata_out = ChannelMetadata(
+        local_count=left_metadata.local_count,
+        partitioning=Partitioning(
+            row_orderings=(
+                RowOrdering(strategy.output_order_keys, RowOrderingScope.GLOBAL),
+            )
+        ),
+        duplicated=False,
     )
-    right_aligned = (
-        right_boundaries_aligned
-        and not right_metadata.duplicated
-        and right_metadata.local_count == right_target_count
-    )
+    await send_metadata(ch_out, context, metadata_out)
     if tracer is not None:
-        tracer.decision = _ordered_join_decision(
-            left_aligned=left_aligned, right_aligned=right_aligned
-        )
-    ch_left_adjusted = context.create_channel()
-    ch_right_adjusted = context.create_channel()
-    async with shutdown_on_error(
-        context,
-        chs_aux=(ch_left_adjusted, ch_right_adjusted),
-        trace_ir=ir,
-        ir_context=ir_context,
-    ) as actor_scope:
-        ir_context = actor_scope.require_ir_context()
-        await gather_in_task_group(
-            _adjust_ordered_join_side(
+        tracer.decision = "ordered_incremental"
+
+    left_carry: TableChunk | None = None
+    right_pending: TableChunk | None = None
+    right_done = False
+    sequence_number = 0
+    left_msg = await ch_left.recv(context)
+    while left_msg is not None:
+        current = TableChunk.from_message(left_msg, br=context.br())
+        if left_carry is not None:
+            current = await concat_batch(
+                [left_carry, current],
                 context,
-                comm,
-                ir.children[0],
+                ir.children[0].schema,
                 ir_context,
-                ch_left_adjusted,
-                ch_left,
-                strategy.left_input_ordering,
-                strategy.left_output_ordering,
-                input_rows_ordered=strategy.left_input_rows_ordered,
-                collective_id=collective_ids.shuffle("left"),
-                already_aligned=left_aligned,
-            ),
-            _adjust_ordered_join_side(
+            )
+        next_left_msg = await ch_left.recv(context)
+        if next_left_msg is None:
+            complete = current
+            left_carry = None
+        else:
+            complete, left_carry = await split_trailing_run(
                 context,
-                comm,
-                ir.children[1],
-                ir_context,
-                ch_right_adjusted,
-                ch_right,
-                strategy.right_input_ordering,
-                strategy.right_output_ordering,
-                input_rows_ordered=strategy.right_input_rows_ordered,
-                collective_id=collective_ids.shuffle("right"),
-                already_aligned=right_aligned,
-            ),
-            _join_chunks(
+                current,
+                strategy.left_order_keys,
+            )
+
+        if complete.shape[0] == 0:
+            result = empty_table_chunk(ir, context, ir_context.get_cuda_stream())
+        else:
+            candidates: list[TableChunk] = []
+            while not right_done:
+                supply = right_pending
+                right_pending = None
+                if supply is None:
+                    right_msg = await ch_right.recv(context)
+                    if right_msg is None:
+                        right_done = True
+                        break
+                    supply = TableChunk.from_message(right_msg, br=context.br())
+                (
+                    selected,
+                    right_pending,
+                    complete,
+                    passed_demand,
+                ) = await select_demand_range(
+                    context,
+                    supply,
+                    complete,
+                    strategy.right_order_keys,
+                    strategy.left_order_keys,
+                )
+                if selected is not None:
+                    candidates.append(selected)
+                if passed_demand:
+                    break
+
+            if not candidates:
+                right_chunk = empty_table_chunk(
+                    ir.children[1], context, ir_context.get_cuda_stream()
+                )
+            elif len(candidates) == 1:
+                right_chunk = candidates[0]
+            else:
+                right_chunk = await concat_batch(
+                    candidates,
+                    context,
+                    ir.children[1].schema,
+                    ir_context,
+                )
+            result = await _evaluate_incremental_join(
                 context,
                 ir,
                 ir_context,
-                ch_out,
-                ch_left_adjusted,
-                ch_right_adjusted,
-                tracer=tracer,
-            ),
+                complete,
+                right_chunk,
+            )
+        await send_chunk(
+            context,
+            ch_out,
+            result,
+            sequence_number,
+            tracer=tracer,
         )
+        sequence_number += 1
+        left_msg = next_left_msg
+
+    while not right_done and await ch_right.recv(context) is not None:
+        pass
+    await ch_out.drain(context)
 
 
 def _make_shuffle_strategy(
@@ -1450,7 +1560,7 @@ def join_input_requires_redistribution(
     """Return whether the join strategy redistributes an input side."""
     if isinstance(strategy, BroadcastJoinStrategy):
         return side == strategy.side and not metadata.duplicated
-    if isinstance(strategy, OrderedJoinStrategy):
+    if isinstance(strategy, (OrderedJoinStrategy, IncrementalOrderedJoinStrategy)):
         # Ordered inputs already have a viable join strategy without adaptive
         # sampling. Keep that strategy and avoid introducing a sampled
         # prefilter pipeline solely to optimize boundary alignment.
@@ -1720,6 +1830,7 @@ async def choose_strategy(
     join_state: JoinPlanningState,
     executor: StreamingExecutor,
     collective_ids: JoinCollectiveIds,
+    requested_order_keys: tuple[OrderKey, ...],
     *,
     tracer: ActorTracer | None,
 ) -> JoinStrategy:
@@ -1744,18 +1855,6 @@ async def choose_strategy(
     chunkwise = hash_chunkwise and left_partitioning.is_aligned_with(
         right_partitioning, context.br()
     )
-    left_ordering = left_partitioning.get_ordering()
-    right_ordering = right_partitioning.get_ordering()
-    left_rows_ordered = left_ordering is not None and is_row_ordered_by(
-        left_metadata.partitioning,
-        left_ordering.keys,
-        scope=RowOrderingScope.RANK_LOCAL,
-    )
-    right_rows_ordered = right_ordering is not None and is_row_ordered_by(
-        right_metadata.partitioning,
-        right_ordering.keys,
-        scope=RowOrderingScope.RANK_LOCAL,
-    )
     if chunkwise:
         join_state.left.sample = TableSizeStats(
             local_sample=TableSample(ChunkStore(context)),
@@ -1773,11 +1872,18 @@ async def choose_strategy(
                 ir,
                 left_partitioning,
                 right_partitioning,
-                left_input_rows_ordered=left_rows_ordered,
-                right_input_rows_ordered=right_rows_ordered,
             )
         )
         is not None
+        and _ordered_join_is_aligned(
+            context,
+            comm,
+            ordered_strategy,
+            left_partitioning,
+            right_partitioning,
+            left_metadata,
+            right_metadata,
+        )
     ):
         if tracer is not None:
             tracer.decision = "ordered"
@@ -1800,6 +1906,39 @@ async def choose_strategy(
             collective_ids.size_estimate,
         )
         return ordered_strategy
+    elif (
+        nranks == 1
+        and not left_metadata.duplicated
+        and not right_metadata.duplicated
+        and (
+            incremental_strategy := _make_incremental_ordered_strategy(
+                ir,
+                left_metadata,
+                right_metadata,
+                requested_order_keys,
+            )
+        )
+        is not None
+    ):
+        join_state.left.sample = TableSizeStats(
+            local_sample=TableSample(ChunkStore(context)),
+            total_chunks=left_metadata.local_count,
+        )
+        join_state.right.sample = TableSizeStats(
+            local_sample=TableSample(ChunkStore(context)),
+            total_chunks=right_metadata.local_count,
+        )
+        await resolve_prefilters(
+            context,
+            comm,
+            join_state,
+            incremental_strategy,
+            left_partitioning,
+            right_partitioning,
+            executor,
+            collective_ids.size_estimate,
+        )
+        return incremental_strategy
     else:
         assert executor.dynamic_planning is not None
         await collect_samples(
@@ -1901,6 +2040,7 @@ async def join_actor(
     ch_prefilter_domains: tuple[Channel[TableChunk], ...],
     executor: StreamingExecutor,
     collective_ids: JoinCollectiveIds,
+    requested_order_keys: tuple[OrderKey, ...],
 ) -> None:
     """
     Dynamic Join actor that selects the best strategy at runtime.
@@ -1931,6 +2071,8 @@ async def join_actor(
         Streaming executor configuration.
     collective_ids
         List of collective IDs for shuffle/broadcast; consumed as needed.
+    requested_order_keys
+        Output ordering requested by a downstream consumer, if supported.
     """
     async with shutdown_on_error(
         context,
@@ -1970,6 +2112,7 @@ async def join_actor(
             join_state,
             executor,
             collective_ids,
+            requested_order_keys,
             tracer=tracer,
         )
         for candidate in join_state.candidates:
@@ -2055,7 +2198,19 @@ async def join_actor(
                         ch_left,
                         ch_right,
                         strategy,
-                        collective_ids,
+                        tracer=tracer,
+                    )
+                )
+            elif isinstance(strategy, IncrementalOrderedJoinStrategy):
+                actor_tasks.append(
+                    _incremental_ordered_join(
+                        context,
+                        ir,
+                        ir_context,
+                        ch_out,
+                        ch_left,
+                        ch_right,
+                        strategy,
                         tracer=tracer,
                     )
                 )
@@ -2199,6 +2354,10 @@ def _(
                 ),
                 executor,
                 collective_ids,
+                _requested_join_order_keys(
+                    ir,
+                    rec.state["partitioning_requests"].get(ir, ()),
+                ),
             )
         ]
         return actors, channels
