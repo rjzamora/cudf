@@ -39,14 +39,12 @@ from cudf_polars.dsl.traversal import traversal
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.streaming.actor_graph.collectives.ordering import (
     _metadata_has_ordering,
-    _with_extracted_ordering,
 )
 from cudf_polars.streaming.actor_graph.collectives.sort import _can_sort_chunkwise
 from cudf_polars.streaming.actor_graph.collectives.sort_utils import (
     sort_to_order_keys,
 )
 from cudf_polars.streaming.actor_graph.core import evaluate_logical_plan
-from cudf_polars.streaming.actor_graph.hconcat import build_hconcat_partitioning
 from cudf_polars.streaming.actor_graph.partitioning import (
     NormalizedPartitioning,
     is_globally_row_ordered_by,
@@ -778,35 +776,6 @@ def _make_order_scheme(
     )
 
 
-def test_extracted_ordering_preserves_inter_rank_only_metadata(spmd_engine) -> None:
-    existing = _make_order_scheme(spmd_engine.context, key_indices=(0,))
-    extracted = _make_order_scheme(spmd_engine.context, key_indices=(1,))
-    metadata = ChannelMetadata(
-        2,
-        partitioning=Partitioning(inter_rank=existing, local=None),
-    )
-
-    result = _with_extracted_ordering(
-        metadata,
-        Partitioning(inter_rank=extracted, local="inherit"),
-    )
-
-    assert result.partitioning is not None
-    assert isinstance(result.partitioning.inter_rank, OrderScheme)
-    assert [
-        ordering.column_indices for ordering in result.partitioning.inter_rank.orderings
-    ] == [
-        (0,),
-        (1,),
-    ]
-    assert isinstance(result.partitioning.local, OrderScheme)
-    assert [
-        ordering.column_indices for ordering in result.partitioning.local.orderings
-    ] == [
-        (1,),
-    ]
-
-
 @pytest.mark.parametrize(
     "range_keys,strict,expected",
     [
@@ -837,43 +806,6 @@ def test_rank_ranges_and_local_row_order_prove_global_order(
     )
 
     assert is_globally_row_ordered_by(partitioning, order_keys) is expected
-
-
-def test_hconcat_preserves_inter_rank_only_metadata(spmd_engine) -> None:
-    engine = pl.GPUEngine(executor="streaming", raise_on_fail=True)
-    query = pl.concat(
-        [pl.LazyFrame({"a": [1]}), pl.LazyFrame({"b": [2]})],
-        how="horizontal",
-    )
-    translated = Translator(query._ldf.visit(), engine).translate_ir()
-    ir = next(node for node in traversal([translated]) if isinstance(node, HConcat))
-    ir = HConcat(
-        ir.schema,
-        ir.should_broadcast,
-        ir.strict,
-        True,  # noqa: FBT003
-        *ir.children,
-    )
-    left = _make_order_scheme(spmd_engine.context, key_indices=(0,))
-    right = _make_order_scheme(spmd_engine.context, key_indices=(0,))
-
-    result = build_hconcat_partitioning(
-        ir,
-        (
-            ChannelMetadata(1, partitioning=Partitioning(left, local=None)),
-            ChannelMetadata(1, partitioning=Partitioning(right, local="inherit")),
-        ),
-        spmd_engine.context,
-    )
-
-    assert result is not None
-    assert isinstance(result.inter_rank, OrderScheme)
-    assert [ordering.column_indices for ordering in result.inter_rank.orderings] == [
-        (0,),
-        (1,),
-    ]
-    assert isinstance(result.local, OrderScheme)
-    assert [ordering.column_indices for ordering in result.local.orderings] == [(1,)]
 
 
 def test_remap_partitioning_drops_only_row_order(spmd_engine) -> None:

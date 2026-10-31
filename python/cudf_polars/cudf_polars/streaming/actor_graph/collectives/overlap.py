@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import operator
 import struct
-from contextlib import nullcontext
+from bisect import bisect_left
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
 from enum import IntEnum
-from functools import partial
 from itertools import accumulate, pairwise
 from typing import TYPE_CHECKING
 
@@ -27,26 +27,14 @@ from rapidsmpf.streaming.core.message import Message
 from cudf_polars.dsl.utils.naming import names_to_indices
 from cudf_polars.dsl.utils.windows import duration_to_scalar
 from cudf_polars.streaming.actor_graph.collectives.slice_exchange import (
-    ExchangePlan,
-    InputDemand,
-    SliceExchange,
-    SliceResolver,
-    intersection as _intersection,
-    merge_row_ranges as _merge_row_ranges,
-    replay_buffer as _replay_buffer,
-    row_range_slices as _row_range_pieces,
-    row_range_summary_slices as _row_range_summary_pieces,
-    tag_row_slice as _tag_row_piece,
+    SliceRoute,
+    SparseExchange,
 )
 from cudf_polars.streaming.actor_graph.utils import ChunkStore
 from cudf_polars.utils.cuda_stream import join_cuda_streams
 
 if TYPE_CHECKING:
-    from collections.abc import (
-        AsyncIterator,
-        Callable,
-        Sequence,
-    )
+    from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 
     from pylibcudf.utils import CudaStreamLike
     from rapidsmpf.communicator.communicator import Communicator
@@ -57,11 +45,10 @@ if TYPE_CHECKING:
     from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.dsl.ir import Rolling
-    from cudf_polars.streaming.actor_graph.collectives.slice_exchange import (
-        PreparedExchange,
-        RoutedSlice,
-        RowRange,
-    )
+
+
+type RowRange = tuple[int, int]
+type GhostSend = tuple[int, int, int]
 
 
 type _BoundSearch = Callable[
@@ -77,111 +64,6 @@ type _BoundSearch = Callable[
 ]
 
 
-def _chrono_storage_dtype(dtype: plc.DataType) -> plc.DataType:
-    """Return the integer storage type for a chrono dtype."""
-    if dtype.id() in (plc.TypeId.TIMESTAMP_DAYS, plc.TypeId.DURATION_DAYS):
-        return plc.DataType(plc.TypeId.INT32)
-    return plc.DataType(plc.TypeId.INT64)
-
-
-async def _column_insertion_point(
-    context: Context,
-    index_column: plc.Column,
-    needle: plc.Column,
-    find: _BoundSearch,
-    dtype: plc.DataType,
-    stream: Stream,
-) -> int:
-    """Find a needle's insertion point in one available index column."""
-    needs_cast = index_column.type() != dtype
-    memory_scope = nullcontext()
-    if needs_cast:
-        reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
-            index_column.size() * 8, net_memory_delta=0
-        )
-        memory_scope = opaque_memory_usage(reservation)
-    with memory_scope:
-        if needs_cast:
-            index_column = plc.unary.cast(index_column, dtype, stream=stream)
-        value = (
-            find(
-                plc.Table([index_column]),
-                plc.Table([needle]),
-                [plc.types.Order.ASCENDING],
-                [plc.types.NullOrder.AFTER],
-                stream,
-                context.br().device_mr,
-            )
-            .to_scalar(stream=stream)
-            .to_py(stream=stream)
-        )
-    assert isinstance(value, int)
-    return value
-
-
-async def _value_insertion_point(
-    context: Context,
-    index_column: plc.Column,
-    value: int,
-    find: _BoundSearch,
-    dtype: plc.DataType,
-    stream: Stream,
-) -> int:
-    """Find a host value's insertion point in an index column."""
-    scalar = plc.Scalar.from_py(
-        value,
-        _chrono_storage_dtype(dtype) if plc.traits.is_chrono(dtype) else dtype,
-        stream=stream,
-    )
-    needle = plc.Column.from_scalar(scalar, 1, stream=stream)
-    if plc.traits.is_chrono(dtype):
-        needle = plc.unary.bit_cast(
-            needle,
-            dtype,
-            stream=stream,
-            mr=context.br().device_mr,
-        )
-    return await _column_insertion_point(
-        context,
-        index_column,
-        needle,
-        find,
-        dtype,
-        stream,
-    )
-
-
-def _host_ordering_value(
-    value: plc.Column,
-    *,
-    stream: Stream,
-    br: BufferResource,
-) -> int:
-    """Copy a single-row ordering value to host."""
-    if plc.traits.is_chrono(value.type()):
-        value = plc.unary.bit_cast(
-            value,
-            _chrono_storage_dtype(value.type()),
-            stream=stream,
-            mr=br.device_mr,
-        )
-    result = value.to_scalar(stream=stream).to_py(stream=stream)
-    assert isinstance(result, int)
-    return result
-
-
-def _host_ordering_value_at(
-    column: plc.Column,
-    row: int,
-    *,
-    stream: Stream,
-    br: BufferResource,
-) -> int:
-    """Copy one ordering value from a device column to host."""
-    (value,) = plc.copying.slice(column, [row, row + 1], stream=stream)
-    return _host_ordering_value(value, stream=stream, br=br)
-
-
 class RangeValidation(IntEnum):
     """Validation status for one rank's range index."""
 
@@ -189,32 +71,6 @@ class RangeValidation(IntEnum):
     NULL = 1
     UNSORTED = 2
     OUT_OF_BOUNDS = 3
-
-
-@dataclass(frozen=True)
-class _RangeBounds:
-    """First and last values in an ordered range."""
-
-    first: int | None
-    last: int | None
-
-
-@dataclass(frozen=True)
-class _RangeSupply:
-    """Global row span and key bounds supplied by one chunk."""
-
-    rows: RowRange
-    keys: _RangeBounds
-
-
-@dataclass(frozen=True)
-class _RangeSliceSpec:
-    """Ordered column and endpoint semantics used for range slicing."""
-
-    index_position: int
-    index_dtype: plc.DataType
-    start_closed: bool
-    end_closed: bool
 
 
 @dataclass
@@ -257,6 +113,9 @@ class RangeValues:
     """First boundary required to evaluate the chunk's rows."""
     last_needed: int
     """Last boundary required to evaluate the chunk's rows."""
+
+
+type RangeRequest = tuple[int, RangeValues]
 
 
 @dataclass
@@ -435,6 +294,114 @@ class RangeOverlapPolicy(_OverlapPolicy[RangeBufferedChunk]):
         )
 
     @staticmethod
+    def _chrono_storage_dtype(dtype: plc.DataType) -> plc.DataType:
+        """Return the integer storage type for a chrono dtype."""
+        if dtype.id() in (plc.TypeId.TIMESTAMP_DAYS, plc.TypeId.DURATION_DAYS):
+            return plc.DataType(plc.TypeId.INT32)
+        return plc.DataType(plc.TypeId.INT64)
+
+    @classmethod
+    def _host_ordering_value(
+        cls,
+        value: plc.Column,
+        *,
+        stream: Stream,
+        br: BufferResource,
+    ) -> int:
+        """Copy a single-row ordering value to host."""
+        if plc.traits.is_chrono(value.type()):
+            value = plc.unary.bit_cast(
+                value,
+                cls._chrono_storage_dtype(value.type()),
+                stream=stream,
+                mr=br.device_mr,
+            )
+        result = value.to_scalar(stream=stream).to_py(stream=stream)
+        assert isinstance(result, int)
+        return result
+
+    @classmethod
+    def _host_ordering_value_at(
+        cls,
+        column: plc.Column,
+        row: int,
+        *,
+        stream: Stream,
+        br: BufferResource,
+    ) -> int:
+        """Copy one ordering value from a device column to host."""
+        (value,) = plc.copying.slice(column, [row, row + 1], stream=stream)
+        return cls._host_ordering_value(value, stream=stream, br=br)
+
+    @staticmethod
+    async def _insertion_point(
+        context: Context,
+        index_column: plc.Column,
+        needle: plc.Column,
+        find: _BoundSearch,
+        dtype: plc.DataType,
+        stream: Stream,
+    ) -> int:
+        """Find a needle's insertion point in one available index column."""
+        needs_cast = index_column.type() != dtype
+        memory_scope = nullcontext()
+        if needs_cast:
+            reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
+                index_column.size() * 8, net_memory_delta=0
+            )
+            memory_scope = opaque_memory_usage(reservation)
+        with memory_scope:
+            if needs_cast:
+                index_column = plc.unary.cast(index_column, dtype, stream=stream)
+            value = (
+                find(
+                    plc.Table([index_column]),
+                    plc.Table([needle]),
+                    [plc.types.Order.ASCENDING],
+                    [plc.types.NullOrder.AFTER],
+                    stream,
+                    context.br().device_mr,
+                )
+                .to_scalar(stream=stream)
+                .to_py(stream=stream)
+            )
+        assert isinstance(value, int)
+        return value
+
+    async def insertion_point(
+        self,
+        context: Context,
+        index_column: plc.Column,
+        value: int,
+        find: _BoundSearch,
+        stream: Stream,
+    ) -> int:
+        """Find a host value's insertion point in an index column."""
+        scalar = plc.Scalar.from_py(
+            value,
+            self._chrono_storage_dtype(self.index_dtype)
+            if plc.traits.is_chrono(self.index_dtype)
+            else self.index_dtype,
+            stream=stream,
+        )
+        needle = plc.Column.from_scalar(scalar, 1, stream=stream)
+        if plc.traits.is_chrono(self.index_dtype):
+            needle = plc.unary.bit_cast(
+                needle,
+                self.index_dtype,
+                stream=stream,
+                mr=context.br().device_mr,
+            )
+        return await self._insertion_point(
+            context,
+            index_column,
+            needle,
+            find,
+            self.index_dtype,
+            stream,
+        )
+
+    @staticmethod
     async def _insertion_row(
         chunks: Sequence[RangeBufferedChunk],
         needle: plc.Column,
@@ -460,7 +427,7 @@ class RangeOverlapPolicy(_OverlapPolicy[RangeBufferedChunk]):
                 continue
             stream = chunk.chunk.stream
             join_cuda_streams(downstreams=[stream], upstreams=[needle_stream])
-            insertion_point = await _column_insertion_point(
+            insertion_point = await RangeOverlapPolicy._insertion_point(
                 context,
                 chunk.overlap.index_column,
                 needle,
@@ -560,21 +527,21 @@ class RangeOverlapPolicy(_OverlapPolicy[RangeBufferedChunk]):
                     validate_index or index_column.null_count() == 0
                 ):
                     host_values = RangeValues(
-                        _host_ordering_value_at(
+                        self._host_ordering_value_at(
                             index_column, 0, stream=chunk.stream, br=context.br()
                         ),
-                        _host_ordering_value_at(
+                        self._host_ordering_value_at(
                             index_column,
                             nrows - 1,
                             stream=chunk.stream,
                             br=context.br(),
                         ),
-                        _host_ordering_value(
+                        self._host_ordering_value(
                             first_needed_boundary,
                             stream=chunk.stream,
                             br=context.br(),
                         ),
-                        _host_ordering_value(
+                        self._host_ordering_value(
                             last_needed_boundary,
                             stream=chunk.stream,
                             br=context.br(),
@@ -745,292 +712,35 @@ class RowCountOverlapPolicy(_OverlapPolicy[BufferedChunk]):
 type OverlapPolicy[BufferedChunkT: BufferedChunk] = _OverlapPolicy[BufferedChunkT]
 
 
-def _count_demands(
-    spans: Sequence[RowRange],
-    preceding: int,
-    following: int,
-) -> tuple[InputDemand[RowRange, RowRange] | None, ...]:
-    """Return the row-count overlap needed by each rank."""
-    total = spans[-1][1] if spans else 0
-    return tuple(
-        InputDemand(
-            owned=(start, stop),
-            needed=(max(0, start - preceding), min(total, stop + following)),
-        )
-        if start != stop
-        else None
-        for start, stop in spans
-    )
+@dataclass(frozen=True)
+class _CountSummary:
+    """Number of rows owned by one rank."""
+
+    rows: int
 
 
-def _plan_count_overlap(
-    rank: int,
-    supplies: Sequence[RowRange],
-    demands: Sequence[InputDemand[RowRange, RowRange] | None],
-) -> ExchangePlan[RowRange, RowRange]:
-    """Plan row-count overlap from independent supplies and demands."""
-    routes = tuple(
-        tuple(
-            destination
-            for destination, demand in enumerate(demands)
-            if demand is not None
-            and (
-                _intersection(supply, demand.needed) is not None
-                or (
-                    demand.owned is not None
-                    and _intersection(supply, demand.owned) is not None
-                )
-            )
-        )
-        for supply in supplies
-    )
-    requests = tuple(
-        (destination, demand)
-        for destination in routes[rank]
-        if (demand := demands[destination]) is not None
-    )
-    return ExchangePlan.from_routes(rank, routes, requests)
+@dataclass(frozen=True)
+class _RangeSummary:
+    """Validation and host range values for one rank's input."""
+
+    rows: int
+    validation: RangeValidation
+    # Host range values may be absent for empty or invalid input.
+    range_values: RangeValues | None
 
 
-def _ranges_may_overlap(supply: _RangeBounds, demand: _RangeBounds) -> bool:
-    """Return whether two ranges may overlap."""
-    return not (
-        (
-            supply.last is not None
-            and demand.first is not None
-            and supply.last < demand.first
-        )
-        or (
-            supply.first is not None
-            and demand.last is not None
-            and supply.first > demand.last
-        )
-    )
+@dataclass(frozen=True)
+class _PreparedInput:
+    """Buffered local input and ghost exchange state for one rank."""
 
-
-def _plan_range_overlap(
-    rank: int,
-    supplies: Sequence[_RangeSupply | None],
-    demands: Sequence[InputDemand[RowRange, _RangeBounds] | None],
-) -> ExchangePlan[RowRange, _RangeBounds]:
-    """Plan key-range overlap from independent supplies and demands."""
-    routes = tuple(
-        tuple(
-            (destination, demand)
-            for destination, demand in enumerate(demands)
-            if demand is not None
-            and supply is not None
-            and (
-                _ranges_may_overlap(supply.keys, demand.needed)
-                or (
-                    demand.owned is not None
-                    and _intersection(supply.rows, demand.owned) is not None
-                )
-            )
-        )
-        for supply in supplies
-    )
-    requests = tuple((destination, demand) for destination, demand in routes[rank])
-    destinations = tuple(
-        tuple(destination for destination, _ in source_routes)
-        for source_routes in routes
-    )
-    return ExchangePlan.from_routes(rank, destinations, requests)
-
-
-async def _allgather_ints(
-    context: Context,
-    comm: Communicator,
-    collective_id: int,
-    payload: tuple[int, ...],
-) -> tuple[tuple[int, ...], ...]:
-    """All-gather fixed-width signed integer metadata in rank order."""
-    fmt = f"<{len(payload)}q"
-    gather = AllGather(context, comm, collective_id)
-    try:
-        gather.insert(
-            0,
-            PackedData.from_host_bytes(struct.pack(fmt, *payload), context.br()),
-        )
-    finally:
-        gather.insert_finished()
-    return tuple(
-        struct.unpack(fmt, item.to_host_bytes())
-        for item in await gather.extract_all(context, ordered=True)
-    )
-
-
-async def _gather_counts(
-    context: Context,
-    comm: Communicator,
-    collective_id: int,
-    rows: int,
-) -> tuple[int, ...]:
-    """Gather the row count owned by every rank."""
-    return tuple(
-        item[0]
-        for item in await _allgather_ints(
-            context,
-            comm,
-            collective_id,
-            (rows,),
-        )
-    )
-
-
-async def _gather_ranges(
-    context: Context,
-    comm: Communicator,
-    collective_id: int,
-    rows: int,
-    supply: _RangeBounds | None,
-    demand: _RangeBounds | None,
-    validation: RangeValidation,
-) -> tuple[
-    tuple[int, ...],
-    tuple[_RangeBounds | None, ...],
-    tuple[_RangeBounds | None, ...],
-    tuple[RangeValidation, ...],
-]:
-    """Gather row counts, range bounds, and validation from every rank."""
-    supply_values = (supply.first, supply.last) if supply is not None else (0, 0)
-    demand_values = (demand.first, demand.last) if demand is not None else (0, 0)
-    values = (*supply_values, *demand_values)
-    if any(value is None or not -(2**63) <= value < 2**63 for value in values):
-        validation = RangeValidation.OUT_OF_BOUNDS
-    packed_values = tuple(
-        value if isinstance(value, int) and -(2**63) <= value < 2**63 else 0
-        for value in values
-    )
-    packed = await _allgather_ints(
-        context,
-        comm,
-        collective_id,
-        (
-            rows,
-            int(validation),
-            int(supply is not None),
-            *packed_values[:2],
-            int(demand is not None),
-            *packed_values[2:],
-        ),
-    )
-    return (
-        tuple(item[0] for item in packed),
-        tuple(_RangeBounds(item[3], item[4]) if item[2] else None for item in packed),
-        tuple(_RangeBounds(item[6], item[7]) if item[5] else None for item in packed),
-        tuple(RangeValidation(item[1]) for item in packed),
-    )
-
-
-def _range_summary_pieces(
-    spec: _RangeSliceSpec,
-    size: int,
-    supply: _RangeSupply | None,
-    requests: Sequence[tuple[int, InputDemand[RowRange, _RangeBounds]]],
-) -> list[RoutedSlice] | None:
-    """Resolve requests that cover or exclude a complete ordered chunk."""
-    if size == 0:
-        return []
-    if supply is None:
-        return None
-    supply_first, supply_last = supply.keys.first, supply.keys.last
-    if supply_first is None or supply_last is None:
-        return None
-    result: list[RoutedSlice] = []
-    for destination, demand in requests:
-        first, last = demand.needed.first, demand.needed.last
-        lower_full = (
-            first is None
-            or first < supply_first
-            or (first == supply_first and spec.start_closed)
-        )
-        upper_full = (
-            last is None
-            or last > supply_last
-            or (last == supply_last and spec.end_closed)
-        )
-        below = last is not None and (
-            last < supply_first or (last == supply_first and not spec.end_closed)
-        )
-        above = first is not None and (
-            first > supply_last or (first == supply_last and not spec.start_closed)
-        )
-        if lower_full and upper_full:
-            needed: RowRange | None = supply.rows
-        elif below or above:
-            needed = None
-        else:
-            return None
-        owned = (
-            _intersection(supply.rows, demand.owned)
-            if demand.owned is not None
-            else None
-        )
-        for piece in _merge_row_ranges(needed, owned):
-            result.extend(_tag_row_piece(destination, supply.rows, piece, demand.owned))
-    return result
-
-
-async def _range_pieces(
-    context: Context,
-    spec: _RangeSliceSpec,
-    chunk: TableChunk,
-    supply: _RangeSupply | None,
-    requests: Sequence[tuple[int, InputDemand[RowRange, _RangeBounds]]],
-) -> list[RoutedSlice]:
-    """Resolve range requests to exact half-open slices within one chunk."""
-    size = chunk.shape[0]
-    if size == 0:
-        return []
-    if supply is None:
-        raise ValueError("Nonempty range input requires a supply summary")
-    supply_first, supply_last = supply.keys.first, supply.keys.last
-    if supply_first is None or supply_last is None:
-        raise ValueError("Nonempty range input requires finite key bounds")
-    index = chunk.table_view().columns()[spec.index_position]
-    result: list[RoutedSlice] = []
-    for destination, demand in requests:
-        first, last = demand.needed.first, demand.needed.last
-        begin = (
-            0
-            if first is None
-            or first < supply_first
-            or (first == supply_first and spec.start_closed)
-            else await _value_insertion_point(
-                context,
-                index,
-                first,
-                plc.search.lower_bound if spec.start_closed else plc.search.upper_bound,
-                spec.index_dtype,
-                chunk.stream,
-            )
-        )
-        stop = (
-            size
-            if last is None
-            or last > supply_last
-            or (last == supply_last and spec.end_closed)
-            else await _value_insertion_point(
-                context,
-                index,
-                last,
-                plc.search.upper_bound if spec.end_closed else plc.search.lower_bound,
-                spec.index_dtype,
-                chunk.stream,
-            )
-        )
-        needed = (
-            (supply.rows[0] + begin, supply.rows[0] + stop) if begin < stop else None
-        )
-        owned = (
-            _intersection(supply.rows, demand.owned)
-            if demand.owned is not None
-            else None
-        )
-        for piece in _merge_row_ranges(needed, owned):
-            result.extend(_tag_row_piece(destination, supply.rows, piece, demand.owned))
-    return result
+    owned_buffer: ChunkStore
+    """Spillable messages containing locally owned chunks."""
+    ghost_exchange: SparseExchange | None
+    """Exchange used to send or receive ghost chunks."""
+    ghost_sources: tuple[int, ...]
+    """Candidate source ranks for ghost chunks in input order."""
+    owned_host_values: tuple[RangeValues | None, ...]
+    """Cached host range values for locally owned chunks."""
 
 
 class OverlapInput[BufferedChunkT: BufferedChunk]:
@@ -1066,7 +776,7 @@ class OverlapInput[BufferedChunkT: BufferedChunk]:
         self.policy = policy
         self.multirank = comm.nranks != 1 and not duplicated
         self.collective_id = collective_id
-        self._prepared: PreparedExchange | None = None
+        self._prepared: _PreparedInput | None = None
 
     async def __aenter__(self) -> OverlapInput[BufferedChunkT]:
         """Prepare non-duplicated multi-rank input and wait for all ranks."""
@@ -1074,15 +784,58 @@ class OverlapInput[BufferedChunkT: BufferedChunk]:
             self._prepared = await self._prepare()
         return self
 
-    async def __aexit__(self, *exc_info: object) -> None:
+    async def __aexit__(self, exc_type: object, *_exc_info: object) -> None:
         """Release messages still owned by this input."""
         prepared, self._prepared = self._prepared, None
         if prepared is not None:
-            prepared.clear()
+            if exc_type is not None:
+                with suppress(BaseException):
+                    prepared.owned_buffer.clear()
+                if prepared.ghost_exchange is not None:
+                    with suppress(BaseException):
+                        await prepared.ghost_exchange.aclose()
+                return
+            try:
+                prepared.owned_buffer.clear()
+            finally:
+                if prepared.ghost_exchange is not None:
+                    await prepared.ghost_exchange.aclose()
 
     def __aiter__(self) -> AsyncIterator[StagedChunk[BufferedChunkT]]:
         """Yield prepared chunks in row order."""
         return self._chunks()
+
+    async def _raw_owned_chunks(
+        self,
+    ) -> AsyncIterator[tuple[TableChunk, RangeValues | None]]:
+        """Yield locally owned chunks and any cached host range values."""
+        if not self.multirank:
+            while (msg := await self.ch_in.recv(self.context)) is not None:
+                yield TableChunk.from_message(msg, br=self.context.br()), None
+        else:
+            assert self._prepared is not None
+            for position, msg in enumerate(self._prepared.owned_buffer):
+                yield (
+                    TableChunk.from_message(msg, br=self.context.br()),
+                    self._prepared.owned_host_values[position]
+                    if self._prepared.owned_host_values
+                    else None,
+                )
+
+    async def _raw_ghost_chunks(
+        self, sources: Iterable[int]
+    ) -> AsyncIterator[tuple[TableChunk, None]]:
+        """Yield exchanged chunks from each source rank in row order."""
+        prepared = self._prepared
+        for source in sources:
+            assert prepared is not None
+            assert prepared.ghost_exchange is not None
+            chunks = prepared.ghost_exchange.extract(source)
+            try:
+                for message in chunks:
+                    yield TableChunk.from_message(message, br=self.context.br()), None
+            finally:
+                chunks.clear()
 
     async def _chunks(self) -> AsyncIterator[StagedChunk[BufferedChunkT]]:
         """Prepare chunks in one row coordinate system for this rank."""
@@ -1090,174 +843,89 @@ class OverlapInput[BufferedChunkT: BufferedChunk]:
             raise RuntimeError(
                 "Multi-rank overlap input must be used as an async context manager"
             )
-        if self._prepared is None:
-
-            async def direct_input() -> AsyncIterator[tuple[Message[TableChunk], bool]]:
-                while (msg := await self.ch_in.recv(self.context)) is not None:
-                    yield msg, True
-
-            messages = direct_input()
-        else:
-            messages = self._prepared.iter_tagged_source_order(
-                self.context,
-                self.comm.rank,
-            )
-
         row_offset = 0
-        async for message, owned in messages:
-            raw_chunk = TableChunk.from_message(message, br=self.context.br())
-            chunk = await self.policy.prepare_chunk(
-                self.context,
-                raw_chunk,
-                row_offset=row_offset,
-            )
-            self.policy.observe(chunk)
-            row_offset = chunk.row_stop
-            yield StagedChunk(chunk, owned=owned)
+        sources = self._prepared.ghost_sources if self._prepared else ()
+        split = bisect_left(sources, self.comm.rank)
+        inputs = (
+            (False, self._raw_ghost_chunks(sources[:split])),
+            (True, self._raw_owned_chunks()),
+            (False, self._raw_ghost_chunks(sources[split:])),
+        )
+        for owned, values in inputs:
+            async for raw_chunk, host_values in values:
+                chunk = await self.policy.prepare_chunk(
+                    self.context,
+                    raw_chunk,
+                    row_offset=row_offset,
+                    host_values=host_values,
+                )
+                self.policy.observe(chunk)
+                row_offset = chunk.row_stop
+                yield StagedChunk(chunk, owned=owned)
 
-    async def _prepare(self) -> PreparedExchange:
+    async def _prepare(self) -> _PreparedInput:
         """Buffer local input, agree on a plan, and exchange ghost chunks."""
         policy = self.policy
         if not isinstance(policy, (RangeOverlapPolicy, RowCountOverlapPolicy)):
             raise TypeError(f"Unsupported overlap policy: {type(policy).__name__}")
         buffer = ChunkStore(self.context)
-        collective = SliceExchange(
-            self.context,
-            self.comm,
-            self.collective_id,
-        )
         try:
             if isinstance(policy, RangeOverlapPolicy):
-                (
-                    local_rows,
-                    local_spans,
-                    supply,
-                    demand,
-                    validation,
-                    host_values,
-                ) = await self._buffer_range_input(buffer, policy)
-                counts, supplies, needed, validations = await _gather_ranges(
-                    self.context,
-                    self.comm,
-                    self.collective_id,
-                    local_rows,
-                    supply,
-                    demand,
-                    validation,
-                )
-                self._validate_ranges(policy, supplies, validations)
-                starts = tuple(accumulate(counts, initial=0))
-                spans = tuple(pairwise(starts))
-                demands = tuple(
-                    InputDemand(
-                        owned=span if span[0] != span[1] else None,
-                        needed=rank_needed,
-                    )
-                    if rank_needed is not None
-                    else None
-                    for span, rank_needed in zip(spans, needed, strict=True)
-                )
-                rank_supplies = tuple(
-                    _RangeSupply(span, keys) if keys is not None else None
-                    for span, keys in zip(spans, supplies, strict=True)
-                )
-                range_plan = _plan_range_overlap(
-                    self.comm.rank,
-                    rank_supplies,
-                    demands,
-                )
-                slice_spec = _RangeSliceSpec(
-                    policy.index_position,
-                    policy.index_dtype,
-                    policy.start_closed,
-                    policy.end_closed,
+                summary, host_values = await self._buffer_range_input(buffer, policy)
+                gathered = await self._gather_ranges(summary)
+                self._validate_ranges(policy, gathered)
+                sends, sources, destinations = self._range_plan(summary, gathered)
+                row_offset = sum(item.rows for item in gathered[: self.comm.rank])
+                return await self._exchange(
+                    buffer,
+                    policy,
+                    sends,
+                    sources,
+                    destinations,
+                    row_offset,
+                    host_values=host_values,
+                    summaries=gathered,
                 )
 
-                rank_start = starts[self.comm.rank]
-                chunk_supplies = tuple(
-                    _RangeSupply(
-                        (rank_start + span[0], rank_start + span[1]),
-                        _RangeBounds(value.first_owned, value.last_owned),
-                    )
-                    if value is not None
-                    else None
-                    for span, value in zip(local_spans, host_values, strict=True)
-                )
-                return await collective.exchange(
-                    _replay_buffer(buffer, chunk_supplies),
-                    range_plan,
-                    resolver=SliceResolver(
-                        resolve_chunk=partial(
-                            _range_pieces,
-                            self.context,
-                            slice_spec,
-                        ),
-                        resolve_summary=partial(_range_summary_pieces, slice_spec),
-                    ),
-                )
-
-            local_rows, local_spans = await self._buffer_count_input(buffer)
-            counts = await _gather_counts(
-                self.context,
-                self.comm,
-                self.collective_id,
-                local_rows,
+            count_summary = await self._buffer_count_input(buffer)
+            count_summaries = await self._gather_counts(count_summary)
+            starts = tuple(
+                accumulate((item.rows for item in count_summaries), initial=0)
             )
-            starts = tuple(accumulate(counts, initial=0))
-            spans = tuple(pairwise(starts))
-            rank_start = starts[self.comm.rank]
-            chunk_spans = tuple(
-                (rank_start + start, rank_start + stop) for start, stop in local_spans
+            sends, sources, destinations = self._count_plan(
+                policy, tuple(pairwise(starts))
             )
-            count_plan = _plan_count_overlap(
-                self.comm.rank,
-                spans,
-                _count_demands(spans, policy.preceding, policy.following),
-            )
-            return await collective.exchange(
-                _replay_buffer(buffer, chunk_spans),
-                count_plan,
-                resolver=SliceResolver(
-                    resolve_chunk=_row_range_pieces,
-                    resolve_summary=_row_range_summary_pieces,
-                ),
+            return await self._exchange(
+                buffer,
+                policy,
+                sends,
+                sources,
+                destinations,
+                starts[self.comm.rank],
             )
         except BaseException:
             buffer.clear()
             raise
 
-    async def _buffer_count_input(
-        self, buffer: ChunkStore
-    ) -> tuple[int, tuple[RowRange, ...]]:
-        """Buffer local chunks and return their count and rank-local spans."""
+    async def _buffer_count_input(self, buffer: ChunkStore) -> _CountSummary:
+        """Buffer local chunks and return their total row count."""
         rows = 0
-        spans = []
         while (msg := await self.ch_in.recv(self.context)) is not None:
             chunk = TableChunk.from_message(msg, br=self.context.br())
-            start = rows
             rows += chunk.shape[0]
-            spans.append((start, rows))
             buffer.insert(Message(0, chunk))
-        return rows, tuple(spans)
+        return _CountSummary(rows)
 
     async def _buffer_range_input(
         self,
         buffer: ChunkStore,
         policy: RangeOverlapPolicy,
-    ) -> tuple[
-        int,
-        tuple[RowRange, ...],
-        _RangeBounds | None,
-        _RangeBounds | None,
-        RangeValidation,
-        tuple[RangeValues | None, ...],
-    ]:
+    ) -> tuple[_RangeSummary, tuple[RangeValues | None, ...]]:
         """Buffer local chunks and collect host range values."""
         row_offset = 0
         validation = RangeValidation.VALID
         summary_values = None
         host_values: list[RangeValues | None] = []
-        spans = []
         while (msg := await self.ch_in.recv(self.context)) is not None:
             table_chunk = TableChunk.from_message(msg, br=self.context.br())
             nrows, _ = table_chunk.shape
@@ -1287,38 +955,90 @@ class OverlapInput[BufferedChunkT: BufferedChunk]:
                     assert values is not None
                     summary_values = RangeValues(
                         summary_values.first_owned
-                        if summary_values is not None
+                        if summary_values
                         else values.first_owned,
                         values.last_owned,
                         summary_values.first_needed
-                        if summary_values is not None
+                        if summary_values
                         else values.first_needed,
                         values.last_needed,
                     )
             host_values.append(values)
             buffer.insert(Message(0, table_chunk))
-            spans.append((row_offset, row_offset + nrows))
             row_offset += nrows
-        return (
-            row_offset,
-            tuple(spans),
-            _RangeBounds(summary_values.first_owned, summary_values.last_owned)
-            if summary_values is not None
-            else None,
-            _RangeBounds(summary_values.first_needed, summary_values.last_needed)
-            if summary_values is not None
-            else None,
-            validation,
-            tuple(host_values),
+        return _RangeSummary(row_offset, validation, summary_values), tuple(host_values)
+
+    async def _allgather_ints(
+        self, payload: tuple[int, ...]
+    ) -> tuple[tuple[int, ...], ...]:
+        """All-gather fixed-width signed integer metadata in rank order."""
+        fmt = f"<{len(payload)}q"
+        gather = AllGather(self.context, self.comm, self.collective_id)
+        try:
+            gather.insert(
+                0,
+                PackedData.from_host_bytes(
+                    struct.pack(fmt, *payload), self.context.br()
+                ),
+            )
+        finally:
+            gather.insert_finished()
+        return tuple(
+            struct.unpack(fmt, item.to_host_bytes())
+            for item in await gather.extract_all(self.context, ordered=True)
+        )
+
+    async def _gather_counts(self, summary: _CountSummary) -> tuple[_CountSummary, ...]:
+        """Gather the row count owned by every rank."""
+        return tuple(
+            _CountSummary(item[0])
+            for item in await self._allgather_ints((summary.rows,))
+        )
+
+    async def _gather_ranges(self, summary: _RangeSummary) -> tuple[_RangeSummary, ...]:
+        """Gather range summaries after checking signed 64-bit bounds."""
+        values = summary.range_values
+        validation = summary.validation
+        if values is not None and any(
+            not -(2**63) <= value < 2**63
+            for value in (
+                values.first_owned,
+                values.last_owned,
+                values.first_needed,
+                values.last_needed,
+            )
+        ):
+            validation = RangeValidation.OUT_OF_BOUNDS
+        packed_values = (
+            (
+                values.first_owned,
+                values.last_owned,
+                values.first_needed,
+                values.last_needed,
+            )
+            if values is not None and validation is RangeValidation.VALID
+            else (0, 0, 0, 0)
+        )
+        return tuple(
+            _RangeSummary(
+                item[0],
+                RangeValidation(item[1]),
+                RangeValues(*item[2:])
+                if item[0] and item[1] == RangeValidation.VALID
+                else None,
+            )
+            for item in await self._allgather_ints(
+                (summary.rows, int(validation), *packed_values)
+            )
         )
 
     @staticmethod
     def _validate_ranges(
         policy: RangeOverlapPolicy,
-        supplies: Sequence[_RangeBounds | None],
-        validations: Sequence[RangeValidation],
+        summaries: Sequence[_RangeSummary],
     ) -> None:
         """Raise the same range-validation error on every rank."""
+        validations = {item.validation for item in summaries}
         if RangeValidation.OUT_OF_BOUNDS in validations:
             raise NotImplementedError(
                 "Multi-rank rolling does not support index values outside the "
@@ -1327,20 +1047,247 @@ class OverlapInput[BufferedChunkT: BufferedChunk]:
         if RangeValidation.NULL in validations:
             policy.raise_validation(RangeValidation.NULL)
         previous = None
-        for supply, validation in zip(supplies, validations, strict=True):
-            if validation is RangeValidation.UNSORTED:
+        for item in summaries:
+            if item.validation is RangeValidation.UNSORTED:
                 break
-            if supply is None:
+            if not item.rows:
                 continue
-            values = supply
+            values = item.range_values
             if (
-                values.first is None
-                or values.last is None
-                or values.first > values.last
-                or (previous is not None and values.first < previous)
+                values is None
+                or values.first_owned > values.last_owned
+                or (previous is not None and values.first_owned < previous)
             ):
                 break
-            previous = values.last
+            previous = values.last_owned
         else:
             return
         policy.raise_validation(RangeValidation.UNSORTED)
+
+    @staticmethod
+    def _intersection(left: RowRange, right: RowRange) -> RowRange | None:
+        """Return the intersection of two half-open global row spans."""
+        start, stop = max(left[0], right[0]), min(left[1], right[1])
+        return (start, stop) if start < stop else None
+
+    def _count_plan(
+        self,
+        policy: RowCountOverlapPolicy,
+        spans: Sequence[RowRange],
+    ) -> tuple[list[GhostSend], tuple[int, ...], tuple[int, ...]]:
+        """
+        Plan count-based ghost slices in global row coordinates.
+
+        ``spans`` contains the half-open row span owned by each rank. Sends are
+        ``(destination, start, stop)`` tuples in the same coordinate system.
+        """
+        total = spans[-1][1] if spans else 0
+        requests = tuple(
+            tuple(
+                span
+                for span in (
+                    (max(0, start - policy.preceding), start),
+                    (stop, min(total, stop + policy.following)),
+                )
+                if start != stop and span[0] < span[1]
+            )
+            for start, stop in spans
+        )
+        rank = self.comm.rank
+        sends: list[GhostSend] = []
+        sources: list[int] = []
+        destinations: set[int] = set()
+        for other, span in enumerate(spans):
+            if other == rank:
+                continue
+            if any(self._intersection(span, request) for request in requests[rank]):
+                sources.append(other)
+            for request in requests[other]:
+                if (piece := self._intersection(spans[rank], request)) is not None:
+                    sends.append((other, *piece))
+                    destinations.add(other)
+        return sends, tuple(sources), tuple(destinations)
+
+    def _range_plan(
+        self,
+        local: _RangeSummary,
+        summaries: Sequence[_RangeSummary],
+    ) -> tuple[list[GhostSend], tuple[int, ...], tuple[int, ...]]:
+        """
+        Select source and destination ranks for range overlap.
+
+        This rank-level plan is conservative. ``_range_pieces`` later applies
+        the policy's open or closed endpoints to find exact chunk slices.
+        """
+        rank = self.comm.rank
+        local_values = local.range_values
+        sources = tuple(
+            source
+            for source, item in enumerate(summaries)
+            if source != rank
+            and local_values is not None
+            and item.range_values is not None
+            and item.range_values.last_owned >= local_values.first_needed
+            and item.range_values.first_owned <= local_values.last_needed
+        )
+        destinations = tuple(
+            destination
+            for destination, item in enumerate(summaries)
+            if destination != rank
+            and local_values is not None
+            and item.range_values is not None
+            and local_values.last_owned >= item.range_values.first_needed
+            and local_values.first_owned <= item.range_values.last_needed
+        )
+        return [], sources, destinations
+
+    async def _exchange(
+        self,
+        buffer: ChunkStore,
+        policy: RangeOverlapPolicy | RowCountOverlapPolicy,
+        sends: Sequence[GhostSend],
+        sources: Sequence[int],
+        destinations: Sequence[int],
+        global_row_offset: int,
+        *,
+        host_values: tuple[RangeValues | None, ...] = (),
+        summaries: Sequence[_RangeSummary] = (),
+    ) -> _PreparedInput:
+        """
+        Exchange ghost slices and return buffered owned input.
+
+        Count-based sends use half-open global row coordinates. Range-based
+        sends are resolved from rank summaries to chunk-local slices before
+        insertion into the sparse all-to-all.
+        """
+        sources = tuple(sorted(sources))
+        destinations = tuple(sorted(set(destinations)))
+        if not (sources or destinations):
+            return _PreparedInput(buffer, None, sources, host_values)
+        exchange = SparseExchange(
+            self.context,
+            self.comm,
+            self.collective_id,
+            sources=sources,
+            destinations=destinations,
+        )
+        source, output = buffer, ChunkStore(self.context)
+        start = 0
+        try:
+            for position, msg in enumerate(source):
+                chunk = TableChunk.from_message(msg, br=self.context.br())
+                size = chunk.shape[0]
+                pieces: list[tuple[int, int, int]] = []
+                range_values = None
+                if isinstance(policy, RangeOverlapPolicy) and size:
+                    range_values = host_values[position]
+                    assert range_values is not None
+                    range_requests = tuple(
+                        (destination, destination_values)
+                        for destination in destinations
+                        if (destination_values := summaries[destination].range_values)
+                        is not None
+                        and range_values.last_owned >= destination_values.first_needed
+                        and range_values.first_owned <= destination_values.last_needed
+                    )
+                else:
+                    span = (
+                        start + global_row_offset,
+                        start + global_row_offset + size,
+                    )
+                    pieces = [
+                        (destination, piece[0] - span[0], piece[1] - span[0])
+                        for destination, request_start, request_stop in sends
+                        if (
+                            piece := self._intersection(
+                                span, (request_start, request_stop)
+                            )
+                        )
+                        is not None
+                    ]
+                    range_requests = ()
+                if not range_requests and not pieces:
+                    output.insert(Message(0, chunk))
+                    start += size
+                    continue
+                available, extra = await make_table_chunks_available_or_wait(
+                    self.context,
+                    chunk,
+                    reserve_extra=0,
+                    net_memory_delta=0,
+                )
+                with opaque_memory_usage(extra):
+                    if (
+                        isinstance(policy, RangeOverlapPolicy)
+                        and range_values is not None
+                    ):
+                        pieces = await self._range_pieces(
+                            policy,
+                            available,
+                            size,
+                            range_values,
+                            range_requests,
+                        )
+                    await exchange.insert_slices(
+                        available,
+                        tuple(SliceRoute(*piece) for piece in pieces),
+                    )
+                    output.insert(Message(0, available))
+                start += size
+            source.clear()
+            await exchange.finish()
+        except BaseException:
+            output.clear()
+            with suppress(BaseException):
+                source.clear()
+            with suppress(BaseException):
+                await exchange.aclose()
+            raise
+        return _PreparedInput(output, exchange, sources, host_values)
+
+    async def _range_pieces(
+        self,
+        policy: RangeOverlapPolicy,
+        chunk: TableChunk,
+        size: int,
+        chunk_values: RangeValues,
+        requests: Sequence[RangeRequest],
+    ) -> list[tuple[int, int, int]]:
+        """
+        Resolve range requests to half-open row slices within one chunk.
+
+        Each result is ``(destination, start, stop)``. Search selection follows
+        the policy's open or closed window endpoints.
+        """
+        pieces = []
+        index = chunk.table_view().columns()[policy.index_position]
+        for destination, requested_values in requests:
+            first_needed = requested_values.first_needed
+            last_needed = requested_values.last_needed
+            begin = (
+                0
+                if first_needed < chunk_values.first_owned
+                or (policy.start_closed and first_needed == chunk_values.first_owned)
+                else await policy.insertion_point(
+                    self.context,
+                    index,
+                    first_needed,
+                    policy.find_start,
+                    chunk.stream,
+                )
+            )
+            end = (
+                size
+                if last_needed > chunk_values.last_owned
+                or (policy.end_closed and last_needed == chunk_values.last_owned)
+                else await policy.insertion_point(
+                    self.context,
+                    index,
+                    last_needed,
+                    policy.find_end,
+                    chunk.stream,
+                )
+            )
+            if begin < end:
+                pieces.append((destination, begin, end))
+        return pieces

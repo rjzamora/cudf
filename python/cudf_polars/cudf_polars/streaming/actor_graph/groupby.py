@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pylibcudf as plc
 from cudf_streaming.channel_metadata import (
@@ -17,9 +17,14 @@ from cudf_streaming.channel_metadata import (
     RowOrdering,
     RowOrderingScope,
 )
-from cudf_streaming.table_chunk import TableChunk
+from cudf_streaming.table_chunk import (
+    TableChunk,
+    make_table_chunks_available_or_wait,
+)
 from rapidsmpf.communicator.single import new_communicator as single_comm
 from rapidsmpf.config import Options, get_environment_variables
+from rapidsmpf.memory.buffer import MemoryType
+from rapidsmpf.memory.memory_reservation import opaque_memory_usage
 from rapidsmpf.streaming.core.actor import define_actor
 from rapidsmpf.streaming.core.context import Context
 from rapidsmpf.streaming.core.message import Message
@@ -28,18 +33,12 @@ from cudf_polars.containers import DataType
 from cudf_polars.dsl.expr import Col, NamedExpr
 from cudf_polars.dsl.ir import IR, Distinct, GroupBy, Select
 from cudf_polars.dsl.utils.naming import names_to_indices, unique_names
-from cudf_polars.streaming.actor_graph.collectives.ordered import (
-    concatenate_key_rows,
-    copy_key_row,
+from cudf_polars.streaming.actor_graph.collectives.ordering import (
     endpoint_rows_equal,
     gather_rank_endpoints,
-    repaired_inter_rank_ordering,
-    split_leading_run,
-    split_trailing_run,
-    stable_sort_chunk,
 )
 from cudf_polars.streaming.actor_graph.collectives.shuffle import ShuffleManager
-from cudf_polars.streaming.actor_graph.collectives.slice_exchange import SliceExchange
+from cudf_polars.streaming.actor_graph.collectives.slice_exchange import SparseExchange
 from cudf_polars.streaming.actor_graph.dispatch import (
     generate_ir_sub_network,
     ir_context_for_node,
@@ -48,6 +47,7 @@ from cudf_polars.streaming.actor_graph.partitioning import (
     NormalizedPartitioning,
     is_globally_row_ordered_by,
     maybe_remap_partitioning,
+    partitioning_or_none,
     replace_row_orderings,
 )
 from cudf_polars.streaming.actor_graph.tracing import send_chunk
@@ -73,21 +73,19 @@ from cudf_polars.streaming.groupby import (
     combine,
     decompose,
 )
-from cudf_polars.streaming.partitioning_requests import (
-    OrderPartitioningRequest,
-)
+from cudf_polars.streaming.partitioning_requests import OrderPartitioningRequest
 from cudf_polars.streaming.repartition import Repartition
-from cudf_polars.utils.dtypes import make_empty_column
+from cudf_polars.utils.cuda_stream import stream_ordered_after
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator
+    from collections.abc import AsyncIterator, Sequence
 
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.memory.buffer_resource import BufferResource
     from rapidsmpf.streaming.core.channel import Channel
 
     from cudf_polars.dsl.ir import IRExecutionContext
-    from cudf_polars.streaming.actor_graph.collectives.ordered import RankEndpoints
+    from cudf_polars.streaming.actor_graph.collectives.ordering import RankEndpoints
     from cudf_polars.streaming.actor_graph.dispatch import SubNetGenerator
     from cudf_polars.streaming.actor_graph.partitioning import PartitioningLevel
     from cudf_polars.streaming.actor_graph.tracing import ActorTracer
@@ -482,364 +480,198 @@ async def _shuffle_reduce(
     await ch_out.drain(context)
 
 
-def _remap_groupby_order_keys(
-    decomposed: DecomposedGroupBy,
-    input_order_keys: tuple[OrderKey, ...],
-    suffix: tuple[tuple[plc.types.Order, plc.types.NullOrder], ...],
-) -> tuple[OrderKey, ...]:
-    """Return full group-key ordering with the input ordering as a prefix."""
-    prefix = tuple(
-        OrderKey(index, key.order, key.null_order)
-        for index, key in zip(
-            decomposed.shuffle_indices,
-            input_order_keys,
-            strict=False,
-        )
+def _table_chunk(
+    context: Context, table: plc.Table, stream: Any, *, exclusive: bool = True
+) -> TableChunk:
+    return TableChunk.from_pylibcudf_table(
+        table, stream, exclusive_view=exclusive, br=context.br()
     )
-    suffix_keys = tuple(
-        OrderKey(index, order, null_order)
-        for index, (order, null_order) in zip(
-            decomposed.shuffle_indices[len(prefix) :],
-            suffix,
-            strict=True,
-        )
-    )
-    return (*prefix, *suffix_keys)
 
 
-async def _ordered_partial_reductions(
+async def _copy_key_endpoints(
+    context: Context,
+    first: TableChunk,
+    last: TableChunk,
+    order_keys: Sequence[OrderKey],
+) -> tuple[TableChunk, TableChunk, TableChunk]:
+    """Copy the first and last key rows into independent storage."""
+    inputs = [first] if first is last else [first, last]
+    chunks, extra = await make_table_chunks_available_or_wait(
+        context, inputs, reserve_extra=0, net_memory_delta=0
+    )
+    first, last = chunks[0], chunks[-1]
+    with (
+        opaque_memory_usage(extra),
+        stream_ordered_after(
+            context.br().stream_pool.get_stream,
+            upstreams=(first.stream, last.stream),
+        ) as stream,
+    ):
+        views = []
+        for chunk, row in ((first, 0), (last, last.shape[0] - 1)):
+            table = chunk.table_view()
+            keys = plc.Table([table.columns()[key.column_index] for key in order_keys])
+            views.append(plc.copying.slice(keys, [row, row + 1], stream=stream)[0])
+        cost = sum(
+            _table_chunk(context, view, stream, exclusive=False).into_packed_data_cost()
+            for view in views
+        )
+        reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
+            cost, net_memory_delta=0
+        )
+        with opaque_memory_usage(reservation):
+            result = plc.concatenate.concatenate(
+                views, stream=stream, mr=context.br().device_mr
+            )
+    return _table_chunk(context, result, stream), first, last
+
+
+async def _sort_chunk(
+    context: Context, chunk: TableChunk, keys: Sequence[OrderKey]
+) -> TableChunk:
+    """Stably sort one partial reduction."""
+    if chunk.shape[0] < 2:
+        return chunk
+    chunk, extra = await make_table_chunks_available_or_wait(
+        context, chunk, reserve_extra=chunk.data_alloc_size(), net_memory_delta=0
+    )
+    with opaque_memory_usage(extra):
+        table = chunk.table_view()
+        result = plc.sorting.stable_sort_by_key(
+            table,
+            plc.Table([table.columns()[key.column_index] for key in keys]),
+            [key.order for key in keys],
+            [key.null_order for key in keys],
+            stream=chunk.stream,
+            mr=context.br().device_mr,
+        )
+    return _table_chunk(context, result, chunk.stream)
+
+
+async def _split_key_run(
+    context: Context,
+    chunk: TableChunk,
+    keys: Sequence[OrderKey],
+    *,
+    leading: bool,
+) -> tuple[TableChunk, TableChunk | None]:
+    """Split a sorted chunk beside its leading or trailing equal-key run."""
+    if not (nrows := chunk.shape[0]):
+        return chunk, None
+    chunk, extra = await make_table_chunks_available_or_wait(
+        context, chunk, reserve_extra=chunk.data_alloc_size(), net_memory_delta=0
+    )
+    with opaque_memory_usage(extra):
+        table = chunk.table_view()
+        key_table = plc.Table([table.columns()[key.column_index] for key in keys])
+        row = 0 if leading else nrows - 1
+        boundary = plc.copying.slice(key_table, [row, row + 1], stream=chunk.stream)[0]
+        find = plc.search.upper_bound if leading else plc.search.lower_bound
+        split = cast(
+            "int",
+            find(
+                key_table,
+                boundary,
+                [key.order for key in keys],
+                [key.null_order for key in keys],
+                stream=chunk.stream,
+            )
+            .to_scalar(stream=chunk.stream)
+            .to_py(stream=chunk.stream),
+        )
+        if split == nrows:
+            return chunk, None
+        views = plc.copying.split(table, [split], stream=chunk.stream)
+        pieces = tuple(
+            chunk
+            if view.num_rows() == nrows
+            else _table_chunk(
+                context,
+                view.copy(chunk.stream, context.br().device_mr),
+                chunk.stream,
+            )
+            for view in views
+        )
+    first, second = pieces
+    return first, second
+
+
+async def _ordered_reductions(
     context: Context,
     decomposed: DecomposedGroupBy,
     ir_context: IRExecutionContext,
     ch_in: Channel[TableChunk],
-    aggregated: TableChunk,
-    *,
-    input_drained: bool,
-) -> AsyncIterator[TableChunk]:
-    """Yield locally reduced chunks in input order."""
-    yield aggregated
-    if input_drained:
-        return
-    while (msg := await ch_in.recv(context)) is not None:
-        chunk = await evaluate_chunk(
+    prefix_keys: tuple[OrderKey, ...],
+    output_keys: tuple[OrderKey, ...],
+) -> AsyncIterator[tuple[TableChunk, bool]]:
+    """
+    Yield complete reductions followed by one unresolved trailing run.
+
+    Reduced state for one ordered-prefix run must fit in a local reduction.
+    Full-key ordering limits that state to one group.
+    """
+    carry = None
+    while (message := await ch_in.recv(context)) is not None:
+        current = await evaluate_chunk(
             context,
-            TableChunk.from_message(msg, br=context.br()),
+            TableChunk.from_message(message, br=context.br()),
             decomposed.piecewise_ir,
             ir_context=ir_context,
         )
-        yield _enforce_schema(
-            chunk,
+        current = _enforce_schema(
+            current,
             decomposed.reduction_ir.schema,
             context.br(),
         )
-
-
-async def _ordered_reduction_chunks(
-    context: Context,
-    decomposed: DecomposedGroupBy,
-    ir_context: IRExecutionContext,
-    chunks: AsyncIterator[TableChunk],
-    prefix_keys: tuple[OrderKey, ...],
-    output_order_keys: tuple[OrderKey, ...],
-) -> AsyncIterator[tuple[TableChunk, bool]]:
-    """Yield complete reductions followed by the unresolved final key run."""
-    trailing_store = ChunkStore(context)
-    try:
-        async for chunk in chunks:
-            current = chunk
-            if message := next(iter(trailing_store), None):
-                current = await evaluate_batch(
-                    [TableChunk.from_message(message, br=context.br()), current],
-                    context,
-                    decomposed.reduction_ir,
-                    ir_context=ir_context,
-                )
-            current = await stable_sort_chunk(context, current, output_order_keys)
-            complete, trailing = await split_trailing_run(
+        if carry is not None:
+            current = await evaluate_batch(
+                [carry, current],
                 context,
-                current,
-                prefix_keys,
-            )
-            if complete.shape[0]:
-                yield complete, False
-            if trailing is not None:
-                trailing_store.insert(Message(0, trailing))
-        if message := next(iter(trailing_store), None):
-            yield TableChunk.from_message(message, br=context.br()), True
-    finally:
-        trailing_store.clear()
-
-
-async def _ordered_incremental_reduce(
-    context: Context,
-    decomposed: DecomposedGroupBy,
-    ir_context: IRExecutionContext,
-    ch_out: Channel[TableChunk],
-    ch_in: Channel[TableChunk],
-    metadata_in: ChannelMetadata,
-    *,
-    aggregated: TableChunk,
-    chunks_received: int,
-    input_drained: bool,
-    input_order_keys: tuple[OrderKey, ...],
-    output_order_keys: tuple[OrderKey, ...],
-    tracer: ActorTracer | None,
-) -> None:
-    """Incrementally reduce ordered groups without rebuilding strict chunks."""
-    partial_prefix_keys = output_order_keys[: len(input_order_keys)]
-    result_order_keys = tuple(
-        OrderKey(index, key.order, key.null_order)
-        for index, key in zip(
-            decomposed.output_indices,
-            output_order_keys,
-            strict=False,
-        )
-    )
-    local_count = _ordered_output_count(metadata_in.local_count, chunks_received)
-    output_partitioning = maybe_remap_partitioning(
-        decomposed.ir,
-        metadata_in.partitioning,
-        context=context,
-        preserves_row_order=True,
-    )
-    metadata_out = ChannelMetadata(
-        local_count=local_count,
-        partitioning=replace_row_orderings(
-            output_partitioning or Partitioning(),
-            (RowOrdering(result_order_keys, RowOrderingScope.GLOBAL),),
-        ),
-        duplicated=metadata_in.duplicated,
-    )
-    if tracer is not None:
-        tracer.decision = "ordered_incremental"
-        if metadata_in.duplicated:
-            tracer.set_duplicated()
-    await send_metadata(ch_out, context, metadata_out)
-
-    chunks = _ordered_reduction_chunks(
-        context,
-        decomposed,
-        ir_context,
-        _ordered_partial_reductions(
-            context,
-            decomposed,
-            ir_context,
-            ch_in,
-            aggregated,
-            input_drained=input_drained,
-        ),
-        partial_prefix_keys,
-        output_order_keys,
-    )
-    sequence_number = 0
-    async for chunk, _ in chunks:
-        sequence_number = await _send_final_groupby_chunk(
-            context,
-            decomposed,
-            ir_context,
-            ch_out,
-            chunk,
-            sequence_number,
-            tracer,
-        )
-    if sequence_number == 0:
-        await _send_final_groupby_chunk(
-            context,
-            decomposed,
-            ir_context,
-            ch_out,
-            empty_table_chunk(
                 decomposed.reduction_ir,
-                context,
-                ir_context.get_cuda_stream(),
-            ),
-            sequence_number,
-            tracer,
+                ir_context=ir_context,
+            )
+        current = await _sort_chunk(context, current, output_keys)
+        complete, carry = await _split_key_run(
+            context, current, prefix_keys, leading=False
         )
-    await ch_out.drain(context)
+        if complete.shape[0]:
+            yield complete, False
+    if carry is not None:
+        yield carry, True
 
 
-def _ordered_output_count(local_count: int, chunks_received: int) -> int:
-    """Estimate remaining output chunks without trusting the input estimate."""
-    return max(1, local_count - chunks_received + 1)
-
-
-@dataclass
-class _PreparedOrderedReduction:
-    """Spillable local reduction state awaiting rank-boundary resolution."""
-
-    chunks: ChunkStore
-    trailing: ChunkStore
-    first_key: TableChunk | None
-    last_key: TableChunk | None
-    empty: TableChunk
-
-    def clear(self) -> None:
-        """Release buffered local chunks."""
-        self.chunks.clear()
-        self.trailing.clear()
-
-
-async def _prepare_ordered_reduction(
-    context: Context,
-    decomposed: DecomposedGroupBy,
-    ir_context: IRExecutionContext,
-    ch_in: Channel[TableChunk],
-    *,
-    aggregated: TableChunk,
-    input_drained: bool,
-    input_order_keys: tuple[OrderKey, ...],
-    output_order_keys: tuple[OrderKey, ...],
-) -> _PreparedOrderedReduction:
-    """Reduce local ordered input while retaining its final prefix run."""
-    prefix_keys = output_order_keys[: len(input_order_keys)]
-    chunks = ChunkStore(context)
-    empty = empty_table_chunk(
-        decomposed.reduction_ir,
-        context,
-        ir_context.get_cuda_stream(),
-    )
-    reductions = _ordered_reduction_chunks(
-        context,
-        decomposed,
-        ir_context,
-        _ordered_partial_reductions(
-            context,
-            decomposed,
-            ir_context,
-            ch_in,
-            aggregated,
-            input_drained=input_drained,
-        ),
-        prefix_keys,
-        output_order_keys,
-    )
-    trailing = ChunkStore(context)
-    first_key: TableChunk | None = None
-    last_key: TableChunk | None = None
-    try:
-        async for chunk, is_trailing in reductions:
-            if first_key is None:
-                first_key = await copy_key_row(context, chunk, prefix_keys, 0)
-            if is_trailing:
-                last_key = await copy_key_row(
-                    context,
-                    chunk,
-                    prefix_keys,
-                    chunk.shape[0] - 1,
-                )
-                trailing.insert(Message(0, chunk))
-            else:
-                chunks.insert(Message(0, chunk))
-    except BaseException:
-        chunks.clear()
-        trailing.clear()
-        raise
-    return _PreparedOrderedReduction(
-        chunks,
-        trailing,
-        first_key,
-        last_key,
-        empty,
-    )
-
-
-def _ordered_boundary_owners(
+def _boundary_owners(
     endpoints: RankEndpoints,
-    prefix_keys: tuple[OrderKey, ...],
+    keys: tuple[OrderKey, ...],
     stream: Any,
-    nranks: int,
 ) -> dict[int, int]:
-    """Assign each rank's trailing prefix to its rightmost owning rank."""
-    ranks = endpoints.ranks
-    same_within = tuple(
-        endpoint_rows_equal(endpoints, 2 * i, 2 * i + 1, prefix_keys, stream)
-        for i in range(len(ranks))
+    """Assign each trailing key run to its rightmost nonempty rank."""
+    nranks = len(endpoints.ranks)
+    if not nranks:
+        return {}
+    full_rank = tuple(
+        endpoint_rows_equal(endpoints, 2 * i, 2 * i + 1, keys, stream)
+        for i in range(nranks)
     )
-    same_between = tuple(
-        endpoint_rows_equal(
-            endpoints,
-            2 * i + 1,
-            2 * i + 2,
-            prefix_keys,
-            stream,
+    shared_boundary = tuple(
+        endpoint_rows_equal(endpoints, 2 * i + 1, 2 * i + 2, keys, stream)
+        for i in range(nranks - 1)
+    )
+    owners = {endpoints.ranks[-1]: endpoints.ranks[-1]}
+    for position in range(nranks - 2, -1, -1):
+        rank = endpoints.ranks[position]
+        next_rank = endpoints.ranks[position + 1]
+        owners[rank] = (
+            owners[next_rank]
+            if shared_boundary[position] and full_rank[position + 1]
+            else next_rank
+            if shared_boundary[position]
+            else rank
         )
-        for i in range(len(ranks) - 1)
-    )
-    owners: dict[int, int] = {}
-    for position, rank in enumerate(ranks):
-        owner = position
-        while owner < len(ranks) - 1 and same_between[owner]:
-            owner += 1
-            if not same_within[owner]:
-                break
-        owners[rank] = ranks[owner]
-    if ranks and ranks[-1] != nranks - 1:
-        last_rank = ranks[-1]
-        for position, source in enumerate(ranks):
-            if owners[source] == last_rank and endpoint_rows_equal(
-                endpoints,
-                2 * position + 1,
-                endpoints.keys.num_rows() - 1,
-                prefix_keys,
-                stream,
-            ):
-                owners[source] = nranks - 1
     return owners
 
 
-async def _reduce_boundary_states(
-    context: Context,
-    decomposed: DecomposedGroupBy,
-    ir_context: IRExecutionContext,
-    states: AsyncIterator[TableChunk],
-    output_order_keys: tuple[OrderKey, ...],
-) -> TableChunk | None:
-    """Combine ordered boundary states in source-rank order."""
-    try:
-        result = await anext(states)
-    except StopAsyncIteration:
-        return None
-    async for state in states:
-        result = await evaluate_batch(
-            [result, state],
-            context,
-            decomposed.reduction_ir,
-            ir_context=ir_context,
-        )
-    return await stable_sort_chunk(context, result, output_order_keys)
-
-
-async def _send_final_groupby_chunk(
-    context: Context,
-    decomposed: DecomposedGroupBy,
-    ir_context: IRExecutionContext,
-    ch_out: Channel[TableChunk],
-    chunk: TableChunk | None,
-    sequence_number: int,
-    tracer: ActorTracer | None,
-) -> int:
-    """Apply the final selection and send one nonempty output chunk."""
-    if chunk is None or chunk.shape[0] == 0:
-        return sequence_number
-    if decomposed.select_ir is not None:
-        chunk = await evaluate_chunk(
-            context,
-            chunk,
-            decomposed.select_ir,
-            ir_context=ir_context,
-        )
-    await send_chunk(
-        context,
-        ch_out,
-        chunk,
-        sequence_number,
-        tracer=tracer,
-    )
-    return sequence_number + 1
-
-
-async def _distributed_ordered_reduce(
+async def _ordered_reduce(
     context: Context,
     comm: Communicator,
     decomposed: DecomposedGroupBy,
@@ -848,226 +680,204 @@ async def _distributed_ordered_reduce(
     ch_in: Channel[TableChunk],
     metadata_in: ChannelMetadata,
     collective_ids: list[int],
+    input_keys: tuple[OrderKey, ...],
+    output_keys: tuple[OrderKey, ...],
     *,
-    aggregated: TableChunk,
-    input_drained: bool,
-    input_order_keys: tuple[OrderKey, ...],
-    output_order_keys: tuple[OrderKey, ...],
+    distributed: bool,
     tracer: ActorTracer | None,
 ) -> None:
-    """Reduce globally ordered input and exchange only boundary states."""
-    prepared = await _prepare_ordered_reduction(
-        context,
-        decomposed,
-        ir_context,
-        ch_in,
-        aggregated=aggregated,
-        input_drained=input_drained,
-        input_order_keys=input_order_keys,
-        output_order_keys=output_order_keys,
+    """Stream ordered reductions, reconciling rank-boundary state if needed."""
+    prefix_keys = output_keys[: len(input_keys)]
+    reductions = _ordered_reductions(
+        context, decomposed, ir_context, ch_in, prefix_keys, output_keys
     )
-    prefix_keys = output_order_keys[: len(input_order_keys)]
-    stream = ir_context.get_cuda_stream()
-    try:
-        if prepared.first_key is None:
-            dtypes = tuple(decomposed.reduction_ir.schema.values())
-            local_endpoints = TableChunk.from_pylibcudf_table(
-                plc.Table(
-                    [
-                        make_empty_column(dtypes[key.column_index], stream)
-                        for key in prefix_keys
-                    ]
+
+    async def emit(chunk: TableChunk | None, sequence_number: int) -> int:
+        if chunk is None or chunk.shape[0] == 0:
+            return sequence_number
+        if decomposed.select_ir is not None:
+            chunk = await evaluate_chunk(
+                context, chunk, decomposed.select_ir, ir_context=ir_context
+            )
+        await send_chunk(context, ch_out, chunk, sequence_number, tracer=tracer)
+        return sequence_number + 1
+
+    async def send_output_metadata(local_count: int) -> None:
+        partitioning = Partitioning()
+        if not distributed:
+            remapped = maybe_remap_partitioning(
+                decomposed.ir,
+                metadata_in.partitioning,
+                context=context,
+                preserves_row_order=True,
+            )
+            if remapped is not None:
+                partitioning = (
+                    partitioning_or_none(remapped.inter_rank, None, ()) or partitioning
+                )
+        result_keys = tuple(
+            OrderKey(index, key.order, key.null_order)
+            for index, key in zip(decomposed.output_indices, output_keys, strict=False)
+        )
+        await send_metadata(
+            ch_out,
+            context,
+            ChannelMetadata(
+                local_count=local_count,
+                partitioning=replace_row_orderings(
+                    partitioning,
+                    (RowOrdering(result_keys, RowOrderingScope.GLOBAL),),
                 ),
+                duplicated=False,
+            ),
+        )
+
+    if not distributed:
+        await send_output_metadata(
+            max(1, metadata_in.local_count),
+        )
+        if tracer is not None:
+            tracer.decision = "ordered"
+        sequence_number = 0
+        async for chunk, _ in reductions:
+            sequence_number = await emit(chunk, sequence_number)
+        if sequence_number == 0:
+            await emit(
+                empty_table_chunk(
+                    decomposed.reduction_ir, context, ir_context.get_cuda_stream()
+                ),
+                0,
+            )
+        await ch_out.drain(context)
+        return
+
+    complete = ChunkStore(context)
+    trailing = None
+    try:
+        async for chunk, is_trailing in reductions:
+            if is_trailing:
+                trailing = chunk
+            else:
+                complete.insert(Message(0, chunk))
+
+        stream = ir_context.get_cuda_stream()
+        messages = iter(complete)
+        first_message = next(messages, None)
+        first = (
+            TableChunk.from_message(first_message, br=context.br())
+            if first_message is not None
+            else trailing
+        )
+        if first is None:
+            empty = empty_table_chunk(decomposed.reduction_ir, context, stream)
+            table = empty.table_view()
+            local_endpoints = _table_chunk(
+                context,
+                plc.Table([table.columns()[key.column_index] for key in prefix_keys]),
                 stream,
-                exclusive_view=True,
-                br=context.br(),
+                exclusive=False,
             )
         else:
-            assert prepared.last_key is not None
-            local_endpoints = await concatenate_key_rows(
-                context,
-                prepared.first_key,
-                prepared.last_key,
+            assert trailing is not None
+            local_endpoints, first, trailing = await _copy_key_endpoints(
+                context, first, trailing, prefix_keys
             )
-        endpoints = await gather_rank_endpoints(
+        (endpoints,) = await gather_rank_endpoints(
             context,
             comm,
             ir_context,
             collective_ids.pop(),
-            local_endpoints,
+            (local_endpoints,),
             stream,
         )
-        owners = _ordered_boundary_owners(
-            endpoints,
-            prefix_keys,
-            stream,
-            comm.nranks,
+        owners = _boundary_owners(endpoints, prefix_keys, stream)
+        sources = tuple(
+            sorted(
+                source
+                for source, owner in owners.items()
+                if owner == comm.rank and source != comm.rank
+            )
         )
         owner = owners.get(comm.rank)
-        routes = tuple(
-            (destination,)
-            if (destination := owners.get(source)) is not None and destination != source
-            else ()
-            for source in range(comm.nranks)
+        destinations = (owner,) if owner is not None and owner != comm.rank else ()
+        local_count_estimate = (
+            1
+            if not endpoints.ranks and comm.rank == 0
+            else max(0, metadata_in.local_count)
         )
-        destination = owner if owner is not None and owner != comm.rank else None
+        await send_output_metadata(local_count_estimate)
+        if tracer is not None:
+            tracer.decision = "ordered_distributed"
 
-        async def _boundary_source() -> AsyncGenerator[Message[TableChunk]]:
-            if destination is not None:
-                for message in prepared.trailing:
-                    yield message
-
-        exchange = await SliceExchange(
+        async with SparseExchange(
             context,
             comm,
             collective_ids.pop(),
-        ).exchange_whole(
-            _boundary_source(),
-            routes,
-        )
-        sources = exchange.remote_sources
+            sources=sources,
+            destinations=destinations,
+        ) as exchange:
+            first_is_trailing = first is trailing
+            if destinations:
+                assert trailing is not None
+                await exchange.insert_chunk(destinations[0], trailing)
+                trailing = None
+            await exchange.finish()
 
-        try:
-            result_order_keys = tuple(
-                OrderKey(index, key.order, key.null_order)
-                for index, key in zip(
-                    decomposed.output_indices,
-                    output_order_keys,
-                    strict=False,
-                )
-            )
-            inter_rank_ordering = repaired_inter_rank_ordering(
-                context.br(),
-                endpoints,
-                result_order_keys[: len(prefix_keys)],
-                comm.nranks,
-                stream,
-            )
-            await send_metadata(
-                ch_out,
-                context,
-                ChannelMetadata(
-                    local_count=metadata_in.local_count,
-                    partitioning=Partitioning(
-                        inter_rank=(
-                            OrderScheme([inter_rank_ordering])
-                            if inter_rank_ordering is not None
-                            else None
-                        ),
-                        row_orderings=(
-                            RowOrdering(
-                                result_order_keys,
-                                RowOrderingScope.GLOBAL,
-                            ),
-                        ),
-                    ),
-                    duplicated=False,
-                ),
-            )
-            if tracer is not None:
-                tracer.decision = "ordered_distributed"
-            sequence_number = 0
-            chunks = iter(prepared.chunks)
-            first_message = next(chunks, None)
-            local_first: TableChunk | None = None
-            remainder: TableChunk | None = None
+            local_first = None
+            remainder = None
             if sources:
-                if first_message is not None:
-                    local_first, remainder = await split_leading_run(
-                        context,
-                        TableChunk.from_message(first_message, br=context.br()),
-                        prefix_keys,
+                if not first_is_trailing:
+                    local_first, remainder = await _split_key_run(
+                        context, first, prefix_keys, leading=True
                     )
                 else:
-                    trailing_message = next(iter(prepared.trailing), None)
-                    local_first = (
-                        TableChunk.from_message(trailing_message, br=context.br())
-                        if trailing_message is not None
-                        else None
+                    local_first, trailing = trailing, None
+                states: list[TableChunk] = []
+                for source in sources:
+                    remote = exchange.extract(source)
+                    try:
+                        states.extend(
+                            TableChunk.from_message(message, br=context.br())
+                            for message in remote
+                        )
+                    finally:
+                        remote.clear()
+                if local_first is not None:
+                    states.append(local_first)
+                boundary = (
+                    await evaluate_batch(
+                        states,
+                        context,
+                        decomposed.reduction_ir,
+                        ir_context=ir_context,
                     )
+                    if len(states) > 1
+                    else states[0]
+                )
+                boundary = await _sort_chunk(context, boundary, output_keys)
+            else:
+                boundary = first if first_message is not None else None
 
-                async def boundary_states() -> AsyncIterator[TableChunk]:
-                    async for message in exchange.iter_source_order(
+            sequence_number = 0
+            chunks = [boundary, remainder]
+            chunks.extend(
+                TableChunk.from_message(message, br=context.br())
+                for message in messages
+            )
+            chunks.append(trailing)
+            for chunk in chunks:
+                sequence_number = await emit(chunk, sequence_number)
+            if not endpoints.ranks and comm.rank == 0:
+                await emit(
+                    empty_table_chunk(
+                        decomposed.reduction_ir,
                         context,
-                        comm.rank,
-                    ):
-                        yield TableChunk.from_message(message, br=context.br())
-                    if local_first is not None:
-                        yield local_first
-
-                sequence_number = await _send_final_groupby_chunk(
-                    context,
-                    decomposed,
-                    ir_context,
-                    ch_out,
-                    await _reduce_boundary_states(
-                        context,
-                        decomposed,
-                        ir_context,
-                        boundary_states(),
-                        output_order_keys,
+                        stream,
                     ),
                     sequence_number,
-                    tracer,
                 )
-                sequence_number = await _send_final_groupby_chunk(
-                    context,
-                    decomposed,
-                    ir_context,
-                    ch_out,
-                    remainder,
-                    sequence_number,
-                    tracer,
-                )
-            elif first_message is not None:
-                sequence_number = await _send_final_groupby_chunk(
-                    context,
-                    decomposed,
-                    ir_context,
-                    ch_out,
-                    TableChunk.from_message(first_message, br=context.br()),
-                    sequence_number,
-                    tracer,
-                )
-
-            for message in chunks:
-                sequence_number = await _send_final_groupby_chunk(
-                    context,
-                    decomposed,
-                    ir_context,
-                    ch_out,
-                    TableChunk.from_message(message, br=context.br()),
-                    sequence_number,
-                    tracer,
-                )
-            if destination is None:
-                trailing_message = next(iter(prepared.trailing), None)
-                sequence_number = await _send_final_groupby_chunk(
-                    context,
-                    decomposed,
-                    ir_context,
-                    ch_out,
-                    TableChunk.from_message(trailing_message, br=context.br())
-                    if trailing_message is not None
-                    else None,
-                    sequence_number,
-                    tracer,
-                )
-
-            if not endpoints.ranks and comm.rank == 0:
-                await _send_final_groupby_chunk(
-                    context,
-                    decomposed,
-                    ir_context,
-                    ch_out,
-                    prepared.empty,
-                    sequence_number,
-                    tracer,
-                )
-        finally:
-            exchange.clear()
     finally:
-        prepared.clear()
+        complete.clear()
     await ch_out.drain(context)
 
 
@@ -1122,60 +932,66 @@ def _key_indices(
         return tuple(schema_keys[k] for k in schema if k in subset)
 
 
-def _ordered_groupby_prefix(
-    partitioning: Partitioning | None,
-    group_keys: tuple[int, ...],
-) -> tuple[OrderKey, ...]:
-    """Return the longest row-ordering prefix of the group keys."""
-    if partitioning is None:
-        return ()
-    candidates = []
-    for ordering in partitioning.row_orderings:
-        prefix = ordering.order_keys[: len(group_keys)]
-        if (
-            not ordering.group_keys
-            and prefix
-            and tuple(key.column_index for key in prefix) == group_keys[: len(prefix)]
-            and is_globally_row_ordered_by(partitioning, prefix)
-        ):
-            candidates.append(prefix)
-    return max(candidates, key=len, default=())
-
-
-def _requested_groupby_order_keys(
-    ir: GroupBy,
+def _ordered_groupby_keys(
+    ir: GroupBy | Distinct,
     decomposed: DecomposedGroupBy,
     requests: tuple[PartitioningRequest, ...],
-    input_order_keys: tuple[OrderKey, ...],
-) -> tuple[OrderKey, ...]:
-    """Return a compatible full-key ordering requested by a consumer."""
-    keys = tuple(key.name for key in ir.keys)
+    partitioning: Partitioning | None,
+    group_keys: tuple[int, ...],
+) -> tuple[tuple[OrderKey, ...], tuple[OrderKey, ...]]:
+    """Return compatible input and output group-key orderings."""
+    if not isinstance(ir, GroupBy) or partitioning is None:
+        return (), ()
+
+    def matching_prefix(ordering: RowOrdering) -> tuple[OrderKey, ...]:
+        result = []
+        for key, index in zip(ordering.order_keys, group_keys, strict=False):
+            if key.column_index != index:
+                break
+            result.append(key)
+        return tuple(result)
+
+    candidates = (
+        prefix
+        for ordering in partitioning.row_orderings
+        if not ordering.group_keys
+        and (prefix := matching_prefix(ordering))
+        and is_globally_row_ordered_by(partitioning, prefix)
+    )
+    input_keys = max(candidates, key=len, default=())
+    if not input_keys:
+        return (), ()
+    key_names = tuple(key.name for key in ir.keys)
+    prefix = tuple(
+        (name, key.order, key.null_order)
+        for name, key in zip(key_names, input_keys, strict=False)
+    )
     if ir.maintain_order:
-        return (
-            _remap_groupby_order_keys(decomposed, input_order_keys, ())
-            if len(input_order_keys) == len(keys)
-            else ()
+        if len(input_keys) != len(key_names):
+            return input_keys, ()
+        directions = input_keys
+    else:
+        request = next(
+            (
+                request
+                for request in requests
+                if isinstance(request, OrderPartitioningRequest)
+                and tuple(key.name for key in request.keys) == key_names
+                and tuple(
+                    (key.name, key.order, key.null_order)
+                    for key in request.keys[: len(input_keys)]
+                )
+                == prefix
+            ),
+            None,
         )
-    for request in requests:
-        if not isinstance(request, OrderPartitioningRequest):
-            continue
-        if tuple(key.name for key in request.keys) != keys:
-            continue
-        requested_prefix = request.keys[: len(input_order_keys)]
-        if any(
-            (requested.order, requested.null_order) != (actual.order, actual.null_order)
-            for requested, actual in zip(
-                requested_prefix,
-                input_order_keys,
-                strict=True,
-            )
-        ):
-            continue
-        suffix = tuple(
-            (key.order, key.null_order) for key in request.keys[len(input_order_keys) :]
-        )
-        return _remap_groupby_order_keys(decomposed, input_order_keys, suffix)
-    return ()
+        if request is None:
+            return input_keys, ()
+        directions = request.keys
+    return input_keys, tuple(
+        OrderKey(index, key.order, key.null_order)
+        for index, key in zip(decomposed.shuffle_indices, directions, strict=True)
+    )
 
 
 def _maintain_order(ir: GroupBy | Distinct) -> bool:
@@ -1373,10 +1189,6 @@ async def groupby_actor(
             partitioning.inter_rank_scheme,
             OrderScheme,
         ) and partitioning.is_strictly_partitioned(level="inter_rank")
-        input_row_order_keys = _ordered_groupby_prefix(
-            metadata_in.partitioning,
-            group_keys,
-        )
         fallback_case = (
             # NOTE: This criteria means that we fell back
             # to one partition at lowering time.
@@ -1413,22 +1225,29 @@ async def groupby_actor(
 
         decomposed = DecomposedGroupBy.from_ir(ir)
         assert not decomposed.need_preshuffle, "Should already be shuffled."
-        requested_order_keys = (
-            _requested_groupby_order_keys(
-                ir,
+        input_row_order_keys, requested_order_keys = _ordered_groupby_keys(
+            ir,
+            decomposed,
+            partitioning_requests,
+            metadata_in.partitioning,
+            group_keys,
+        )
+        if not metadata_in.duplicated and requested_order_keys:
+            await _ordered_reduce(
+                context,
+                comm,
                 decomposed,
-                partitioning_requests,
+                ir_context,
+                ch_out,
+                ch_in,
+                metadata_in,
+                collective_ids,
                 input_row_order_keys,
+                requested_order_keys,
+                distributed=nranks > 1 and not rank_ordered,
+                tracer=tracer,
             )
-            if isinstance(ir, GroupBy) and input_row_order_keys
-            else ()
-        )
-        use_ordered_incremental = (
-            isinstance(ir, GroupBy)
-            and not metadata_in.duplicated
-            and bool(input_row_order_keys)
-            and bool(requested_order_keys)
-        )
+            return
 
         aggregated, input_drained, chunks_received = await _local_aggregation(
             context,
@@ -1436,43 +1255,8 @@ async def groupby_actor(
             ir_context,
             ch_in,
             target_partition_size,
-            allow_early_exit=use_ordered_incremental or not maintain_order,
+            allow_early_exit=not maintain_order,
         )
-
-        if use_ordered_incremental:
-            assert isinstance(ir, GroupBy)
-            if nranks == 1 or rank_ordered:
-                await _ordered_incremental_reduce(
-                    context,
-                    decomposed,
-                    ir_context,
-                    ch_out,
-                    ch_in,
-                    metadata_in,
-                    aggregated=aggregated,
-                    chunks_received=chunks_received,
-                    input_drained=input_drained,
-                    input_order_keys=input_row_order_keys,
-                    output_order_keys=requested_order_keys,
-                    tracer=tracer,
-                )
-            else:
-                await _distributed_ordered_reduce(
-                    context,
-                    comm,
-                    decomposed,
-                    ir_context,
-                    ch_out,
-                    ch_in,
-                    metadata_in,
-                    collective_ids,
-                    aggregated=aggregated,
-                    input_drained=input_drained,
-                    input_order_keys=input_row_order_keys,
-                    output_order_keys=requested_order_keys,
-                    tracer=tracer,
-                )
-            return
 
         skip_global_comm = metadata_in.duplicated or isinstance(
             partitioning.inter_rank_scheme, HashScheme

@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import polars as pl
@@ -22,6 +22,7 @@ from cudf_streaming.table_chunk import (
     TableChunk,
     make_table_chunks_available_or_wait,
 )
+from rapidsmpf.memory.memory_reservation import opaque_memory_usage
 from rapidsmpf.streaming.core.message import Message
 
 from cudf_polars.containers import DataType
@@ -32,13 +33,17 @@ from cudf_polars.streaming.actor_graph.utils import (
     recv_metadata,
     send_metadata,
 )
-from cudf_polars.utils.cuda_stream import stream_ordered_after
+from cudf_polars.utils.cuda_stream import (
+    join_cuda_streams,
+    stream_ordered_after,
+)
 from cudf_polars.utils.dtypes import make_empty_column
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from cudf_streaming.channel_metadata import OrderKey
+    from pylibcudf.utils import CudaStreamLike
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.streaming.core.channel import Channel
     from rapidsmpf.streaming.core.context import Context
@@ -58,6 +63,164 @@ class OrderSchemePartitioningResult:
     """The extracted partitioning, or ``None`` if extraction was not possible."""
     chunks: ChunkStore
     """The consumed chunks, stored in replay order."""
+
+
+@dataclass(frozen=True)
+class RankEndpoints:
+    """First and last key rows for each nonempty rank."""
+
+    keys: plc.Table
+    ranks: tuple[int, ...]
+    stream: CudaStreamLike | None = field(default=None, repr=False, compare=False)
+
+
+def _order_rank_endpoints_after(
+    stream: CudaStreamLike,
+    endpoints: RankEndpoints,
+) -> None:
+    """Order a consumer stream after the endpoint producer stream."""
+    if endpoints.stream is not None and endpoints.stream is not stream:
+        join_cuda_streams(downstreams=(stream,), upstreams=(endpoints.stream,))
+
+
+async def gather_rank_endpoints(
+    context: Context,
+    comm: Communicator,
+    ir_context: IRExecutionContext,
+    collective_id: int,
+    local_key_sets: Sequence[TableChunk],
+    stream: Stream,
+) -> tuple[RankEndpoints, ...]:
+    """Gather zero-or-two-row endpoint tables for one or more inputs."""
+    if not local_key_sets:
+        return ()
+    if any(keys.shape[0] not in (0, 2) for keys in local_key_sets):
+        raise ValueError("Rank endpoint tables must contain zero or two rows")
+    available, extra = await make_table_chunks_available_or_wait(
+        context,
+        local_key_sets,
+        reserve_extra=sum(keys.data_alloc_size() for keys in local_key_sets),
+        net_memory_delta=0,
+    )
+    with (
+        opaque_memory_usage(extra),
+        stream_ordered_after(
+            context.br().stream_pool.get_stream,
+            upstreams=tuple(keys.stream for keys in available),
+        ) as concat_stream,
+    ):
+        tagged = []
+        for set_index, keys in enumerate(available):
+            size = keys.shape[0]
+            tagged.append(
+                plc.Table(
+                    [
+                        plc.Column.from_iterable_of_py(
+                            [set_index] * size,
+                            plc.DataType(plc.TypeId.INT32),
+                            stream=concat_stream,
+                        ),
+                        plc.Column.from_iterable_of_py(
+                            [comm.rank] * size,
+                            plc.DataType(plc.TypeId.INT32),
+                            stream=concat_stream,
+                        ),
+                        *keys.table_view().columns(),
+                    ]
+                )
+            )
+        tagged_table = plc.concatenate.concatenate(
+            tagged,
+            stream=concat_stream,
+            mr=context.br().device_mr,
+        )
+    gathered = AllGatherManager(context, comm, collective_id)
+    with gathered.inserting() as inserter:
+        await inserter.insert(
+            comm.rank,
+            TableChunk.from_pylibcudf_table(
+                tagged_table,
+                concat_stream,
+                exclusive_view=True,
+                br=context.br(),
+            ),
+        )
+    table = await gathered.extract_concatenated(
+        stream,
+        ordered=True,
+        ir_context=ir_context,
+    )
+    set_column, rank_column, *key_columns = table.columns()
+    set_indices = set_column.to_arrow(stream=stream).to_pylist()
+    rank_indices = rank_column.to_arrow(stream=stream).to_pylist()
+    key_table = plc.Table(key_columns)
+    result = []
+    for set_index in range(len(local_key_sets)):
+        rows = tuple(i for i, value in enumerate(set_indices) if value == set_index)
+        if len(rows) % 2:
+            raise RuntimeError("Invalid gathered rank endpoints")
+        ranks = tuple(rank_indices[row] for row in rows[::2])
+        if any(
+            rank_indices[row] != rank
+            for row, rank in zip(rows[1::2], ranks, strict=True)
+        ):
+            raise RuntimeError("Invalid gathered rank endpoint pairs")
+        gather_map = plc.Column.from_iterable_of_py(
+            list(rows),
+            plc.DataType(plc.TypeId.INT32),
+            stream=stream,
+        )
+        result.append(
+            RankEndpoints(
+                plc.copying.gather(
+                    key_table,
+                    gather_map,
+                    plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                    stream=stream,
+                ),
+                ranks,
+                stream,
+            )
+        )
+    return tuple(result)
+
+
+def key_row_less(
+    left: plc.Table,
+    right: plc.Table,
+    order_keys: Sequence[OrderKey],
+    stream: Stream,
+) -> bool:
+    """Return whether one key row precedes another."""
+    if left.num_rows() != 1 or right.num_rows() != 1:
+        raise ValueError("Key comparison requires one row per table")
+    insertion = plc.search.lower_bound(
+        left,
+        right,
+        [key.order for key in order_keys],
+        [key.null_order for key in order_keys],
+        stream=stream,
+    )
+    (value,) = plc.copying.slice(insertion, [0, 1], stream=stream)
+    return value.to_scalar(stream=stream).to_py(stream=stream) == 1
+
+
+def endpoint_rows_equal(
+    endpoints: RankEndpoints,
+    left: int,
+    right: int,
+    order_keys: Sequence[OrderKey],
+    stream: Stream,
+) -> bool:
+    """Return whether two endpoint rows belong to the same key group."""
+    _order_rank_endpoints_after(stream, endpoints)
+    if endpoints.keys.num_columns() == 0:
+        raise ValueError("Endpoint equality requires at least one key")
+    left_row = plc.copying.slice(endpoints.keys, [left, left + 1], stream=stream)[0]
+    right_row = plc.copying.slice(endpoints.keys, [right, right + 1], stream=stream)[0]
+    return not key_row_less(
+        left_row, right_row, order_keys, stream
+    ) and not key_row_less(right_row, left_row, order_keys, stream)
 
 
 def _extract_boundaries_from_endpoint_rows(

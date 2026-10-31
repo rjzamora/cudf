@@ -41,7 +41,7 @@ def supports_ordered_cursor_join(ir: Join) -> bool:
     return (
         ir.options[0] in ("Inner", "Left")
         and ir.options[2] is None
-        and ir.options[5] in ("none", "left")
+        and ir.options[5] == "none"
     )
 
 

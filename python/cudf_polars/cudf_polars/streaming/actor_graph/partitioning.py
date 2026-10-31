@@ -647,13 +647,9 @@ class NormalizedPartitioning:
         return scheme.orderings[0] if isinstance(scheme, OrderScheme) else None
 
     def is_aligned_with(
-        self,
-        other: NormalizedPartitioning,
-        br: BufferResource,
-        *,
-        level: PartitioningLevel = "flat",
+        self, other: NormalizedPartitioning, br: BufferResource
     ) -> bool:
-        """True when both sides share the requested strict partition layout."""
+        """True when both sides share identical inter-rank and local layouts."""
 
         def schemes_aligned(
             lhs: PartitioningScheme,
@@ -671,19 +667,6 @@ class NormalizedPartitioning:
                 )
             return lhs == "inherit" and rhs == "inherit"
 
-        inter_rank_aligned = (
-            self.is_strictly_partitioned(level="inter_rank")
-            and other.is_strictly_partitioned(level="inter_rank")
-            and schemes_aligned(self.inter_rank_scheme, other.inter_rank_scheme)
-        )
-        if level == "inter_rank":
-            return inter_rank_aligned
-        if level == "local":
-            return (
-                self._scheme_is_strict(self.local_scheme)
-                and self._scheme_is_strict(other.local_scheme)
-                and schemes_aligned(self.local_scheme, other.local_scheme)
-            )
         local_schemes_strict = (
             self.local_scheme == "inherit" and other.local_scheme == "inherit"
         ) or (
@@ -691,8 +674,10 @@ class NormalizedPartitioning:
             and self._scheme_is_strict(other.local_scheme)
         )
         return (
-            inter_rank_aligned
+            self.is_strictly_partitioned(level="inter_rank")
+            and other.is_strictly_partitioned(level="inter_rank")
             and local_schemes_strict
+            and schemes_aligned(self.inter_rank_scheme, other.inter_rank_scheme)
             and schemes_aligned(self.local_scheme, other.local_scheme)
         )
 

@@ -17,39 +17,31 @@ import pylibcudf as plc
 from cudf_streaming.channel_metadata import (
     ChannelMetadata,
     OrderKey,
-    OrderScheme,
-    Ordering,
     Partitioning,
     RowOrdering,
     RowOrderingScope,
 )
-from cudf_streaming.table_chunk import TableChunk
 
 from cudf_polars import Translator
-from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.dsl.ir import Cache, Join
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.engine.core import all_gather_host_data
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.engine.spmd import allgather_polars_dataframe
 from cudf_polars.streaming.actor_graph import join as join_actor_graph
+from cudf_polars.streaming.actor_graph.collectives import sort as sort_actor_graph
 from cudf_polars.streaming.actor_graph.collectives.common import reserve_op_id
 from cudf_polars.streaming.actor_graph.core import evaluate_logical_plan
 from cudf_polars.streaming.actor_graph.join import (
     _forward_join_partitioning,
-    _make_ordered_strategy,
-    _ordered_join_execution,
     _use_pwise_join,
 )
-from cudf_polars.streaming.actor_graph.partitioning import NormalizedPartitioning
-from cudf_polars.streaming.actor_graph.utils import ChunkStore
 from cudf_polars.streaming.base import PartitionInfo
 from cudf_polars.streaming.parallel import lower_ir_graph
 from cudf_polars.streaming.shuffle import Shuffle
 from cudf_polars.streaming.statistics import collect_statistics
 from cudf_polars.testing.asserts import assert_gpu_result_equal
 from cudf_polars.testing.engine_utils import warns_on_spmd
-from cudf_polars.testing.io import make_partitioned_source
 from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
 
 if TYPE_CHECKING:
@@ -210,74 +202,6 @@ def _join_ir(q: pl.LazyFrame) -> Join:
     return next(node for node in traversal([ir]) if isinstance(node, Join))
 
 
-def _order_partitioning(
-    spmd_engine,
-    key_indices: tuple[int, ...],
-    *,
-    order: plc.types.Order = plc.types.Order.ASCENDING,
-    null_order: plc.types.NullOrder = plc.types.NullOrder.BEFORE,
-) -> NormalizedPartitioning:
-    stream = spmd_engine.context.br().stream_pool.get_stream()
-    table = DataFrame.from_polars(
-        pl.DataFrame({f"k{i}": [1, 2] for i in key_indices}),
-        stream,
-    ).table
-    chunk = TableChunk.from_pylibcudf_table(
-        table,
-        stream,
-        exclusive_view=False,
-        br=spmd_engine.context.br(),
-    )
-    return NormalizedPartitioning(
-        OrderScheme(
-            [
-                Ordering(
-                    [OrderKey(index, order, null_order) for index in key_indices],
-                    chunk,
-                    strict_boundaries=True,
-                )
-            ]
-        ),
-        "inherit",
-    )
-
-
-def _set_sorted_join_metadata(spmd_engine_factory) -> ChannelMetadata:
-    engine = spmd_engine_factory(
-        StreamingOptions(
-            max_rows_per_partition=128,
-            target_partition_size=1,
-            broadcast_limit=1,
-            fallback_mode="raise",
-            raise_on_fail=True,
-        ),
-    )
-    left = pl.LazyFrame({"k": [1, 2, 3], "x": [10, 20, 30]}).set_sorted("k")
-    right = pl.LazyFrame({"k": [1, 2, 3], "y": [100, 200, 300]}).set_sorted("k")
-    q = left.join(right, on="k", how="inner")
-
-    assert_gpu_result_equal(q, engine=engine, check_row_order=False)
-    ir = Translator(q._ldf.visit(), engine).translate_ir()
-    metadata_collector = evaluate_logical_plan(
-        ir, ConfigOptions.from_polars_engine(engine), collect_metadata=True
-    )[1]
-    assert metadata_collector is not None
-    assert len(metadata_collector) == 1
-    return metadata_collector[0]
-
-
-def test_ordered_join_after_set_sorted_inputs(spmd_engine_factory):
-    metadata = _set_sorted_join_metadata(spmd_engine_factory)
-
-    assert metadata.partitioning is not None
-    assert isinstance(metadata.partitioning.inter_rank, OrderScheme)
-    assert metadata.partitioning.local == "inherit"
-    (ordering,) = metadata.partitioning.inter_rank.orderings
-    assert tuple(key.column_index for key in ordering.keys) == (0,)
-    assert ordering.strict_boundaries is True
-    assert metadata.partitioning.row_orderings == ()
-
-
 @pytest.mark.parametrize("how", ["inner", "left"])
 @pytest.mark.parametrize("descending", [False, True])
 def test_row_ordered_join_across_chunks(spmd_engine_factory, how, descending) -> None:
@@ -290,452 +214,66 @@ def test_row_ordered_join_across_chunks(spmd_engine_factory, how, descending) ->
             raise_on_fail=True,
         )
     )
-    left_df = pl.DataFrame(
-        {
-            "k": [0, 0, 0, 1, 2, 2, 3],
-            "left_value": range(7),
-        }
-    ).sort("k", descending=descending)
-    right_df = pl.DataFrame(
-        {
-            "k": [0, 0, 1, 1, 2, 4],
-            "right_value": range(6),
-        }
-    ).sort("k", descending=descending)
-    left = left_df.lazy().set_sorted("k", descending=descending)
-    right = right_df.lazy().set_sorted("k", descending=descending)
-    q = left.join(right, on="k", how=how).sort("k", descending=descending)
-
-    expected = q.collect()
-    ir = Translator(q._ldf.visit(), engine).translate_ir()
-    result, metadata_collector = evaluate_logical_plan(
-        ir,
-        ConfigOptions.from_polars_engine(engine),
-        collect_metadata=True,
-    )
-    assert_frame_equal(result, expected, check_row_order=False)
-    assert result["k"].is_sorted(descending=descending)
-    assert metadata_collector is not None
-    (metadata,) = metadata_collector
-    assert metadata.local_count > 1
-    assert metadata.partitioning is not None
-    assert metadata.partitioning.inter_rank is None
-    (row_ordering,) = metadata.partitioning.row_orderings
-    assert row_ordering.scope == RowOrderingScope.GLOBAL
-    assert tuple(key.column_index for key in row_ordering.order_keys) == (0,)
-
-
-def test_row_ordered_join_preserves_empty_left_chunks(spmd_engine_factory) -> None:
-    """Emit one output chunk for every ordered left input chunk."""
-    engine = spmd_engine_factory(
-        StreamingOptions(
-            max_rows_per_partition=2,
-            target_partition_size=1,
-            broadcast_limit=1,
-            fallback_mode="raise",
-            raise_on_fail=True,
-        )
-    )
     left = (
-        pl.LazyFrame(
-            {
-                "key": range(4),
-                "left_value": range(4),
-                "keep": [False, False, True, True],
-            }
-        )
-        .filter(pl.col("keep"))
-        .drop("keep")
-        .set_sorted("key")
+        pl.DataFrame({"key": [0, 0, 0, 1, 2, 2, 3], "left_value": range(7)})
+        .sort("key", descending=descending)
+        .lazy()
     )
-    right = pl.LazyFrame({"key": range(4), "right_value": range(4)}).set_sorted("key")
-    q = left.join(right, on="key", how="inner").sort("key")
+    right = (
+        pl.DataFrame({"key": [0, 0, 1, 1, 2, 4], "right_value": range(6)})
+        .sort("key", descending=descending)
+        .lazy()
+    )
+    q = (
+        left.set_sorted("key", descending=descending)
+        .join(right.set_sorted("key", descending=descending), on="key", how=how)
+        .sort("key", descending=descending)
+    )
+
     ir = Translator(q._ldf.visit(), engine).translate_ir()
-
-    result, metadata_collector = evaluate_logical_plan(
-        ir,
-        ConfigOptions.from_polars_engine(engine),
-        collect_metadata=True,
-    )
-
-    assert_frame_equal(q.collect(), result)
-    assert metadata_collector is not None
-    (metadata,) = metadata_collector
-    assert metadata.local_count == 2
-
-
-def test_row_ordered_join_reloads_spilled_candidates(spmd_engine_factory) -> None:
-    """Reload spillable right candidates before the local join."""
-    engine = spmd_engine_factory(
-        StreamingOptions(
-            max_rows_per_partition=2,
-            target_partition_size=1,
-            broadcast_limit=1,
-            fallback_mode="raise",
-            raise_on_fail=True,
-        )
-    )
-    left = pl.LazyFrame({"key": [0, 10], "left_value": [0, 1]}).set_sorted("key")
-    right = pl.LazyFrame({"key": range(11), "right_value": range(11)}).set_sorted("key")
-    q = left.join(right, on="key", how="inner").sort("key")
-    original_concat = join_actor_graph.concat_batch
-    unavailable_candidate_counts = []
-
-    class SpillingChunkStore(ChunkStore):
-        def __init__(self, context):
-            super().__init__(context)
-            self._br = context.br()
-
-        def insert(self, message):
-            super().insert(message)
-            self._store.spill(mid=self._mids[-1], br=self._br)
-
-    async def observed_concat(chunks, *args, **kwargs):
-        unavailable_candidate_counts.append(
-            sum(not chunk.is_available() for chunk in chunks)
-        )
-        return await original_concat(chunks, *args, **kwargs)
-
     with (
-        patch.object(join_actor_graph, "ChunkStore", SpillingChunkStore),
-        patch.object(join_actor_graph, "concat_batch", observed_concat),
         patch.object(
             join_actor_graph,
-            "_incremental_ordered_join_chunks",
-            wraps=join_actor_graph._incremental_ordered_join_chunks,
-        ) as ordered_cursor,
+            "_incremental_ordered_join",
+            wraps=join_actor_graph._incremental_ordered_join,
+        ) as ordered_join,
+        patch.object(
+            sort_actor_graph,
+            "_sample_chunks_for_size_estimate",
+            side_effect=AssertionError("globally ordered input should bypass sorting"),
+        ),
+        patch.object(
+            sort_actor_graph,
+            "chunkwise_evaluate",
+            side_effect=AssertionError("globally ordered input should pass through"),
+        ),
     ):
-        result = q.collect(engine=engine)
+        result, metadata_collector = evaluate_logical_plan(
+            ir, ConfigOptions.from_polars_engine(engine), collect_metadata=True
+        )
+    assert ordered_join.await_count == 1
 
-    assert_frame_equal(q.collect(), result)
-    assert ordered_cursor.call_count == 1
-    assert unavailable_candidate_counts
-    assert max(unavailable_candidate_counts) > 1
+    assert_frame_equal(q.collect(), result, check_row_order=False)
+    assert result["key"].is_sorted(descending=descending)
+    assert metadata_collector is not None
+    (metadata,) = metadata_collector
+    assert metadata.partitioning is not None
+    (row_ordering,) = metadata.partitioning.row_orderings
+    assert row_ordering.scope == RowOrderingScope.GLOBAL
 
 
 def _share_source_path(spmd_engine, source) -> str:
-    """Share a rank-0 temporary path with every SPMD rank."""
     path = str(source).encode() if spmd_engine.rank == 0 else b""
     with reserve_op_id() as op_id:
         return all_gather_host_data(
-            spmd_engine.comm,
-            spmd_engine.context.br(),
-            op_id,
-            path,
+            spmd_engine.comm, spmd_engine.context.br(), op_id, path
         )[0].decode()
 
 
 @pytest.mark.spmd
 @pytest.mark.parametrize("how", ["inner", "left"])
-@pytest.mark.parametrize("descending", [False, True])
-def test_row_ordered_join_across_ranks(
-    spmd_engine_factory,
-    tmp_path,
-    how,
-    descending,
-) -> None:
-    """Exchange right rows needed by an ordered left rank range."""
-    engine = spmd_engine_factory(
-        StreamingOptions(
-            max_rows_per_partition=2,
-            target_partition_size=1,
-            broadcast_limit=1,
-            fallback_mode="raise",
-            raise_on_fail=True,
-        )
-    )
-    if engine.comm.nranks != 2:
-        pytest.skip("This test expects exactly two ranks.")
-    root = tmp_path / "ordered-join"
-    if engine.rank == 0:
-        for side in ("left", "right"):
-            source = root / side
-            source.mkdir(parents=True)
-            make_partitioned_source(
-                pl.DataFrame(
-                    {
-                        "raw": range(11, -1, -1) if descending else range(12),
-                        f"{side}_value": range(12),
-                    }
-                ),
-                source,
-                "parquet",
-                n_files=2 if side == "left" else 1,
-                row_group_size=2,
-            )
-    root = _share_source_path(engine, root)
-
-    def ordered_input(side: str) -> pl.LazyFrame:
-        return (
-            pl.scan_parquet(f"{root}/{side}")
-            .set_sorted("raw", descending=descending)
-            .with_columns(
-                pl.col("raw")
-                .cast(pl.Datetime("ns"))
-                .dt.truncate("3ns")
-                .cast(pl.Int64)
-                .alias("key"),
-                pl.lit(0, dtype=pl.Int64).alias("group"),
-            )
-            .set_sorted(["group", "key"], descending=descending)
-            .drop("raw")
-        )
-
-    q = (
-        ordered_input("left")
-        .join(
-            ordered_input("right"),
-            on=["group", "key"],
-            how=how,
-        )
-        .sort(["group", "key"], descending=descending)
-    )
-    with (
-        patch.object(
-            join_actor_graph,
-            "_distributed_incremental_ordered_join",
-            wraps=join_actor_graph._distributed_incremental_ordered_join,
-        ) as ordered_join,
-        patch.object(
-            join_actor_graph,
-            "plan_key_bounds_exchange",
-            wraps=join_actor_graph.plan_key_bounds_exchange,
-        ) as exchange_plan,
-    ):
-        result = q.collect(engine=engine)
-    result = allgather_polars_dataframe(engine=engine, local_df=result, op_id=0)
-    assert_frame_equal(q.collect(), result, check_row_order=False)
-    keys = result.select("group", "key")
-    assert_frame_equal(
-        keys,
-        keys.sort(["group", "key"], descending=descending),
-    )
-    assert ordered_join.call_count == 1
-    assert exchange_plan.call_count == 1
-
-
-@pytest.mark.spmd
-def test_row_ordered_join_consolidates_shared_rank_key(
-    spmd_engine_factory,
-    tmp_path,
-) -> None:
-    """Assign a key spanning several ranks to exactly one output rank."""
-    engine = spmd_engine_factory(
-        StreamingOptions(
-            max_rows_per_partition=2,
-            target_partition_size=1,
-            broadcast_limit=1,
-            fallback_mode="raise",
-            raise_on_fail=True,
-        )
-    )
-    if engine.comm.nranks != 3:
-        pytest.skip("This test expects exactly three ranks.")
-    root = tmp_path / "shared-key-join"
-    if engine.rank == 0:
-        for side in ("left", "right"):
-            source = root / side
-            source.mkdir(parents=True)
-            make_partitioned_source(
-                pl.DataFrame(
-                    {
-                        "key": [1] * 6,
-                        f"{side}_value": range(6),
-                    }
-                ),
-                source,
-                "parquet",
-                n_files=2,
-                row_group_size=2,
-            )
-    root = _share_source_path(engine, root)
-
-    def ordered_input(side: str) -> pl.LazyFrame:
-        return pl.scan_parquet(f"{root}/{side}").set_sorted("key")
-
-    q = (
-        ordered_input("left")
-        .join(
-            ordered_input("right"),
-            on="key",
-            how="inner",
-        )
-        .sort("key")
-    )
-    ir = Translator(q._ldf.visit(), engine).translate_ir()
-    with patch.object(
-        join_actor_graph,
-        "plan_key_bounds_exchange",
-        wraps=join_actor_graph.plan_key_bounds_exchange,
-    ) as ownership_plan:
-        result, metadata_collector = evaluate_logical_plan(
-            ir,
-            ConfigOptions.from_polars_engine(engine),
-            collect_metadata=True,
-        )
-    with reserve_op_id() as op_id:
-        rank_rows = tuple(
-            int(value)
-            for value in all_gather_host_data(
-                engine.comm,
-                engine.context.br(),
-                op_id,
-                str(result.height).encode(),
-            )
-        )
-    result = allgather_polars_dataframe(engine=engine, local_df=result, op_id=0)
-    assert_frame_equal(q.collect(), result, check_row_order=False)
-    assert rank_rows == (0, 0, 36)
-    assert ownership_plan.call_count == 2
-    assert metadata_collector is not None
-    (metadata,) = metadata_collector
-    assert metadata.partitioning is not None
-    assert isinstance(metadata.partitioning.inter_rank, OrderScheme)
-    (ordering,) = metadata.partitioning.inter_rank.orderings
-    assert ordering.strict_boundaries
-    boundaries = ordering.get_boundaries(engine.context.br())
-    assert DataFrame.from_table(
-        boundaries.table_view(),
-        ["key"],
-        [DataType(pl.Int64())],
-        boundaries.stream,
-    ).to_polars()["key"].to_list() == [1, 1]
-
-
-@pytest.mark.spmd
-@pytest.mark.parametrize(
-    "descending,nulls_last,layout,expected_rank_rows,expected_boundaries",
-    [
-        (
-            False,
-            False,
-            ([None, None], [None, 1, 2], [2, 3]),
-            (0, 10, 5),
-            [None, 2],
-        ),
-        (
-            True,
-            False,
-            ([None, None], [None, 3, 2], [2, 1]),
-            (0, 10, 5),
-            [None, 2],
-        ),
-    ],
-)
-def test_row_ordered_join_repairs_shared_rank_boundaries(
-    spmd_engine_factory,
-    tmp_path,
-    descending,
-    nulls_last,
-    layout,
-    expected_rank_rows,
-    expected_boundaries,
-) -> None:
-    """Repair shared numeric and null boundaries in either direction."""
-    engine = spmd_engine_factory(
-        StreamingOptions(
-            max_rows_per_partition=2,
-            target_partition_size=1,
-            broadcast_limit=1,
-            fallback_mode="raise",
-            raise_on_fail=True,
-        )
-    )
-    if engine.comm.nranks != 3:
-        pytest.skip("This test expects exactly three ranks.")
-    root = tmp_path / f"shared-boundary-join-{descending}"
-    if engine.rank == 0:
-        for side in ("left", "right"):
-            source = root / side
-            source.mkdir(parents=True)
-            for partition, values in enumerate(layout):
-                pl.DataFrame(
-                    {
-                        "key": pl.Series(values, dtype=pl.Int64),
-                        f"{side}_value": range(len(values)),
-                    }
-                ).write_parquet(source / f"{partition}.parquet")
-    root = _share_source_path(engine, root)
-
-    def ordered_input(side: str) -> pl.LazyFrame:
-        return pl.scan_parquet(f"{root}/{side}").set_sorted(
-            "key",
-            descending=descending,
-            nulls_last=nulls_last,
-        )
-
-    q = (
-        ordered_input("left")
-        .join(
-            ordered_input("right"),
-            on="key",
-            how="inner",
-            nulls_equal=True,
-        )
-        .sort("key", descending=descending, nulls_last=nulls_last)
-    )
-    ir = Translator(q._ldf.visit(), engine).translate_ir()
-    with patch.object(
-        join_actor_graph,
-        "plan_key_bounds_exchange",
-        wraps=join_actor_graph.plan_key_bounds_exchange,
-    ) as ownership_plan:
-        result, metadata_collector = evaluate_logical_plan(
-            ir,
-            ConfigOptions.from_polars_engine(engine),
-            collect_metadata=True,
-        )
-    with reserve_op_id() as op_id:
-        rank_rows = tuple(
-            int(value)
-            for value in all_gather_host_data(
-                engine.comm,
-                engine.context.br(),
-                op_id,
-                str(result.height).encode(),
-            )
-        )
-    result = allgather_polars_dataframe(engine=engine, local_df=result, op_id=0)
-    assert_frame_equal(q.collect(), result, check_row_order=False)
-    assert rank_rows == expected_rank_rows
-    assert ownership_plan.call_count == 2
-    assert metadata_collector is not None
-    (metadata,) = metadata_collector
-    assert metadata.partitioning is not None
-    (row_ordering,) = metadata.partitioning.row_orderings
-    assert row_ordering.scope == RowOrderingScope.GLOBAL
-    (order_key,) = row_ordering.order_keys
-    assert order_key.order == (
-        plc.types.Order.DESCENDING if descending else plc.types.Order.ASCENDING
-    )
-    assert order_key.null_order == (
-        plc.types.NullOrder.AFTER
-        if nulls_last != descending
-        else plc.types.NullOrder.BEFORE
-    )
-    assert isinstance(metadata.partitioning.inter_rank, OrderScheme)
-    (ordering,) = metadata.partitioning.inter_rank.orderings
-    assert ordering.strict_boundaries
-    boundaries = ordering.get_boundaries(engine.context.br())
-    assert (
-        DataFrame.from_table(
-            boundaries.table_view(),
-            ["key"],
-            [DataType(pl.Int64())],
-            boundaries.stream,
-        )
-        .to_polars()["key"]
-        .to_list()
-        == expected_boundaries
-    )
-
-
-@pytest.mark.spmd
-def test_row_ordered_join_repairs_sparse_rank_topology(
-    spmd_engine_factory,
-    tmp_path,
-) -> None:
-    """Repair ownership with leading, interior, and trailing empty inputs."""
+def test_row_ordered_join_across_ranks(spmd_engine_factory, tmp_path, how) -> None:
+    """Join shared keys with empty ranks while retaining global row order."""
     engine = spmd_engine_factory(
         StreamingOptions(
             max_rows_per_partition=2,
@@ -747,80 +285,57 @@ def test_row_ordered_join_repairs_sparse_rank_topology(
     )
     if engine.comm.nranks != 4:
         pytest.skip("This test expects exactly four ranks.")
-    root = tmp_path / "sparse-rank-join"
+    root = tmp_path / "ordered-join"
     layouts = {
-        "left": (([1], False), ([1, 1], True), ([1], False), ([1, 1], True)),
-        "right": (([1, 1], True), ([1, 1], True), ([1], False), ([1], False)),
+        "left": (([0], False), ([0, 1], True), ([1, 2], True), ([2], False)),
+        "right": (([0], True), ([1], False), ([1, 1], True), ([2], True)),
     }
     if engine.rank == 0:
         for side, layout in layouts.items():
             source = root / side
             source.mkdir(parents=True)
-            for partition, (values, keep) in enumerate(layout):
+            for rank, (keys, keep) in enumerate(layout):
                 pl.DataFrame(
                     {
-                        "key": pl.Series(values, dtype=pl.Int64),
-                        f"{side}_value": range(len(values)),
+                        "key": keys,
+                        f"{side}_value": range(len(keys)),
                         "keep": keep,
                     }
-                ).write_parquet(source / f"{partition}.parquet")
+                ).write_parquet(source / f"{rank}.parquet")
     root = _share_source_path(engine, root)
 
     def ordered_input(side: str) -> pl.LazyFrame:
         return (
             pl.scan_parquet(f"{root}/{side}")
-            .filter(pl.col("keep"))
+            .filter("keep")
             .drop("keep")
             .set_sorted("key")
         )
 
     q = (
         ordered_input("left")
-        .join(
-            ordered_input("right"),
-            on="key",
-            how="inner",
-        )
+        .join(ordered_input("right"), on="key", how=how)
         .sort("key")
     )
     ir = Translator(q._ldf.visit(), engine).translate_ir()
     with patch.object(
         join_actor_graph,
-        "plan_key_bounds_exchange",
-        wraps=join_actor_graph.plan_key_bounds_exchange,
-    ) as ownership_plan:
+        "_distributed_incremental_ordered_join",
+        wraps=join_actor_graph._distributed_incremental_ordered_join,
+    ) as ordered_join:
         result, metadata_collector = evaluate_logical_plan(
-            ir,
-            ConfigOptions.from_polars_engine(engine),
-            collect_metadata=True,
+            ir, ConfigOptions.from_polars_engine(engine), collect_metadata=True
         )
-    with reserve_op_id() as op_id:
-        rank_rows = tuple(
-            int(value)
-            for value in all_gather_host_data(
-                engine.comm,
-                engine.context.br(),
-                op_id,
-                str(result.height).encode(),
-            )
-        )
+    assert ordered_join.await_count == 1
     result = allgather_polars_dataframe(engine=engine, local_df=result, op_id=0)
+
     assert_frame_equal(q.collect(), result, check_row_order=False)
-    assert rank_rows == (0, 0, 0, 16)
-    assert ownership_plan.call_count == 2
+    assert result["key"].is_sorted()
     assert metadata_collector is not None
     (metadata,) = metadata_collector
     assert metadata.partitioning is not None
-    assert isinstance(metadata.partitioning.inter_rank, OrderScheme)
-    (ordering,) = metadata.partitioning.inter_rank.orderings
-    assert ordering.strict_boundaries
-    boundaries = ordering.get_boundaries(engine.context.br())
-    assert DataFrame.from_table(
-        boundaries.table_view(),
-        ["key"],
-        [DataType(pl.Int64())],
-        boundaries.stream,
-    ).to_polars()["key"].to_list() == [1, 1, 1]
+    (row_ordering,) = metadata.partitioning.row_orderings
+    assert row_ordering.scope == RowOrderingScope.GLOBAL
 
 
 @pytest.mark.parametrize(
@@ -875,77 +390,6 @@ def test_partitionwise_join_preserves_maintained_side_ordering(
     (row_ordering,) = result.row_orderings
     (key,) = row_ordering.order_keys
     assert tuple(join.schema)[key.column_index] == expected_column
-
-
-def test_ordered_join_strategy_matches_exact_ordering_width(spmd_engine):
-    left = pl.LazyFrame({"k0": [1], "k1": [2], "x": [3]})
-    right = pl.LazyFrame({"k0": [1], "k1": [2], "y": [4]})
-    join_ir = _join_ir(left.join(right, on="k0", how="inner"))
-    partitioning = _order_partitioning(spmd_engine, (0, 1))
-
-    assert _make_ordered_strategy(join_ir, partitioning, partitioning) is None
-
-
-def test_ordered_join_strategy_checks_order_key_semantics(spmd_engine):
-    left = pl.LazyFrame({"k0": [1], "x": [2]})
-    right = pl.LazyFrame({"k0": [1], "y": [3]})
-    join_ir = _join_ir(left.join(right, on="k0", how="inner"))
-    left_partitioning = _order_partitioning(spmd_engine, (0,))
-    right_partitioning = _order_partitioning(spmd_engine, (0,))
-    mismatched_right = _order_partitioning(
-        spmd_engine, (0,), order=plc.types.Order.DESCENDING
-    )
-
-    assert (
-        _make_ordered_strategy(join_ir, left_partitioning, right_partitioning)
-        is not None
-    )
-    assert _make_ordered_strategy(join_ir, left_partitioning, mismatched_right) is None
-
-
-def test_ordered_join_uses_cursor_for_rank_only_partitioning(spmd_engine) -> None:
-    left = pl.LazyFrame({"k": [1], "x": [2]})
-    right = pl.LazyFrame({"k": [1], "y": [3]})
-    join_ir = _join_ir(left.join(right, on="k", how="inner"))
-    partitioning = _order_partitioning(spmd_engine, (0,))
-    rank_only = NormalizedPartitioning(partitioning.inter_rank_scheme, None)
-    strategy = _make_ordered_strategy(join_ir, rank_only, rank_only)
-    assert strategy is not None
-    row_ordering = RowOrdering(
-        strategy.left_input_ordering.keys,
-        RowOrderingScope.GLOBAL,
-    )
-    metadata = ChannelMetadata(
-        local_count=2,
-        partitioning=Partitioning(
-            inter_rank=rank_only.inter_rank_scheme,
-            row_orderings=(row_ordering,),
-        ),
-    )
-
-    assert (
-        _ordered_join_execution(
-            spmd_engine.context,
-            spmd_engine.comm,
-            join_ir,
-            strategy,
-            rank_only,
-            rank_only,
-            metadata,
-            metadata,
-        )
-        == "cursor"
-    )
-
-
-@pytest.mark.parametrize("how", ["right", "full"])
-def test_ordered_join_strategy_rejects_ambiguous_output_key_metadata(spmd_engine, how):
-    left = pl.LazyFrame({"k0": [1], "x": [2]})
-    right = pl.LazyFrame({"k0": [1], "y": [3]})
-    join_ir = _join_ir(left.join(right, on="k0", how=how, coalesce=False))
-    partitioning = _order_partitioning(spmd_engine, (0,))
-
-    assert _make_ordered_strategy(join_ir, partitioning, partitioning) is None
 
 
 def assert_conditional_join(reverse, max_rows_per_partition, streaming_engine_factory):
