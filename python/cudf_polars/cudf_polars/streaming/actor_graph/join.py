@@ -620,6 +620,7 @@ def add_prefilter(
             spec.target_on,
             spec.domain_on,
             ("Semi", spec.nulls_equal, None, "", False, "none"),
+            None,
             target,
             Projection(domain_schema, domain),
         )
