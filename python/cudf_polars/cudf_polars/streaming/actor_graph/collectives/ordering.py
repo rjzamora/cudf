@@ -245,7 +245,7 @@ def _extract_boundaries_from_endpoint_rows(
     -------
     The boundaries table and whether they are strict.
     """
-    # Boundaries are the first endpoint of all partitions except the first.
+    # Boundaries are the last endpoint of all partitions except the last.
     # Strictness compares each partition end with the following partition start.
     previous_partition_ends = plc.concatenate.concatenate(
         plc.copying.slice(
@@ -287,7 +287,7 @@ def _extract_boundaries_from_endpoint_rows(
         plc.DataType(plc.TypeId.BOOL8),
         stream=stream,
     ).to_py(stream=stream)
-    return next_partition_starts, strict
+    return previous_partition_ends, strict
 
 
 def _metadata_has_ordering(metadata: ChannelMetadata, keys: Sequence[OrderKey]) -> bool:
