@@ -1046,6 +1046,7 @@ async def _evaluate_incremental_join(
                 ir.left_on,
                 ir.right_on,
                 options,
+                ir._non_child_args[3],
                 chunk_to_frame(left_chunk, ir.children[0]),
                 chunk_to_frame(right_chunk, ir.children[1]),
                 context=ir_context,

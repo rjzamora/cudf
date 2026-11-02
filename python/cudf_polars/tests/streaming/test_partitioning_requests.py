@@ -200,6 +200,7 @@ def test_join_propagates_downstream_order_request() -> None:
         (named_col("a"),),
         (named_col("x"),),
         ("Inner", False, None, "_right", True, "none"),
+        None,
         left,
         right,
     )
