@@ -37,6 +37,7 @@ def test_sparse_exchange_close_survives_cancellation(
             Mock(), Mock(rank=0, nranks=2), 0, sources=(1,), destinations=()
         )
 
+        exchange.start_finish()
         task = asyncio.create_task(exchange.aclose())
         try:
             await asyncio.wait_for(started.wait(), timeout=timeout_seconds)
