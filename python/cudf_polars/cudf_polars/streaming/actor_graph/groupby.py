@@ -619,6 +619,61 @@ async def _ordered_adjust_reduce(
         )
 
 
+async def _strictify_chunkwise_groupby(
+    context: Context,
+    comm: Communicator,
+    ir: GroupBy,
+    ir_context: IRExecutionContext,
+    ch_out: Channel[TableChunk],
+    ch_in: Channel[TableChunk],
+    metadata_in: ChannelMetadata,
+    input_ordering: Ordering,
+    collective_id: int,
+    tracer: ActorTracer | None,
+) -> None:
+    """Make input key ranges strict, then group each owned partition once."""
+    output_ordering = input_ordering.as_strict(context.br())
+    adjusted_metadata = _adjusted_ordering_metadata(comm, metadata_in, output_ordering)
+    metadata_out = ChannelMetadata(
+        local_count=adjusted_metadata.local_count,
+        partitioning=maybe_remap_partitioning(
+            ir,
+            adjusted_metadata.partitioning,
+            context=context,
+            preserves_row_order=ir.preserves_output_order,
+        ),
+        duplicated=adjusted_metadata.duplicated,
+    )
+    ch_adjusted = context.create_channel()
+    if tracer is not None:
+        tracer.decision = "strictify_chunkwise"
+    async with shutdown_channels_on_error(context, ch_adjusted):
+        await gather_in_task_group(
+            adjust_ordering(
+                context,
+                comm,
+                ir.children[0],
+                ir_context,
+                ch_adjusted,
+                ch_in,
+                input_ordering,
+                output_ordering,
+                input_rows_ordered=True,
+                collective_id=collective_id,
+            ),
+            chunkwise_evaluate(
+                context,
+                ir,
+                ir_context,
+                ch_out,
+                ch_adjusted,
+                metadata_out,
+                input_metadata=adjusted_metadata,
+                tracer=tracer,
+            ),
+        )
+
+
 def _enforce_schema(
     chunk: TableChunk,
     canonical_schema: dict[str, Any],
@@ -926,6 +981,25 @@ async def groupby_actor(
                 metadata_out,
                 input_metadata=metadata_in,
                 tracer=tracer,
+            )
+            return
+
+        if (
+            isinstance(ir, GroupBy)
+            and input_ordering is not None
+            and input_rows_ordered
+        ):
+            await _strictify_chunkwise_groupby(
+                context,
+                comm,
+                ir,
+                ir_context,
+                ch_out,
+                ch_in,
+                metadata_in,
+                input_ordering,
+                collective_ids.pop(),
+                tracer,
             )
             return
 
