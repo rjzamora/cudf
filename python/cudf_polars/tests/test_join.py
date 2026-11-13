@@ -49,8 +49,11 @@ def test_asof_join_backward(engine: pl.GPUEngine, by: str | None):
 @pytest.mark.engine_params(["spmd-small"])
 def test_asof_join_empty_right(engine: pl.GPUEngine):
     left = pl.LazyFrame({"time": [1, 2]})
-    right = pl.LazyFrame({"time": [], "value": []}).cast(
-        {"time": pl.Int64, "value": pl.Int64}
+    right = pl.LazyFrame(
+        {
+            "time": pl.Series([], dtype=pl.Int64),
+            "value": pl.Series([], dtype=pl.Int64),
+        }
     )
     assert_gpu_result_equal(left.join_asof(right, on="time"), engine=engine)
 
