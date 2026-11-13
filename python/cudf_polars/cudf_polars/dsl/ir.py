@@ -97,6 +97,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "IR",
+    "AsofJoin",
     "Cache",
     "CallbackSink",
     "ConditionalJoin",
@@ -3284,6 +3285,183 @@ class ConditionalJoin(IR):
             result = left_result.with_columns(right_result.columns, stream=stream)
 
         return result.slice(zlice)
+
+
+class AsofJoin(IR):
+    """
+    An as-of join of two dataframes.
+
+    Notes
+    -----
+    Currently supports only backward matching with exact matches and no
+    tolerance. Streaming execution broadcasts the right side to every rank.
+    """
+
+    __slots__ = ("left_by", "left_on", "options", "right_by", "right_on")
+    _non_child = (
+        "schema",
+        "left_on",
+        "right_on",
+        "left_by",
+        "right_by",
+        "options",
+    )
+    _n_non_child_args = 5
+
+    def __init__(
+        self,
+        schema: Schema,
+        left_on: expr.NamedExpr,
+        right_on: expr.NamedExpr,
+        left_by: tuple[str, ...],
+        right_by: tuple[str, ...],
+        options: tuple[Zlice | None, str, bool],
+        left: IR,
+        right: IR,
+    ) -> None:
+        self.schema = schema
+        self.left_on = left_on
+        self.right_on = right_on
+        self.left_by = left_by
+        self.right_by = right_by
+        self.options = options
+        self.children = (left, right)
+        self._non_child_args = (left_on, right_on, left_by, right_by, options)
+
+    @staticmethod
+    def prepare_right(
+        right_on: expr.NamedExpr,
+        right_by: tuple[str, ...],
+        right: DataFrame,
+        *,
+        already_sorted: bool,
+        context: IRExecutionContext,
+    ) -> tuple[DataFrame, plc.join.AsofJoin]:
+        """Prepare the right payload and keys for repeated probes."""
+        right_on_col = broadcast(
+            right_on.value.evaluate(right),
+            target_length=right.num_rows,
+            stream=right.stream,
+        )[0]
+        right_by_cols = [right.column_map[name].obj for name in right_by]
+        keys = plc.Table([*right_by_cols, right_on_col.obj])
+        if already_sorted:
+            return right, plc.join.AsofJoin(
+                plc.Table(right_by_cols), right_on_col.obj, stream=right.stream
+            )
+
+        with context.stream_ordered_after(right) as stream:
+            columns = plc.sorting.stable_sort_by_key(
+                plc.Table([*right.table.columns(), *keys.columns()]),
+                keys,
+                [plc.types.Order.ASCENDING] * (len(right_by) + 1),
+                [plc.types.NullOrder.BEFORE] * (len(right_by) + 1),
+                stream=stream,
+            ).columns()
+            return DataFrame.from_table(
+                plc.Table(columns[: right.num_columns]),
+                right.column_names,
+                right.dtypes,
+                stream=stream,
+            ), plc.join.AsofJoin(
+                plc.Table(columns[right.num_columns : -1]),
+                columns[-1],
+                stream=stream,
+            )
+
+    @staticmethod
+    def probe_right(
+        left_on: expr.NamedExpr,
+        right_on: expr.NamedExpr,
+        left_by: tuple[str, ...],
+        right_by: tuple[str, ...],
+        options: tuple[Zlice | None, str, bool],
+        left: DataFrame,
+        right: DataFrame,
+        joiner: plc.join.AsofJoin,
+        *,
+        context: IRExecutionContext,
+    ) -> DataFrame:
+        """Probe prepared right keys with the left rows."""
+        zlice, suffix, coalesce = options
+        discarded = set(right_by)
+        if coalesce and left_on.name == right_on.name:
+            discarded.add(right_on.name)
+        right_payload = right.discard_columns(discarded)
+        if right_payload.num_columns == 0:
+            return left.slice(zlice)
+        left_on_col = broadcast(
+            left_on.value.evaluate(left),
+            target_length=left.num_rows,
+            stream=left.stream,
+        )[0]
+        with context.stream_ordered_after(left, right) as stream:
+            gather_map = joiner.join(
+                plc.Table([left.column_map[name].obj for name in left_by]),
+                left_on_col.obj,
+                stream=stream,
+            )
+            gathered = DataFrame.from_table(
+                plc.copying.gather(
+                    right_payload.table,
+                    gather_map,
+                    plc.copying.OutOfBoundsPolicy.NULLIFY,
+                    stream=stream,
+                ),
+                right_payload.column_names,
+                right_payload.dtypes,
+                stream=stream,
+            )
+            gathered = gathered.rename_columns(
+                {
+                    name: f"{name}{suffix}"
+                    for name in gathered.column_names
+                    if name in left.column_names_set
+                }
+            )
+            return left.with_columns(gathered.columns, stream=stream).slice(zlice)
+
+    @classmethod
+    @log_do_evaluate
+    @nvtx_annotate_cudf_polars(message="AsofJoin")
+    def do_evaluate(
+        cls,
+        left_on: expr.NamedExpr,
+        right_on: expr.NamedExpr,
+        left_by: tuple[str, ...],
+        right_by: tuple[str, ...],
+        options: tuple[Zlice | None, str, bool],
+        left: DataFrame,
+        right: DataFrame,
+        *,
+        context: IRExecutionContext,
+    ) -> DataFrame:
+        """Evaluate an as-of join in memory."""
+        right_col = (
+            right.column_map[right_on.value.name]
+            if not right_by and isinstance(right_on.value, expr.Col)
+            else None
+        )
+        already_sorted = (
+            right_col is not None
+            and right_col.is_sorted == plc.types.Sorted.YES
+            and right_col.order == plc.types.Order.ASCENDING
+            and right_col.null_order == plc.types.NullOrder.BEFORE
+        )
+        right, joiner = cls.prepare_right(
+            right_on, right_by, right, already_sorted=already_sorted, context=context
+        )
+        return cls.probe_right(
+            left_on,
+            right_on,
+            left_by,
+            right_by,
+            options,
+            left,
+            right,
+            joiner,
+            context=context,
+        )
 
 
 class Join(IR):

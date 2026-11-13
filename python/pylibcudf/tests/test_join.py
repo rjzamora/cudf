@@ -1,10 +1,12 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
 import pyarrow as pa
 import pytest
 from utils import assert_table_eq
+
+from rmm.pylibrmm.stream import Stream
 
 import pylibcudf as plc
 
@@ -59,6 +61,32 @@ def test_cross_join(left, right):
 
 
 sentinel = np.iinfo(np.int32).min
+
+
+def test_asof_join():
+    left_on = plc.Column.from_arrow(
+        pa.array([4, 0, 3, None, 1], type=pa.int64())
+    )
+    right_on = plc.Column.from_arrow(pa.array([1, 3, 3, 7], type=pa.int64()))
+    indices = plc.join.asof_join(
+        plc.Table([]), left_on, plc.Table([]), right_on
+    )
+    assert indices.to_arrow().to_pylist() == [2, sentinel, 2, sentinel, 0]
+    joiner = plc.join.AsofJoin(plc.Table([]), right_on)
+    assert joiner.join(plc.Table([]), left_on).to_arrow().to_pylist() == [
+        2,
+        sentinel,
+        2,
+        sentinel,
+        0,
+    ]
+    probe_stream = Stream()
+    other_left = plc.Column.from_arrow(
+        pa.array([2, 8], type=pa.int64()), stream=probe_stream
+    )
+    result = joiner.join(plc.Table([]), other_left, stream=probe_stream)
+    del joiner, right_on
+    assert result.to_arrow(stream=probe_stream).to_pylist() == [0, 3]
 
 
 @pytest.mark.parametrize(

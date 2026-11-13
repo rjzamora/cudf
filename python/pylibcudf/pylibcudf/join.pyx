@@ -8,13 +8,16 @@ from libc.stddef cimport size_t
 from libcpp.memory cimport make_unique, unique_ptr
 from libcpp.optional cimport optional
 from libcpp.utility cimport move
+from pylibcudf.libcudf cimport asof_join as cpp_asof_join
 from pylibcudf.libcudf cimport join as cpp_join
 from pylibcudf.libcudf cimport null_mask as cpp_null_mask
 from pylibcudf.libcudf.column.column cimport column
+from pylibcudf.libcudf.column.column_view cimport column_view
 from pylibcudf.libcudf.table.table cimport table
 from pylibcudf.libcudf.table.table_view cimport table_view
 from pylibcudf.libcudf.types cimport mask_state, null_equality
 from pylibcudf.libcudf.utilities.device_buffer cimport device_buffer
+from pylibcudf.experimental._join_streams cimport join_streams
 
 from rmm.pylibrmm.stream cimport Stream
 from rmm.pylibrmm.memory_resource cimport DeviceMemoryResource
@@ -31,6 +34,8 @@ if TYPE_CHECKING:
 from cuda.bindings.cyruntime cimport cudaStream_t
 
 __all__ = [
+    "AsofJoin",
+    "asof_join",
     "conditional_full_join",
     "conditional_inner_join",
     "conditional_left_anti_join",
@@ -49,6 +54,81 @@ __all__ = [
     "mixed_left_join",
     "mixed_left_semi_join",
 ]
+
+
+cdef class AsofJoin:
+    """Prepared backward as-of join for repeated left-side probes.
+
+    The right keys must be sorted by ``(right_by..., right_on)`` with nulls
+    first. The right input is retained for the lifetime of this object.
+    """
+
+    def __cinit__(
+        self,
+        Table right_by,
+        Column right_on,
+        object stream: CudaStreamLike | None = None,
+        DeviceMemoryResource mr=None,
+    ) -> None:
+        self._right_by = right_by
+        self._right_on = right_on
+        self._stream = _get_stream(stream)
+        self._mr = _get_memory_resource(mr)
+        cdef table_view c_right_by = right_by.view()
+        cdef column_view c_right_on = right_on.view()
+        cdef cudaStream_t _cs = self._stream.view().get()
+        with nogil:
+            self.c_obj = cpp_asof_join.make_asof_join(
+                c_right_by, c_right_on, _cs, self._mr.get_mr()
+            )
+
+    def __dealloc__(self):
+        self.c_obj.reset()
+
+    def join(
+        self,
+        Table left_by,
+        Column left_on,
+        object stream: CudaStreamLike | None = None,
+        DeviceMemoryResource mr=None,
+    ) -> Column:
+        """Return one matching right-row index per left row."""
+        cdef Stream _stream = self._stream if stream is None else _get_stream(stream)
+        cdef cudaStream_t _cs = _stream.view().get()
+        mr = _get_memory_resource(mr)
+        cdef table_view c_left_by = left_by.view()
+        cdef column_view c_left_on = left_on.view()
+        cdef unique_ptr[column] result
+        if _stream is not self._stream:
+            join_streams([self._stream], _stream)
+        try:
+            with nogil:
+                result = cpp_asof_join.asof_join_indices(
+                    dereference(self.c_obj), c_left_by, c_left_on, _cs, mr.get_mr()
+                )
+        finally:
+            if _stream is not self._stream:
+                join_streams([_stream], self._stream)
+        return Column.from_libcudf(move(result), _stream, mr)
+
+
+cpdef Column asof_join(
+    Table left_by,
+    Column left_on,
+    Table right_by,
+    Column right_on,
+    object stream: CudaStreamLike | None = None,
+    DeviceMemoryResource mr=None,
+):
+    """Return the right-row index for each left row in a backward as-of join.
+
+    The right keys must be sorted by ``(right_by..., right_on)`` with nulls
+    first. Unmatched rows contain ``JoinNoMatch`` and must be gathered with
+    ``OutOfBoundsPolicy.NULLIFY``.
+    """
+    return AsofJoin(right_by, right_on, stream=stream, mr=mr).join(
+        left_by, left_on, stream=stream, mr=mr
+    )
 
 cdef Column _column_from_gather_map(
     cpp_join.gather_map_type gather_map, object stream, DeviceMemoryResource mr

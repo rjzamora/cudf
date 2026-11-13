@@ -8,7 +8,7 @@ import operator
 from functools import reduce
 from typing import TYPE_CHECKING
 
-from cudf_polars.dsl.ir import ConditionalJoin, Join, Projection, Slice
+from cudf_polars.dsl.ir import AsofJoin, ConditionalJoin, Join, Projection, Slice
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.streaming.base import PartitionInfo
 from cudf_polars.streaming.dispatch import lower_ir_node
@@ -61,6 +61,32 @@ def _maybe_shuffle_frame(
             partitioned_on=on,
         )
         return frame
+
+
+@lower_ir_node.register(AsofJoin)
+def _(
+    ir: AsofJoin, rec: LowerIRTransformer
+) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    if (zlice := ir.options[0]) is not None:
+        offset, length = zlice
+        if length is None:
+            return _lower_ir_fallback(ir, rec, msg="Unsupported as-of join slice")
+        unsliced = AsofJoin(
+            ir.schema,
+            ir.left_on,
+            ir.right_on,
+            ir.left_by,
+            ir.right_by,
+            (None, *ir.options[1:]),
+            *ir.children,
+        )
+        return rec(Slice(ir.schema, offset, length, unsliced))
+
+    (left, right), infos = zip(*(rec(child) for child in ir.children), strict=True)
+    partition_info = reduce(operator.or_, infos)
+    lowered = ir.reconstruct([left, right])
+    partition_info[lowered] = PartitionInfo(count=partition_info[left].count)
+    return lowered, partition_info
 
 
 def _make_hash_join(

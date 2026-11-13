@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from cudf_polars.dsl import expr
 from cudf_polars.dsl.ir import (
+    AsofJoin,
     Distinct,
     Filter,
     GroupBy,
@@ -118,6 +119,15 @@ def _(node: GroupBy) -> Mapping[str, ColumnBinding]:
 def _(node: Rolling) -> Mapping[str, ColumnBinding]:
     assert isinstance(node.index.value, expr.Col)
     return {node.index.name: ColumnBinding(0, node.index.value.name)}
+
+
+@column_domain_bindings.register(AsofJoin)
+def _(node: AsofJoin) -> Mapping[str, ColumnBinding]:
+    return {
+        name: ColumnBinding(0, name)
+        for name in node.children[0].schema
+        if name in node.schema
+    }
 
 
 @column_domain_bindings.register(Join)

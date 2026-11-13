@@ -19,6 +19,60 @@ from cudf_polars.dsl.translate import Translator
 from cudf_polars.testing.asserts import assert_gpu_result_equal
 from cudf_polars.utils.versions import POLARS_VERSION_LT_21
 
+
+@pytest.mark.engine_params(["in-memory", "spmd-small"])
+@pytest.mark.parametrize("by", [None, "sym"])
+def test_asof_join_backward(engine: pl.GPUEngine, by: str | None):
+    left = pl.LazyFrame(
+        {
+            "sym": ["a", "a", "b", "b", "b"],
+            "time": [0, 3, 2, 5, 6],
+            "trade": [10, 11, 12, 13, 14],
+        }
+    ).sort(["sym", "time"] if by else "time")
+    right = pl.LazyFrame(
+        {
+            "sym": ["a", "a", "a", "b", "b"],
+            "time": [1, 3, 3, 1, 4],
+            "quote": [20, 21, 22, 23, 24],
+        }
+    ).sort(["sym", "time"] if by else "time")
+    query = left.join_asof(
+        right,
+        on="time",
+        by=by,
+        strategy="backward",
+    )
+    assert_gpu_result_equal(query, engine=engine)
+
+
+@pytest.mark.engine_params(["spmd-small"])
+def test_asof_join_empty_right(engine: pl.GPUEngine):
+    left = pl.LazyFrame({"time": [1, 2]})
+    right = pl.LazyFrame({"time": [], "value": []}).cast(
+        {"time": pl.Int64, "value": pl.Int64}
+    )
+    assert_gpu_result_equal(left.join_asof(right, on="time"), engine=engine)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"strategy": "forward"},
+        {"tolerance": 1},
+        {"allow_exact_matches": False},
+    ],
+)
+def test_asof_join_unsupported_options(kwargs):
+    frame = pl.LazyFrame({"time": [1, 2]}).sort("time")
+    engine = pl.GPUEngine(executor_options={"min_device_size": 1_000_000_000})
+    translator = Translator(
+        frame.join_asof(frame, on="time", **kwargs)._ldf.visit(), engine
+    )
+    translator.translate_ir()
+    assert any(isinstance(error, NotImplementedError) for error in translator.errors)
+
+
 FUSED_PREDICATE_XFAIL = pytest.mark.xfail(
     POLARS_VERSION_LT_21,
     reason="Polars 2.0 plans an equi join with a residual predicate as a "

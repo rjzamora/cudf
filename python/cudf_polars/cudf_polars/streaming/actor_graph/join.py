@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, assert_never
 
+import pylibcudf as plc
 from cudf_streaming import CardinalityEstimator
 from cudf_streaming.channel_metadata import (
     ChannelMetadata,
@@ -30,7 +31,8 @@ from rapidsmpf.streaming.core.memory_reserve_or_wait import (
 from rapidsmpf.streaming.core.message import Message
 
 from cudf_polars.containers import DataFrame
-from cudf_polars.dsl.ir import IR, Join, Projection
+from cudf_polars.dsl.expr import Col
+from cudf_polars.dsl.ir import IR, AsofJoin, Join, Projection
 from cudf_polars.dsl.utils.naming import names_to_indices
 from cudf_polars.streaming.actor_graph.collectives.allgather import (
     AllGatherManager,
@@ -149,6 +151,143 @@ def _remap_join_partitioning(
         context=context,
         preserves_row_order=_preserved_join_side(ir) == side,
     )
+
+
+@define_actor()
+async def asof_join_actor(
+    context: Context,
+    comm: Communicator,
+    ir: AsofJoin,
+    ir_context: IRExecutionContext,
+    ch_out: Channel[TableChunk],
+    ch_left: Channel[TableChunk],
+    ch_right: Channel[TableChunk],
+    collective_id: int,
+) -> None:
+    """Broadcast the right side and probe it with each left chunk."""
+    async with shutdown_on_error(
+        context,
+        chs_in=(ch_left, ch_right),
+        chs_out=(ch_out,),
+        trace_ir=ir,
+        ir_context=ir_context,
+    ) as actor_scope:
+        ir_context = actor_scope.require_ir_context()
+        left_metadata, right_metadata = await gather_in_task_group(
+            recv_metadata(ch_left, context),
+            recv_metadata(ch_right, context),
+        )
+        right_ir = ir.children[1]
+        right_dfs, _ = await _collect_small_side_for_broadcast(
+            context,
+            comm,
+            ch_right,
+            right_ir,
+            need_allgather=comm.nranks > 1 and not right_metadata.duplicated,
+            collective_id=collective_id,
+            ir_context=ir_context,
+            must_concatenate=True,
+        )
+        right_df = (
+            right_dfs[0]
+            if right_dfs
+            else chunk_to_frame(
+                empty_table_chunk(right_ir, context, ir_context.get_cuda_stream()),
+                right_ir,
+            )
+        )
+        del right_dfs
+        right_sorted = isinstance(ir.right_on.value, Col) and is_row_ordered_by(
+            right_metadata.partitioning,
+            tuple(
+                OrderKey(index, plc.types.Order.ASCENDING, plc.types.NullOrder.BEFORE)
+                for index in names_to_indices(
+                    (*ir.right_by, ir.right_on.value.name), right_ir.schema
+                )
+            ),
+            scope=(
+                RowOrderingScope.RANK_LOCAL
+                if comm.nranks == 1 or right_metadata.duplicated
+                else RowOrderingScope.GLOBAL
+            ),
+        )
+        right_size = sum(
+            column.device_buffer_size() for column in right_df.table.columns()
+        )
+        # Budget several int32-sized arrays per row for group preprocessing.
+        with opaque_memory_usage(
+            await reserve_memory(
+                context,
+                size=(0 if right_sorted else right_size)
+                + (max(right_size, 16 * right_df.num_rows) if ir.right_by else 0),
+                net_memory_delta=0,
+            )
+        ):
+            right_df, joiner = await ir_context.to_thread(
+                ir.prepare_right,
+                ir.right_on,
+                ir.right_by,
+                right_df,
+                already_sorted=right_sorted,
+                context=ir_context,
+            )
+        await send_metadata(
+            ch_out,
+            context,
+            ChannelMetadata(
+                local_count=left_metadata.local_count,
+                partitioning=maybe_remap_partitioning(
+                    ir,
+                    left_metadata.partitioning,
+                    child_index=0,
+                    context=context,
+                    preserves_row_order=True,
+                ),
+                duplicated=left_metadata.duplicated,
+            ),
+        )
+        while (msg := await ch_left.recv(context)) is not None:
+            left_chunk, _ = await make_table_chunks_available_or_wait(
+                context,
+                TableChunk.from_message(msg, br=context.br()),
+                reserve_extra=0,
+                net_memory_delta=missing_net_memory_delta,
+            )
+            right_output_size = (
+                right_size * left_chunk.shape[0] // max(right_df.num_rows, 1)
+            )
+            with opaque_memory_usage(
+                await reserve_memory(
+                    context,
+                    size=left_chunk.data_alloc_size()
+                    + max(right_size, right_output_size),
+                    net_memory_delta=0,
+                )
+            ):
+                result = await ir_context.to_thread(
+                    ir.probe_right,
+                    ir.left_on,
+                    ir.right_on,
+                    ir.left_by,
+                    ir.right_by,
+                    ir.options,
+                    chunk_to_frame(left_chunk, ir.children[0]),
+                    right_df,
+                    joiner,
+                    context=ir_context,
+                )
+                del left_chunk
+            await send_chunk(
+                context,
+                ch_out,
+                TableChunk.from_pylibcudf_table(
+                    result.table, result.stream, exclusive_view=True, br=context.br()
+                ),
+                msg.sequence_number,
+                tracer=actor_scope.tracer,
+            )
+            del result
+        await ch_out.drain(context)
 
 
 @dataclass(frozen=True)
@@ -2124,6 +2263,28 @@ def _forward_join_partitioning(
     return _remap_join_partitioning(
         ir, child_metadatas[child_index], child_index, context
     )
+
+
+@generate_ir_sub_network.register(AsofJoin)
+def _(
+    ir: AsofJoin, rec: SubNetGenerator
+) -> tuple[dict[IR, list[Any]], dict[IR, ChannelManager]]:
+    left, right = ir.children
+    actors, channels = process_children(ir, rec)
+    channels[ir] = ChannelManager(rec.state["context"])
+    actors[ir] = [
+        asof_join_actor(
+            rec.state["context"],
+            rec.state["comm"],
+            ir,
+            ir_context_for_node(rec, ir),
+            channels[ir].reserve_input_slot(),
+            channels[left].reserve_output_slot(),
+            channels[right].reserve_output_slot(),
+            rec.state["collective_id_map"][ir][0],
+        )
+    ]
+    return actors, channels
 
 
 @generate_ir_sub_network.register(Join)
